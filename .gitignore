@@ -1,0 +1,13 @@
+# Virtual environment (large, platform-specific, reproducible via requirements.txt)
+.venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Data: source PDFs and generated drafts (large/binary, and thesis PDFs may
+# not be yours to publish even in a local history). Untrack by default --
+# remove these lines if you do want them versioned.
+inputs/
+outputs/
+completed_drafts/
