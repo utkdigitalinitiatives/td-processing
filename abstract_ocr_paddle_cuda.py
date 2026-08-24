@@ -81,13 +81,14 @@ def init_paddle_ocr() -> PaddleOCR:
         'use_doc_orientation_classify': True,
         'use_doc_unwarping': False,
         'use_textline_orientation': True,
-        'ir_optim': False,
-        'det_db_thresh': 0.3,
-        'det_db_box_thresh': 0.5,
-        'det_db_unclip_ratio': 1.5,
-        'det_db_score_mode': 'slow',
-        'rec_batch_num': 3,
-        'show_log': True,
+        # NOTE: current PaddleOCR/PaddleX builds use the 'text_det_*' names below,
+        # not the legacy 'det_db_*' names. A generous unclip_ratio matters here:
+        # too small and the text detector fails to merge a full line's bounding
+        # box when the line contains a superscript/subscript (e.g. "R2" in "R2
+        # for..."), silently dropping that entire line before OCR even runs on it.
+        'text_det_thresh': 0.3,
+        'text_det_box_thresh': 0.5,
+        'text_det_unclip_ratio': 1.5,
     }
 
     filtered_kwargs, unsupported = filter_supported_paddle_kwargs(desired_kwargs)
@@ -625,6 +626,11 @@ def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List
 
             line_marked.append((w, tag))
 
+            if tag:
+                line_marked.append((w, tag))
+
+
+
         marked_lines.append(line_marked)
 
     return marked_lines
@@ -872,6 +878,7 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
             print(f"  ⚠ No text extracted")
             return
         print(f"  ✓ Extracted {len(words)} text segments")
+
 
         # Superscript/subscript tagging from baselines
         print(f"  Analyzing text layout (superscripts/subscripts)...")
