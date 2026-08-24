@@ -214,6 +214,38 @@ def apply_known_science_notation(text: str) -> str:
         lambda m: _KNOWN_SCIENCE_NOTATION.get(m.group(0), m.group(0)), text
     )
 
+# ---- Common OCR character-confusion fixes ----
+# Applied to reconstructed paragraph text. Deliberately narrow patterns so
+# they only fire in unambiguous contexts, leaving real words/formulas alone.
+#
+# Leading-zero-style decimal fractions (".Ol" -> ".01", ".l45" -> ".145")
+_DECIMAL_FRACTION_RE = re.compile(r"(?<![\w.])\.([O0-9lI]{1,4})(?!\w)")
+_ZERO_O_MID_RE = re.compile(r"(?<=\d)O(?=\d)")
+
+def fix_zero_o_confusion(text: str) -> str:
+    # Fix common OCR confusion between zero and letter O (and l/I) in decimal fractions.
+    # Note: l/I are often misrecognized as 1, but we don't want to blindly replace them in words, so we only fix them in decimal fractions (".l45" -> ".145").
+    if not text:
+        return text
+    def _norm(m: "re.Match") -> str:
+        token = m.group(1)
+        fixed = token.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1"}))
+        return "." + fixed
+    text = _DECIMAL_FRACTION_RE.sub(_norm, text)
+    text = _ZERO_O_MID_RE.sub("0", text)
+    return text
+
+# Collapse stray double periods (". .", ".  .", etc.) down to a single period.
+_DOUBLE_PERIOD_RE = re.compile(r"(?<!\.)\.\s?\.(?!\.)")
+
+def fix_double_periods(text: str) -> str:
+    """Collapse an OCR-inserted stray extra '.' -- adjacent or separated by
+    the single space line-joining inserts -- down to one period.
+    """
+    if not text:
+        return text
+    return _DOUBLE_PERIOD_RE.sub(".", text)
+
 @dataclass
 class OCRWord:
     page: int
@@ -908,7 +940,12 @@ def _paragraphize_marked_lines(marked_lines: List[List[Tuple[OCRWord, Optional[s
 
         split_here = False
         if current["page"] != nxt["page"]:
-            split_here = True
+            # New page, so always split. But check if the next line is indented enough to be a new paragraph.
+            metrics = page_metrics.get(nxt["page"], {"typical_gap": 0.0, "median_height": 1.0, "left_margin": 0.0})
+            indent = nxt["x1"] - metrics["left_margin"]
+            indent_threshold = max(18.0, metrics["median_height"] * 0.9)
+            if indent >= indent_threshold and re.search(r"[.!?;:]\s*$", current["text"]):
+                split_here = True
         else:
             metrics = page_metrics.get(current["page"], {"typical_gap": 0.0, "median_height": 1.0, "left_margin": 0.0})
             gap = max(0.0, nxt["top"] - current["bottom"])
@@ -1013,7 +1050,9 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
 
         html_paragraphs = []
         for paragraph in paragraphs:
-            t = apply_known_science_notation(paragraph)
+            t = fix_zero_o_confusion(paragraph)
+            t = fix_double_periods(t)
+            t = apply_known_science_notation(t)
             t = replace_greek_math(t)
             t = escape_user_content(t)
             t = escape_ampersands_not_entities(t)
