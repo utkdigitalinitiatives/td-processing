@@ -235,28 +235,12 @@ def fix_zero_o_confusion(text: str) -> str:
     text = _ZERO_O_MID_RE.sub("0", text)
     return text
 
-# ---- Mixed-case term casing fixes (learned per-document, not hand-maintained) ----
-# PaddleOCR sometimes reads the right letters for a mixed-case abbreviation
-# but mangles the case -- and not even consistently within the same document
-# (e.g. "dNMP" coming back as "dNmp" in one line and "dNMp" a few lines
-# later). This isn't a letter-confusion problem like fix_zero_o_confusion
-# handles, and a hardcoded term list (dNMP today, the next thesis's jargon
-# tomorrow) doesn't scale across a growing corpus of theses.
-#
-# Instead, learn correct casing straight from each PDF's own embedded text
-# layer: born-digital/tagged theses carry a clean, correctly-cased text
-# layer even when we still OCR the rendered page image for layout reasons
-# (see extract_abstract_region). Scan every page's native text for
-# "notable" mixed-case tokens -- abbreviations like dNMP/mRNA/cDNA/ATPase,
-# as opposed to ordinary sentence-initial capitalization -- and use the
-# most common casing seen as the correction target. PDFs with no usable
-# text layer (pure image scans) just yield an empty reference, so no
-# correction is attempted there.
+# ---- Mixed-case term casing fixes
+
 _CASING_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 def _is_notable_mixed_case(token: str) -> bool:
-    """True for stable-cased abbreviations (dNMP, mRNA, ATPase), False for
-    ordinary words that just happen to be capitalized (The, Dna-as-typo)."""
+    # True if the token has at least 2 letters and contains both uppercase and lowercase letters, but is not a simple capitalized word (e.g., "The", "Dna-as-typo").
     letters = [c for c in token if c.isalpha()]
     if len(letters) < 2:
         return False
@@ -264,26 +248,13 @@ def _is_notable_mixed_case(token: str) -> bool:
     has_lower = any(c.islower() for c in letters)
     if not (has_upper and has_lower):
         return False
-    # Plain leading-cap-then-lowercase is just normal capitalization, not a
-    # stable abbreviation -- exclude it so we don't "correct" e.g. a
-    # sentence-initial word to whatever case it happened to appear in once.
+    # Reject ordinary capitalized words (The, Dna-as-typo) that are not known mixed-case terms.
     if letters[0].isupper() and all(c.islower() for c in letters[1:]):
         return False
     return True
 
 def build_casing_reference(doc, min_occurrences: int = 2, min_dominance: float = 0.7) -> dict:
-    """Learn a lowercase-token -> correctly-cased-token map from a PDF's own
-    embedded text layer, for use by fix_known_term_casing.
-
-    Tallies *every* casing seen for a word, not just mixed-case sightings --
-    otherwise a common word that glitches to a mixed-case artifact even once
-    (e.g. axis-label/table junk like "tO" for "to") would look like its only
-    known casing and get "corrected" into everywhere it appears. A mixed-case
-    variant only earns a correction entry when it's the dominant casing for
-    that word by a wide margin, which real abbreviations (dNMP, mRNA, ...)
-    satisfy easily since they're spelled the same way every time, while
-    one-off scan/table noise does not.
-    """
+    # Build a reference dict of known mixed-case terms (dNMP, mRNA, ATPase) from the document text.
     from collections import Counter
     counts: dict = {}
     for i in range(doc.page_count):
@@ -310,8 +281,7 @@ def build_casing_reference(doc, min_occurrences: int = 2, min_dominance: float =
     return reference
 
 def fix_known_term_casing(text: str, casing_reference: dict) -> str:
-    """Correct OCR case-mangling for mixed-case abbreviations using casing
-    learned from this document itself (see build_casing_reference)."""
+    # Correct OCR-mangled casing of known mixed-case terms (dNMP, mRNA, ATPase)
     if not text or not casing_reference:
         return text
     return _CASING_TOKEN_RE.sub(
