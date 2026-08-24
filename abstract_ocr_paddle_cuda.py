@@ -235,6 +235,89 @@ def fix_zero_o_confusion(text: str) -> str:
     text = _ZERO_O_MID_RE.sub("0", text)
     return text
 
+# ---- Mixed-case term casing fixes (learned per-document, not hand-maintained) ----
+# PaddleOCR sometimes reads the right letters for a mixed-case abbreviation
+# but mangles the case -- and not even consistently within the same document
+# (e.g. "dNMP" coming back as "dNmp" in one line and "dNMp" a few lines
+# later). This isn't a letter-confusion problem like fix_zero_o_confusion
+# handles, and a hardcoded term list (dNMP today, the next thesis's jargon
+# tomorrow) doesn't scale across a growing corpus of theses.
+#
+# Instead, learn correct casing straight from each PDF's own embedded text
+# layer: born-digital/tagged theses carry a clean, correctly-cased text
+# layer even when we still OCR the rendered page image for layout reasons
+# (see extract_abstract_region). Scan every page's native text for
+# "notable" mixed-case tokens -- abbreviations like dNMP/mRNA/cDNA/ATPase,
+# as opposed to ordinary sentence-initial capitalization -- and use the
+# most common casing seen as the correction target. PDFs with no usable
+# text layer (pure image scans) just yield an empty reference, so no
+# correction is attempted there.
+_CASING_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+
+def _is_notable_mixed_case(token: str) -> bool:
+    """True for stable-cased abbreviations (dNMP, mRNA, ATPase), False for
+    ordinary words that just happen to be capitalized (The, Dna-as-typo)."""
+    letters = [c for c in token if c.isalpha()]
+    if len(letters) < 2:
+        return False
+    has_upper = any(c.isupper() for c in letters)
+    has_lower = any(c.islower() for c in letters)
+    if not (has_upper and has_lower):
+        return False
+    # Plain leading-cap-then-lowercase is just normal capitalization, not a
+    # stable abbreviation -- exclude it so we don't "correct" e.g. a
+    # sentence-initial word to whatever case it happened to appear in once.
+    if letters[0].isupper() and all(c.islower() for c in letters[1:]):
+        return False
+    return True
+
+def build_casing_reference(doc, min_occurrences: int = 2, min_dominance: float = 0.7) -> dict:
+    """Learn a lowercase-token -> correctly-cased-token map from a PDF's own
+    embedded text layer, for use by fix_known_term_casing.
+
+    Tallies *every* casing seen for a word, not just mixed-case sightings --
+    otherwise a common word that glitches to a mixed-case artifact even once
+    (e.g. axis-label/table junk like "tO" for "to") would look like its only
+    known casing and get "corrected" into everywhere it appears. A mixed-case
+    variant only earns a correction entry when it's the dominant casing for
+    that word by a wide margin, which real abbreviations (dNMP, mRNA, ...)
+    satisfy easily since they're spelled the same way every time, while
+    one-off scan/table noise does not.
+    """
+    from collections import Counter
+    counts: dict = {}
+    for i in range(doc.page_count):
+        try:
+            text = doc.load_page(i).get_text("text")
+        except Exception:
+            continue
+        if not text:
+            continue
+        for tok in _CASING_TOKEN_RE.findall(text):
+            counts.setdefault(tok.lower(), Counter())[tok] += 1
+
+    reference = {}
+    for key, variants in counts.items():
+        top_variant, top_count = variants.most_common(1)[0]
+        total = sum(variants.values())
+        if not _is_notable_mixed_case(top_variant):
+            continue
+        if total < min_occurrences:
+            continue
+        if (top_count / total) < min_dominance:
+            continue
+        reference[key] = top_variant
+    return reference
+
+def fix_known_term_casing(text: str, casing_reference: dict) -> str:
+    """Correct OCR case-mangling for mixed-case abbreviations using casing
+    learned from this document itself (see build_casing_reference)."""
+    if not text or not casing_reference:
+        return text
+    return _CASING_TOKEN_RE.sub(
+        lambda m: casing_reference.get(m.group(0).lower(), m.group(0)), text
+    )
+
 # Collapse stray double periods (". .", ".  .", etc.) down to a single period.
 _DOUBLE_PERIOD_RE = re.compile(r"(?<!\.)\.\s?\.(?!\.)")
 
@@ -476,10 +559,22 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
             page_y_min, page_y_max = 0.0, 1.0
         page_span = max(1.0, page_y_max - page_y_min)
 
-        # Drop margin page-number words before line-grouping, since a footer
-        # number sitting close under the last body line can otherwise get
-        # merged into that line by the y-band grouper below.
-        page_words = [w for w in page_words if not _is_margin_page_number_word(w, page_y_min, page_span)]
+        # Drop margin page-number LINES (not individual words) before further
+        # line-grouping. Checking isolation at the line level -- rather than
+        # relying on _is_margin_page_number_word's text-pattern + margin-band
+        # check alone -- matters when an abstract's last paragraph ends near
+        # the bottom of the page: isotope numbers ("241AmO2"), exponents
+        # ("10-5"), and "M," all match the bare page-number pattern and sit
+        # in that same bottom margin band, but they share their line with
+        # real body text, so they must never be dropped just for that.
+        pre_lines = group_words_into_lines(page_words)
+        dropped_ids = set()
+        for ln in pre_lines:
+            if not ln or not _line_is_isolated_page_number(ln):
+                continue
+            if _is_margin_page_number_word(ln[0], page_y_min, page_span):
+                dropped_ids.update(id(w) for w in ln)
+        page_words = [w for w in page_words if id(w) not in dropped_ids]
 
         lines = group_words_into_lines(page_words)
 
@@ -589,19 +684,19 @@ def _looks_like_page_number(text: str) -> bool:
 
 def _is_margin_page_number_word(w: OCRWord, page_y_min: float, page_span: float,
                                  margin_ratio: float = 0.08) -> bool:
-    """True if `w` is an isolated running-header/footer page number (Arabic
-    digits like "5" or roman numerals like "iv"/"V") sitting in the page's top
-    or bottom margin, rather than actual abstract body text.
+    """True if `w` looks like a running-header/footer page number (Arabic
+    digits like "5" or roman numerals like "iv"/"V") and sits in the page's
+    top or bottom margin band, rather than actual abstract body text.
 
-    Checked per detected OCR box (before line-grouping) rather than per
-    grouped line: PaddleOCR often returns whole phrases as one box, and a
-    footer page number can sit close enough underneath the last body line
-    that naive y-band line-grouping would otherwise merge them, hiding the
-    number inside a longer joined string. Gated on both (a) looking like a
-    bare page number and (b) sitting in the outer margin band, so a real
-    short body word that happens to fit the pattern (e.g. "Mild") is not
-    misidentified unless it is also isolated way up in the header or down in
-    the footer.
+    This only checks the text pattern and vertical position -- it does NOT
+    by itself confirm the word is isolated from real body text. Callers must
+    pair this with a line-level isolation check (see
+    `_line_is_isolated_page_number`) before dropping anything: when an
+    abstract's last paragraph ends near the bottom of a page, isotope mass
+    numbers ("241" in "241AmO2"), exponents ("-5" in "10-5"), and even bare
+    "M" (a valid roman numeral for 1000) all match this pattern and sit in
+    that same margin band, even though they are plainly part of a real
+    sentence, not a standalone footer number.
     """
     if page_span <= 0:
         return False
@@ -611,6 +706,22 @@ def _is_margin_page_number_word(w: OCRWord, page_y_min: float, page_span: float,
     center_y = w_center_y(w)
     rel = (center_y - page_y_min) / page_span
     return rel <= margin_ratio or rel >= (1.0 - margin_ratio)
+
+
+def _line_is_isolated_page_number(line_words: List[OCRWord]) -> bool:
+    """True if every word on this line looks like a bare page number, i.e.
+    the line has no real body-text content sharing it.
+
+    A genuine running header/footer page number sits alone on its own line
+    ("iii", "5"). A superscript/subscript that merely happens to match the
+    same digit/roman-numeral pattern (isotope numbers, exponents, "M" for
+    molarity) instead shares its line with ordinary body words -- so this
+    line-level check, not just the word's own text, is what actually
+    distinguishes the two cases.
+    """
+    if not line_words:
+        return False
+    return all(_looks_like_page_number((w.text or "").strip()) for w in line_words)
 
 
 def _line_stats(line: List[OCRWord]) -> dict:
@@ -1000,7 +1111,12 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
 
     with fitz.open(pdf_path) as doc:
         print(f"  PDF loaded: {doc.page_count} pages")
-        
+
+        # Learn correct casing for mixed-case abbreviations (dNMP, mRNA, ...)
+        # from this thesis's own embedded text layer, so PaddleOCR's
+        # case-mangling can be corrected without a hand-maintained term list.
+        casing_reference = build_casing_reference(doc)
+
         start_p = None
         end_p = None
         
@@ -1052,6 +1168,7 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
         for paragraph in paragraphs:
             t = fix_zero_o_confusion(paragraph)
             t = fix_double_periods(t)
+            t = fix_known_term_casing(t, casing_reference)
             t = apply_known_science_notation(t)
             t = replace_greek_math(t)
             t = escape_user_content(t)
