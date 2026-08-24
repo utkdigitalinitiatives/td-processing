@@ -4,6 +4,15 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', message='.*urllib3.*')
 warnings.filterwarnings('ignore', message='.*chardet.*')
 
+# Force UTF-8 on stdout/stderr to avoid UnicodeEncodeError on Windows console
+# Helps batch processing of PDFs with non-ASCII characters in text or metadata.
+import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import os
 import difflib
 import re
@@ -161,6 +170,49 @@ MATH_MAP = {
     "∉": "&notin;","∩": "&cap;","∪": "&cup;","⊂": "&sub;","⊃": "&sup;","⊆": "&sube;","⊇": "&supe;",
     "·": "&middot;","′": "&prime;","″": "&Prime;"
 }
+
+# ---- Known scientific notation, matched by exact text rather than OCR geometry ----
+# PaddleOCR (tuned for reliability here, see the unclip_ratio note in
+# init_paddle_ocr) detects and recognizes whole *lines* as a single box, not
+# individual words -- "R2" in "R2 for this equation" comes back as one
+# recognized string with one bounding box, not "R" plus a raised "2". That
+# means mark_sup_sub_lines' vertical-offset comparison between adjacent boxes
+# has nothing to compare for these cases; it stays in place as a fallback for
+# the rare case a document does yield word-level boxes, but the real fix for
+# line-level output is text-pattern matching.
+#
+# Deliberately a curated allowlist rather than an open "any element symbol
+# chain" regex: these abstracts are health-science theses, where an open
+# regex would mistag common non-chemistry alphanumeric tokens as formulas
+# (e.g. "HIV2", "H1N1", "COVID19" -- H, I, V, N, C, O are all valid element
+# symbols). Extend these dicts as new confirmed cases turn up.
+SCIENTIFIC_NOTATION_SUP = {
+    "R2": "R<sup>2</sup>", "r2": "r<sup>2</sup>",
+    "R3": "R<sup>3</sup>", "r3": "r<sup>3</sup>",
+}
+CHEMICAL_FORMULA_SUB = {
+    "H2O": "H<sub>2</sub>O", "CO2": "CO<sub>2</sub>", "O2": "O<sub>2</sub>", "N2": "N<sub>2</sub>",
+    "NH3": "NH<sub>3</sub>", "NH4": "NH<sub>4</sub>", "SO2": "SO<sub>2</sub>", "SO4": "SO<sub>4</sub>",
+    "NO2": "NO<sub>2</sub>", "NO3": "NO<sub>3</sub>", "CaCO3": "CaCO<sub>3</sub>", "MgCl2": "MgCl<sub>2</sub>",
+    "MgSO4": "MgSO<sub>4</sub>", "H2SO4": "H<sub>2</sub>SO<sub>4</sub>", "HNO3": "HNO<sub>3</sub>",
+    "CH4": "CH<sub>4</sub>", "C6H12O6": "C<sub>6</sub>H<sub>12</sub>O<sub>6</sub>", "FeCl3": "FeCl<sub>3</sub>",
+    "Fe2O3": "Fe<sub>2</sub>O<sub>3</sub>", "Al2O3": "Al<sub>2</sub>O<sub>3</sub>", "CuSO4": "CuSO<sub>4</sub>",
+    "AgNO3": "AgNO<sub>3</sub>", "Na2CO3": "Na<sub>2</sub>CO<sub>3</sub>", "K2CO3": "K<sub>2</sub>CO<sub>3</sub>",
+    "BaSO4": "BaSO<sub>4</sub>", "VO2": "VO<sub>2</sub>", "C6H6": "C<sub>6</sub>H<sub>6</sub>",
+    "C2H5OH": "C<sub>2</sub>H<sub>5</sub>OH",
+}
+_KNOWN_SCIENCE_NOTATION = {**SCIENTIFIC_NOTATION_SUP, **CHEMICAL_FORMULA_SUB}
+_SCIENCE_TOKEN_RE = re.compile(r"\b\w+\b")
+
+def apply_known_science_notation(text: str) -> str:
+    """Tag known statistical/chemical tokens (e.g. 'R2', 'CO2') by exact text
+    match, since the OCR line-level boxes give us no visual offset to detect
+    them by position. See _KNOWN_SCIENCE_NOTATION above."""
+    if not text or not _KNOWN_SCIENCE_NOTATION:
+        return text
+    return _SCIENCE_TOKEN_RE.sub(
+        lambda m: _KNOWN_SCIENCE_NOTATION.get(m.group(0), m.group(0)), text
+    )
 
 @dataclass
 class OCRWord:
@@ -377,12 +429,26 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
     for p in range(start_page, min(start_page+max_pages, doc.page_count)):
         print(f"    Processing page {p+1} with PaddleOCR...", end='', flush=True)
         pix = render_page_image(doc, p, dpi=350)
-        h = pix.height
         page_words = paddle_ocr_page(pix, confidence_threshold=confidence_threshold)
         print(f" done ({len(page_words)} text segments found)")
-        
+
         # mark page index
         for w in page_words: w.page = p
+
+        # Content bounds for this page, used to spot isolated header/footer
+        # page-number words (Arabic or roman numerals) in the top/bottom margin.
+        if page_words:
+            page_y_min = min(w.bbox[1] for w in page_words)
+            page_y_max = max(w.bbox[3] for w in page_words)
+        else:
+            page_y_min, page_y_max = 0.0, 1.0
+        page_span = max(1.0, page_y_max - page_y_min)
+
+        # Drop margin page-number words before line-grouping, since a footer
+        # number sitting close under the last body line can otherwise get
+        # merged into that line by the y-band grouper below.
+        page_words = [w for w in page_words if not _is_margin_page_number_word(w, page_y_min, page_span)]
+
         lines = group_words_into_lines(page_words)
 
         # If we hit a stop heading, terminate
@@ -489,6 +555,32 @@ def _looks_like_page_number(text: str) -> bool:
     return False
 
 
+def _is_margin_page_number_word(w: OCRWord, page_y_min: float, page_span: float,
+                                 margin_ratio: float = 0.08) -> bool:
+    """True if `w` is an isolated running-header/footer page number (Arabic
+    digits like "5" or roman numerals like "iv"/"V") sitting in the page's top
+    or bottom margin, rather than actual abstract body text.
+
+    Checked per detected OCR box (before line-grouping) rather than per
+    grouped line: PaddleOCR often returns whole phrases as one box, and a
+    footer page number can sit close enough underneath the last body line
+    that naive y-band line-grouping would otherwise merge them, hiding the
+    number inside a longer joined string. Gated on both (a) looking like a
+    bare page number and (b) sitting in the outer margin band, so a real
+    short body word that happens to fit the pattern (e.g. "Mild") is not
+    misidentified unless it is also isolated way up in the header or down in
+    the footer.
+    """
+    if page_span <= 0:
+        return False
+    text = (w.text or "").strip()
+    if not _looks_like_page_number(text):
+        return False
+    center_y = w_center_y(w)
+    rel = (center_y - page_y_min) / page_span
+    return rel <= margin_ratio or rel >= (1.0 - margin_ratio)
+
+
 def _line_stats(line: List[OCRWord]) -> dict:
     xs1 = [w.bbox[0] for w in line]
     ys1 = [w.bbox[1] for w in line]
@@ -546,7 +638,7 @@ def _is_formula_script_candidate(text: str) -> bool:
 def _has_alpha(text: str) -> bool:
     return any(ch.isalpha() for ch in (text or ""))
 
-def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List[List[Tuple[OCRWord, Optional[str]]]]:
+def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List[List[Tuple[OCRWord, Optional[str], bool]]]:
     """Simple, conservative detector for obvious scripts.
 
     Rules:
@@ -568,7 +660,7 @@ def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List
             y_min, y_max = page_bounds[p]
             page_bounds[p] = (min(y_min, w.bbox[1]), max(y_max, w.bbox[3]))
 
-    marked_lines: List[List[Tuple[OCRWord, Optional[str]]]] = []
+    marked_lines: List[List[Tuple[OCRWord, Optional[str], bool]]] = []
     for ln in lines:
         ln_sorted = sorted(ln, key=lambda w: w.bbox[0])
         if not ln_sorted:
@@ -589,15 +681,27 @@ def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List
                 gaps.append(g)
         attach_gap = max(2.0, min(12.0, 1.4 * (median(gaps) if gaps else 4.0)))
 
-        line_marked: List[Tuple[OCRWord, Optional[str]]] = []
+        line_marked: List[Tuple[OCRWord, Optional[str], bool]] = []
+        glue_next = False
         for i, w in enumerate(ln_sorted):
             txt = (w.text or "").strip()
             tag = None
+            glue_before = glue_next
+            glue_next = False
 
-            if txt and _is_formula_script_candidate(txt) and not _looks_like_page_number(txt):
+            # Note: intentionally NOT excluding tokens that "look like a page
+            # number" here. Sub/superscript candidates are short digit runs
+            # (e.g. "2" in "R2"), which is exactly what _looks_like_page_number
+            # also matches -- excluding them here would suppress virtually
+            # every numeric script. Running-header/footer page numbers are
+            # filtered separately (by margin position, before line-grouping,
+            # in _is_margin_page_number_word) and by the header/footer band
+            # check just below, and a real page number won't sit attached to
+            # an alphabetic neighbor the way a formula script does.
+            if txt and _is_formula_script_candidate(txt):
                 cy = w_center_y(w)
                 h = _word_height(w)
-                
+
                 # Skip likely headers/footers.
                 if (cy - y_min) / page_h > 0.10 and (cy - y_min) / page_h < 0.90:
                     left = ln_sorted[i - 1] if i > 0 else None
@@ -605,6 +709,8 @@ def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List
 
                     left_ok = False
                     right_ok = False
+                    left_gap = None
+                    right_gap = None
                     if left is not None and _has_alpha(left.text):
                         left_gap = w.bbox[0] - left.bbox[2]
                         left_ok = left_gap <= attach_gap
@@ -624,12 +730,16 @@ def mark_sup_sub_lines(words: List[OCRWord], position_only: bool = True) -> List
                         elif obvious_sup:
                             tag = "sup"
 
-            line_marked.append((w, tag))
+                        if tag:
+                            # Glue the tagged token to whichever neighbor it's
+                            # actually attached to, so "R" + "<sub>2</sub>"
+                            # renders as "R<sub>2</sub>" instead of "R <sub>2</sub>".
+                            if left_ok and (not right_ok or (left_gap or 0) <= (right_gap or 0)):
+                                glue_before = True
+                            elif right_ok:
+                                glue_next = True
 
-            if tag:
-                line_marked.append((w, tag))
-
-
+            line_marked.append((w, tag, glue_before))
 
         marked_lines.append(line_marked)
 
@@ -701,14 +811,14 @@ def convert_remaining_non_ascii(text: str) -> str:
             out.append(ch)
     return "".join(out)
 
-def _marked_line_to_record(marked_line: List[Tuple[OCRWord, Optional[str]]]) -> Optional[dict]:
+def _marked_line_to_record(marked_line: List[Tuple[OCRWord, Optional[str], bool]]) -> Optional[dict]:
     """Convert one OCR line into text + layout metadata."""
     if not marked_line:
         return None
 
-    text_parts = []
+    text = ""
     words = []
-    for w, tag in marked_line:
+    for w, tag, glue_before in marked_line:
         t = (w.text or "").strip()
         if not t:
             continue
@@ -716,14 +826,19 @@ def _marked_line_to_record(marked_line: List[Tuple[OCRWord, Optional[str]]]) -> 
             t = f"<sup>{t}</sup>"
         elif tag == "sub":
             t = f"<sub>{t}</sub>"
-        text_parts.append(t)
+        if text and glue_before:
+            text += t
+        elif text:
+            text += " " + t
+        else:
+            text = t
         words.append(w)
 
-    if not text_parts or not words:
+    if not text or not words:
         return None
 
     return {
-        "text": " ".join(text_parts),
+        "text": text,
         "page": words[0].page,
         "x1": float(min(w.bbox[0] for w in words)),
         "top": float(min(w.bbox[1] for w in words)),
@@ -752,7 +867,7 @@ def _join_wrapped_lines(line_texts: List[str]) -> str:
     return re.sub(r"\s+", " ", merged).strip()
 
 
-def _paragraphize_marked_lines(marked_lines: List[List[Tuple[OCRWord, Optional[str]]]]) -> List[str]:
+def _paragraphize_marked_lines(marked_lines: List[List[Tuple[OCRWord, Optional[str], bool]]]) -> List[str]:
     """Split OCR lines into paragraphs using vertical gaps and indentation."""
     line_records = []
     for marked_line in marked_lines:
@@ -898,7 +1013,8 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
 
         html_paragraphs = []
         for paragraph in paragraphs:
-            t = replace_greek_math(paragraph)
+            t = apply_known_science_notation(paragraph)
+            t = replace_greek_math(t)
             t = escape_user_content(t)
             t = escape_ampersands_not_entities(t)
             t = convert_remaining_non_ascii(t)
