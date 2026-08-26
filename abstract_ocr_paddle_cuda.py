@@ -178,6 +178,7 @@ MATH_MAP = {
 SCIENTIFIC_NOTATION_SUP = {
     "R2": "R<sup>2</sup>", "r2": "r<sup>2</sup>",
     "R3": "R<sup>3</sup>", "r3": "r<sup>3</sup>",
+    "cm2": "cm<sup>2</sup>",
 }
 CHEMICAL_FORMULA_SUB = {
     "H2O": "H<sub>2</sub>O", "CO2": "CO<sub>2</sub>", "O2": "O<sub>2</sub>", "N2": "N<sub>2</sub>",
@@ -199,20 +200,29 @@ ISOTOPE_NOTATION_SUP = {
     "89Mo": "<sup>89</sup>Mo", "89Mom": "<sup>89</sup>Mo<sup>m</sup>",
     "90Mo": "<sup>90</sup>Mo", "92Mo": "<sup>92</sup>Mo",
 }
-# Unit OCR fixes: common misreads of units 
+# Unit OCR fixes: common misreads of units
 UNIT_OCR_FIXES = {
     "GFa": "GPa",
 }
-_KNOWN_SCIENCE_NOTATION = {**SCIENTIFIC_NOTATION_SUP, **CHEMICAL_FORMULA_SUB, **ISOTOPE_NOTATION_SUP, **UNIT_OCR_FIXES}
+# Non-chemical subscript notation confirmed by exact text match (e.g. "K2"
+# for a dust-resistivity coefficient). Kept as its own dict, distinct from
+# CHEMICAL_FORMULA_SUB, since these aren't chemical formulas.
+SUBSCRIPT_NOTATION_SUB = {
+    "K2": "K<sub>2</sub>",
+}
+_KNOWN_SCIENCE_NOTATION = {**SCIENTIFIC_NOTATION_SUP, **CHEMICAL_FORMULA_SUB, **ISOTOPE_NOTATION_SUP, **UNIT_OCR_FIXES, **SUBSCRIPT_NOTATION_SUB}
 _SCIENCE_TOKEN_RE = re.compile(r"\b\w+\b")
 
-# Common OCR misreads of scientific phrases that are not simple tokens, so we can't catch them with the token regex above. These are applied by exact text match.
-# Also covers known-italic academic terms (e.g. "log ft", a statistics term always italicized by convention) -- text-pattern matching, not visual detection, so it's reliable regardless of scan quality.
+# Common OCR misreads of scientific phrases that are not single tokens, so we can't catch them with the token regex above. These are applied by exact text match.
 SCIENCE_PHRASE_FIXES = {
     "Ca 2+": "Ca<sup>2+</sup>",
     "Mg 2+": "Mg<sup>2+</sup>",
     "2.Oug": "2.0µg",
     "log ft": "log <i>ft</i>",
+    "K-2": "K<sub>2</sub>",
+    "ft.2": "ft.<sup>2</sup>",
+    "Les )": "Les<sup>-</sup>)",
+    "Rec )": "Rec<sup>-</sup>)",
 }
 
 def apply_known_science_notation(text: str) -> str:
