@@ -23,6 +23,8 @@ import time
 import math
 import html
 import inspect
+import subprocess
+import tempfile
 import numpy as np
 import tqdm
 from PIL import Image
@@ -172,20 +174,7 @@ MATH_MAP = {
 }
 
 # ---- Known scientific notation, matched by exact text rather than OCR geometry ----
-# PaddleOCR (tuned for reliability here, see the unclip_ratio note in
-# init_paddle_ocr) detects and recognizes whole *lines* as a single box, not
-# individual words -- "R2" in "R2 for this equation" comes back as one
-# recognized string with one bounding box, not "R" plus a raised "2". That
-# means mark_sup_sub_lines' vertical-offset comparison between adjacent boxes
-# has nothing to compare for these cases; it stays in place as a fallback for
-# the rare case a document does yield word-level boxes, but the real fix for
-# line-level output is text-pattern matching.
-#
-# Deliberately a curated allowlist rather than an open "any element symbol
-# chain" regex: these abstracts are health-science theses, where an open
-# regex would mistag common non-chemistry alphanumeric tokens as formulas
-# (e.g. "HIV2", "H1N1", "COVID19" -- H, I, V, N, C, O are all valid element
-# symbols). Extend these dicts as new confirmed cases turn up.
+# Problem: OCR often misreads superscripts/subscripts, and we have no visual offset info at the line level to detect them. So we only tag known scientific tokens by exact text match here.
 SCIENTIFIC_NOTATION_SUP = {
     "R2": "R<sup>2</sup>", "r2": "r<sup>2</sup>",
     "R3": "R<sup>3</sup>", "r3": "r<sup>3</sup>",
@@ -201,18 +190,46 @@ CHEMICAL_FORMULA_SUB = {
     "BaSO4": "BaSO<sub>4</sub>", "VO2": "VO<sub>2</sub>", "C6H6": "C<sub>6</sub>H<sub>6</sub>",
     "C2H5OH": "C<sub>2</sub>H<sub>5</sub>OH",
 }
-_KNOWN_SCIENCE_NOTATION = {**SCIENTIFIC_NOTATION_SUP, **CHEMICAL_FORMULA_SUB}
+# Isotope notation (leading mass-number superscript before the element
+# symbol, plus a trailing superscript "m" for a metastable state if present).
+ISOTOPE_NOTATION_SUP = {
+    "89Zr": "<sup>89</sup>Zr", "89Zrm": "<sup>89</sup>Zr<sup>m</sup>",
+    "89Y": "<sup>89</sup>Y", "89y": "<sup>89</sup>Y",
+    "89Nb": "<sup>89</sup>Nb", "89Nbm": "<sup>89</sup>Nb<sup>m</sup>",
+    "89Mo": "<sup>89</sup>Mo", "89Mom": "<sup>89</sup>Mo<sup>m</sup>",
+    "90Mo": "<sup>90</sup>Mo", "92Mo": "<sup>92</sup>Mo",
+}
+# Unit OCR fixes: common misreads of units 
+UNIT_OCR_FIXES = {
+    "GFa": "GPa",
+}
+_KNOWN_SCIENCE_NOTATION = {**SCIENTIFIC_NOTATION_SUP, **CHEMICAL_FORMULA_SUB, **ISOTOPE_NOTATION_SUP, **UNIT_OCR_FIXES}
 _SCIENCE_TOKEN_RE = re.compile(r"\b\w+\b")
 
+# Common OCR misreads of scientific phrases that are not simple tokens, so we can't catch them with the token regex above. These are applied by exact text match.
+# Also covers known-italic academic terms (e.g. "log ft", a statistics term always italicized by convention) -- text-pattern matching, not visual detection, so it's reliable regardless of scan quality.
+SCIENCE_PHRASE_FIXES = {
+    "Ca 2+": "Ca<sup>2+</sup>",
+    "Mg 2+": "Mg<sup>2+</sup>",
+    "2.Oug": "2.0µg",
+    "log ft": "log <i>ft</i>",
+}
+
 def apply_known_science_notation(text: str) -> str:
-    """Tag known statistical/chemical tokens (e.g. 'R2', 'CO2') by exact text
-    match, since the OCR line-level boxes give us no visual offset to detect
-    them by position. See _KNOWN_SCIENCE_NOTATION above."""
-    if not text or not _KNOWN_SCIENCE_NOTATION:
+    """Tag known statistical/chemical/unit tokens (e.g. 'R2', 'CO2', 'GFa')
+    by exact text match, since the OCR line-level boxes give us no visual
+    offset to detect them by position. See _KNOWN_SCIENCE_NOTATION and
+    SCIENCE_PHRASE_FIXES above."""
+    if not text:
         return text
-    return _SCIENCE_TOKEN_RE.sub(
-        lambda m: _KNOWN_SCIENCE_NOTATION.get(m.group(0), m.group(0)), text
-    )
+    for phrase, replacement in SCIENCE_PHRASE_FIXES.items():
+        if phrase in text:
+            text = text.replace(phrase, replacement)
+    if _KNOWN_SCIENCE_NOTATION:
+        text = _SCIENCE_TOKEN_RE.sub(
+            lambda m: _KNOWN_SCIENCE_NOTATION.get(m.group(0), m.group(0)), text
+        )
+    return text
 
 # ---- Common OCR character-confusion fixes ----
 # Applied to reconstructed paragraph text. Deliberately narrow patterns so
@@ -234,6 +251,22 @@ def fix_zero_o_confusion(text: str) -> str:
     text = _DECIMAL_FRACTION_RE.sub(_norm, text)
     text = _ZERO_O_MID_RE.sub("0", text)
     return text
+
+# Degree symbol OCR confusion: "100oC" or "100O'C" -> "100°C"
+_DEGREE_APOSTROPHE_RE = re.compile(r"\b(\d{1,3})[0oO]['’]([CF])\b", re.IGNORECASE)
+
+def fix_degree_celsius(text: str) -> str:
+    if not text:
+        return text
+    return _DEGREE_APOSTROPHE_RE.sub(lambda m: m.group(1) + "0°" + m.group(2).upper(), text)
+
+# Scientific exponent notation: "3 x 10-5" -> "3×10<sup>-5</sup>"
+_SCI_EXPONENT_RE = re.compile(r"(?<=[\d.])\s*[xX]\s*10(\d{1,3})(?!\d)")
+
+def fix_scientific_exponent_notation(text: str) -> str:
+    if not text:
+        return text
+    return _SCI_EXPONENT_RE.sub(lambda m: f"×10<sup>{m.group(1)}</sup>", text)
 
 # ---- Mixed-case term casing fixes
 
@@ -419,6 +452,51 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
     
     return words
 
+# ---- Per-page OCR process isolation ----
+# PaddleOCR's CPU inference has been observed to crash with a native access
+# violation (an uncatchable segfault, not a Python exception) intermittently.
+# To avoid losing the entire PDF processing, we isolate each page's OCR in a separate subprocess. If a crash occurs, we can retry once or skip the page without affecting the rest of the document.
+def run_ocr_page_worker(pdf_path: Path, page_index: int, dpi: int, confidence_threshold: float, out_json: Path):
+    """Child-process entry point: render one page, OCR it, write results as JSON."""
+    with fitz.open(pdf_path) as doc:
+        pix = render_page_image(doc, page_index, dpi=dpi)
+    init_paddle_ocr()
+    words = paddle_ocr_page(pix, confidence_threshold=confidence_threshold)
+    payload = [{"text": w.text, "conf": w.conf, "bbox": list(w.bbox)} for w in words]
+    out_json.write_text(json.dumps(payload), encoding="utf-8")
+
+def ocr_page_isolated(pdf_path: Path, page_index: int, dpi: int, confidence_threshold: float,
+                       max_attempts: int = 2) -> List[OCRWord]:
+    """Run OCR for one page in an isolated subprocess, retrying once on crash."""
+    script_path = Path(__file__).resolve()
+    for attempt in range(1, max_attempts + 1):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = Path(tmp) / "words.json"
+            cmd = [
+                sys.executable, str(script_path),
+                "--ocr-page",
+                "--pdf", str(pdf_path),
+                "--page", str(page_index),
+                "--dpi", str(dpi),
+                "--confidence-threshold", str(confidence_threshold),
+                "--out-json", str(out_json),
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0 and out_json.exists():
+                try:
+                    payload = json.loads(out_json.read_text(encoding="utf-8"))
+                except Exception:
+                    payload = None
+                if payload is not None:
+                    return [
+                        OCRWord(page=page_index, text=item["text"], conf=item["conf"], bbox=tuple(item["bbox"]))
+                        for item in payload
+                    ]
+            if attempt < max_attempts:
+                print(" (crashed, retrying)", end="", flush=True)
+    print(" ⚠ OCR crashed twice, skipping page", end="", flush=True)
+    return []
+
 def find_abstract_page(doc, max_first_pages=15) -> Optional[int]:
    """Find the abstract page using fast PDF text extraction only."""
    page_count = min(max_first_pages, doc.page_count)
@@ -464,8 +542,7 @@ def safe_page_text(doc, page_index: int, confidence_threshold: float = 0.60) -> 
         print(f"  ⚠ Falling back to OCR for page {page_index+1} text extraction")
 
     try:
-        pix = render_page_image(doc, page_index, dpi=220)
-        words = paddle_ocr_page(pix, confidence_threshold=confidence_threshold)
+        words = ocr_page_isolated(Path(doc.name), page_index, dpi=220, confidence_threshold=confidence_threshold)
         return " ".join(w.text for w in words if w.text).strip()
     except Exception as exc:
         print(f"  ⚠ OCR fallback failed on page {page_index+1}: {exc}")
@@ -495,26 +572,28 @@ def group_words_into_lines(words: List[OCRWord], y_tol_ratio=0.03):
         lines.append(sorted(current, key=lambda ww: ww.bbox[0]))
     return lines
 
-def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_threshold: float = 0.60):
+def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_threshold: float = 0.60, pdf_path: Optional[Path] = None):
     """Return raw OCR words (with boxes) from start_page until a stop heading or max_pages.
-    
+
     Args:
         doc: PDF document
         start_page: Starting page index (0-based)
         max_pages: Maximum pages to extract
         confidence_threshold: Filter out OCR detections below this confidence (0.0-1.0).
                              Increase to filter more noise, decrease to catch more text.
+        pdf_path: Path to the PDF on disk, needed to re-open it in the isolated
+                  per-page OCR subprocess (see ocr_page_isolated).
     """
     collected = []
     end_page = start_page
-    
+    src_path = pdf_path if pdf_path is not None else Path(doc.name)
+
     print(f"  Extracting text from pages {start_page+1} to {min(start_page+max_pages, doc.page_count)}...")
     print(f"  (Confidence threshold: {confidence_threshold*100:.0f}%, filtering low-confidence detections)")
 
     for p in range(start_page, min(start_page+max_pages, doc.page_count)):
         print(f"    Processing page {p+1} with PaddleOCR...", end='', flush=True)
-        pix = render_page_image(doc, p, dpi=350)
-        page_words = paddle_ocr_page(pix, confidence_threshold=confidence_threshold)
+        page_words = ocr_page_isolated(src_path, p, dpi=350, confidence_threshold=confidence_threshold)
         print(f" done ({len(page_words)} text segments found)")
 
         # mark page index
@@ -879,20 +958,24 @@ def escape_user_content(text: str) -> str:
         entity_placeholders[placeholder] = entity
         text = text.replace(entity, placeholder)
     
-    # Protect our sup/sub tags
+    # Protect our sup/sub/italic tags
     text = text.replace("<sup>", "___SUP_OPEN___")
     text = text.replace("</sup>", "___SUP_CLOSE___")
     text = text.replace("<sub>", "___SUB_OPEN___")
     text = text.replace("</sub>", "___SUB_CLOSE___")
-    
+    text = text.replace("<i>", "___I_OPEN___")
+    text = text.replace("</i>", "___I_CLOSE___")
+
     # NOW escape any remaining < and > (which are user content)
     text = text.replace("<", "&lt;").replace(">", "&gt;")
-    
+
     # Restore our protected tags
     text = text.replace("___SUP_OPEN___", "<sup>")
     text = text.replace("___SUP_CLOSE___", "</sup>")
     text = text.replace("___SUB_OPEN___", "<sub>")
     text = text.replace("___SUB_CLOSE___", "</sub>")
+    text = text.replace("___I_OPEN___", "<i>")
+    text = text.replace("___I_CLOSE___", "</i>")
     
     # Restore entities
     for placeholder, entity in entity_placeholders.items():
@@ -1111,7 +1194,7 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
 
 
         print(f"\n  Starting OCR extraction (this may take a moment)...")
-        words, end_idx = extract_abstract_region(doc, start_p, max_pages=(end_p-start_p+1), confidence_threshold=confidence_threshold)
+        words, end_idx = extract_abstract_region(doc, start_p, max_pages=(end_p-start_p+1), confidence_threshold=confidence_threshold, pdf_path=pdf_path)
         if not words:
             print(f"  ⚠ No text extracted")
             return
@@ -1138,6 +1221,8 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
         for paragraph in paragraphs:
             t = fix_zero_o_confusion(paragraph)
             t = fix_double_periods(t)
+            t = fix_degree_celsius(t)
+            t = fix_scientific_exponent_notation(t)
             t = fix_known_term_casing(t, casing_reference)
             t = apply_known_science_notation(t)
             t = replace_greek_math(t)
@@ -1174,15 +1259,32 @@ def load_overrides(path: Optional[Path]) -> dict:
 
 def main():
     import argparse
+
+    # Internal/hidden: used when this script re-invokes itself as a child
+    # process for exactly one PDF (see the crash-isolation loop below).
+    if "--ocr-page" in sys.argv:
+        worker_parser = argparse.ArgumentParser()
+        worker_parser.add_argument("--ocr-page", action="store_true")
+        worker_parser.add_argument("--pdf", required=True)
+        worker_parser.add_argument("--page", type=int, required=True)
+        worker_parser.add_argument("--dpi", type=int, required=True)
+        worker_parser.add_argument("--confidence-threshold", type=float, required=True)
+        worker_parser.add_argument("--out-json", required=True)
+        wargs = worker_parser.parse_args()
+        run_ocr_page_worker(Path(wargs.pdf), wargs.page, wargs.dpi, wargs.confidence_threshold, Path(wargs.out_json))
+        return
+
     parser = argparse.ArgumentParser(description="Extract abstracts from PDFs using Paddle OCR.")
     parser.add_argument("--input", required=True, help="Directory with PDFs")
     parser.add_argument("--out", required=True, help="Output directory for HTML files")
     parser.add_argument("--override-csv", default=None, help="Optional CSV file with filename,pages (format: filename,start-end). If not provided, auto-detects abstract boundaries.")
     parser.add_argument("--confidence-threshold", type=float, default=0.60, help="Filter OCR below this confidence (0.0-1.0). Default: 0.60")
     parser.add_argument("--force-single-paragraph", action="store_true", help="Merge extracted abstract text into one <p> block.")
+    # Internal/hidden: used when this script re-invokes itself as a child
+    # process for exactly one PDF (see the crash-isolation loop below).
+    # Not meant to be passed by hand.
+    parser.add_argument("--single-pdf", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    
-    init_paddle_ocr()
 
     in_dir = Path(args.input)
     out_dir = Path(args.out)
@@ -1191,8 +1293,20 @@ def main():
     # Load overrides if provided
     overrides = load_overrides(Path(args.override_csv)) if args.override_csv else {}
 
+    if args.single_pdf:
+        # If --single-pdf is provided, process just that one PDF and exit.
+        process_pdf(
+            Path(args.single_pdf),
+            out_dir,
+            overrides=overrides,
+            max_first_pages=15,
+            confidence_threshold=args.confidence_threshold,
+            force_single_paragraph=args.force_single_paragraph,
+        )
+        return
+
     pdfs = sorted([p for p in in_dir.glob("**/*.pdf")])
-    
+
     print(f"\n" + "="*70)
     print(f"PaddleOCR Abstract Extractor")
     print(f"="*70)
@@ -1206,19 +1320,37 @@ def main():
     print(f"Confidence threshold: {args.confidence_threshold*100:.0f}%")
     print(f"Force single paragraph: {'yes' if args.force_single_paragraph else 'no'}")
     print(f"="*70)
-    
+
+    # Process each PDF in isolation, retrying once if a crash occurs.
+    failures = []
     for idx, pdf in enumerate(pdfs, 1):
-        print(f"\n[{idx}/{len(pdfs)}] ", end="")
-        process_pdf(
-            pdf,
-            out_dir,
-            overrides=overrides,
-            max_first_pages=15,
-            confidence_threshold=args.confidence_threshold,
-            force_single_paragraph=args.force_single_paragraph,
-        )
-    
+        print(f"\n[{idx}/{len(pdfs)}] ", end="", flush=True)
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--input", str(in_dir),
+            "--out", str(out_dir),
+            "--single-pdf", str(pdf),
+            "--confidence-threshold", str(args.confidence_threshold),
+        ]
+        if args.override_csv:
+            cmd += ["--override-csv", args.override_csv]
+        if args.force_single_paragraph:
+            cmd += ["--force-single-paragraph"]
+
+        success = False
+        for attempt in (1, 2):
+            result = subprocess.run(cmd)
+            if result.returncode == 0:
+                success = True
+                break
+            print(f"  ⚠ Crashed (exit code {result.returncode}) processing {pdf.name}"
+                  + (", retrying once..." if attempt == 1 else ", giving up after retry."))
+        if not success:
+            failures.append(pdf.name)
+
     print(f"\n\nProcessed {len(pdfs)} PDFs. Text files saved to {out_dir}")
+    if failures:
+        print(f"⚠ {len(failures)} PDF(s) failed even after retry: {', '.join(failures)}")
 
 if __name__ == "__main__":
     main()
