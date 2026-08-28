@@ -662,34 +662,11 @@ def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str, str]], casing
         )
     return "\n\n".join(sections)
 
-# ---- Equation-region placeholder (isolated -- see ENABLE_EQUATION_PLACEHOLDERS) ----
-# A garbled OCR fragment ("$(K22$ 1.04 .087 (K21") is obviously broken --
-# nobody mistakes it for real content. A fluent VLM transcription of the
-# same equation could be subtly wrong and not look broken at all (both a 3B
-# and a 7B model made the identical sub/superscript mistake on one test
-# equation -- consistent with either a genuinely ambiguous scan or a shared
-# training-data prior overriding the actual pixels; one data point can't
-# tell which). So equations get a stricter bar than recovered prose: any
-# detected equation region always becomes an explicit
-# "[EQUATION - VERIFY MANUALLY]" placeholder in the *primary* draft text --
-# never OCR garbage, never a trusted-looking transcription -- while the
-# VLM's attempt (if --vlm-review is also on) still appears as clearly
-# unverified reference material in the usual supplementary block.
-#
-# Detection is a narrow, deliberately non-general heuristic calibrated
-# against real OCR-line geometry from a confirmed case (Thesis76.K355's two
-# stacked-fraction equations), not the general "any equation" problem: a
-# line is equation-like if it's narrow (PaddleOCR line-grouping merges a
-# whole equation into one detection box, so it's much narrower than a full
-# prose line) AND has no real word-like token, AND is either abnormally
-# tall (a fraction's numerator+denominator collapsed into one sparse
-# detection) or contains a stray "$" or multiple short fragments (a
-# garbled multi-token equation line). Misses inline/single-line/wide
-# equations -- accepted for now, not a general detector.
-#
-# To disable this whole layer (e.g. once VLM math transcription is trusted
-# enough to use directly): flip ENABLE_EQUATION_PLACEHOLDERS to False.
-# Nothing else in the file needs to change.
+# ---- Equation-region placeholder 
+# The OCR pipeline has no reliable way to detect stacked fractions or other
+# multi-line equations, so we insert a placeholder in the paragraph text for
+# each detected equation region.
+
 ENABLE_EQUATION_PLACEHOLDERS = True
 
 _WORDLIKE_TOKEN_RE = re.compile(r"[A-Za-z]{2,}")
