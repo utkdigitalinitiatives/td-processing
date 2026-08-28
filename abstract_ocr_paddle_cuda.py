@@ -507,6 +507,150 @@ def ocr_page_isolated(pdf_path: Path, page_index: int, dpi: int, confidence_thre
     print(" ⚠ OCR crashed twice, skipping page", end="", flush=True)
     return []
 
+# ---- Optional VLM review pass (Ollama, opt-in) ----
+# See plan notes for why this is opt-in and not the default. The VLM pass is slower than PaddleOCR, so we only trigger it on pages that are suspiciously sparse (e.g., missing a sentence) or have very low OCR confidence. The VLM prompt is tuned to transcribe old typewritten abstracts with minimal hallucination, but it is still a generative model and can produce errors, so we append its output as a separate HTML block for human review rather than splicing it into the main draft.
+
+DEFAULT_VLM_MODEL = "qwen2.5vl:3b"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_VLM_TRIGGER_THRESHOLD = 20  # segment count floor; see plan notes
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
+
+VLM_PROMPT = (
+    "This is a scanned page from an old typewritten academic thesis abstract. "
+    "Transcribe ALL the body text on this page exactly as written, word for word. "
+    "Formatting rules:\n"
+    "- Wrap superscript characters (like exponents or isotope numbers) in <sup></sup> tags.\n"
+    "- Wrap subscript characters in <sub></sub> tags.\n"
+    "- If you see a mathematical equation laid out as a stacked fraction (numerator "
+    "above a line, denominator below), transcribe it as inline text using a slash "
+    "for division and <sup>/<sub> tags for any exponents or subscripted variables, "
+    "e.g. K<sub>2</sub> = (eta_f * k') / rho_p * S<sup>2</sup> * (1-epsilon)/epsilon<sup>3</sup>.\n"
+    "- Do NOT invent, guess, or paraphrase any text you cannot clearly read. If a word "
+    "or symbol is illegible, write [ILLEGIBLE] instead of guessing.\n"
+    "- Do not include page numbers, headers, or footers.\n"
+    "- Output only the transcribed text, no commentary."
+)
+
+_vlm_availability_cache: dict = {}
+
+def _vlm_available(model: str, ollama_url: str) -> bool:
+    """Check once (cached) whether Ollama is reachable and `model` is pulled."""
+    cache_key = (model, ollama_url)
+    if cache_key in _vlm_availability_cache:
+        return _vlm_availability_cache[cache_key]
+    available = False
+    if _requests is not None:
+        try:
+            resp = _requests.get(f"{ollama_url}/api/tags", timeout=3)
+            if resp.status_code == 200:
+                names = {m.get("name") for m in resp.json().get("models", [])}
+                available = model in names
+        except Exception:
+            available = False
+    _vlm_availability_cache[cache_key] = available
+    return available
+
+def _page_is_suspicious(segment_count: int, prior_counts: List[int], threshold: int) -> bool:
+    """Flag a page as worth a VLM second look.
+
+    Heuristic, not proven: real data (see plan notes) showed 25-28
+    segments on typical dense abstract pages but 17 on a page missing a
+    whole sentence -- a floor threshold catches that, and comparing
+    against this document's own prior pages catches a partial drop that
+    doesn't cross the floor on an otherwise-denser document. Expect both
+    false positives (a genuinely short abstract) and false negatives (a
+    small drop on an already-sparse page) until tuned on more batches.
+    """
+    if segment_count < threshold:
+        return True
+    if prior_counts:
+        avg_prior = sum(prior_counts) / len(prior_counts)
+        if avg_prior > 0 and segment_count < 0.7 * avg_prior:
+            return True
+    return False
+
+def vlm_transcribe_page(pdf_path: Path, page_index: int, model: str = DEFAULT_VLM_MODEL,
+                         ollama_url: str = DEFAULT_OLLAMA_URL, dpi: int = 300,
+                         max_attempts: int = 2, first_attempt_timeout: int = 180,
+                         retry_timeout: int = 45) -> Optional[str]:
+    """Render one page and ask the VLM to transcribe it. Returns None on failure
+    after one retry -- never raises, so a flaky VLM call can't fail the batch.
+
+    Timeouts are deliberately asymmetric, calibrated against measured
+    qwen2.5vl:3b behavior: a genuine cold start (model not yet loaded into
+    VRAM -- the normal case for the *first* call of a deferred VLM phase,
+    since the PaddleOCR pass ahead of it takes minutes, well past Ollama's
+    idle unload) measured 121.8s once; warm calls measured 7-35s. So
+    first_attempt_timeout=180s covers a cold start with real margin, while
+    retry_timeout=45s is sized for a warm model -- Ollama keeps processing a
+    request server-side even after our client gives up waiting on it, so by
+    the time a retry fires, the model is very likely already warm regardless
+    of whether the first attempt "succeeded". Worst case: 225s (3.75 min),
+    down from a naive 2x180s=360s, without breaking the common cold-start case
+    the way a flat 45s/attempt did (that failed on literally every first call).
+    """
+    if _requests is None:
+        return None
+    with fitz.open(pdf_path) as doc:
+        pix = render_page_image(doc, page_index, dpi=dpi)
+    img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+
+    payload = {
+        "model": model,
+        "prompt": VLM_PROMPT,
+        "images": [img_b64],
+        "stream": False,
+        # num_ctx matters: the image alone consumes most of Ollama's 4096
+        # default context, and the full prompt + response overflows it.
+        "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 2048},
+    }
+    for attempt in range(1, max_attempts + 1):
+        timeout = first_attempt_timeout if attempt == 1 else retry_timeout
+        try:
+            resp = _requests.post(f"{ollama_url}/api/generate", json=payload, timeout=timeout)
+            resp.raise_for_status()
+            text = resp.json().get("response", "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+    return None
+
+def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str]], casing_reference: dict, vlm_model: str) -> str:
+    """Turn (page_index, raw_vlm_text) pairs into HTML-comment-labeled
+    supplementary blocks, running each through the same per-paragraph fixup
+    chain as normal paragraphs (fix_zero_o_confusion, apply_known_science_notation,
+    etc. -- harmless even on already-clean VLM text). See the "Optional VLM
+    review pass" section for why these are appended, not spliced into the draft.
+    """
+    sections = []
+    for page_idx, vlm_text in vlm_blocks:
+        vlm_paragraphs = [p.strip() for p in re.split(r"\n\s*\n", vlm_text) if p.strip()]
+        fixed = []
+        for para in vlm_paragraphs:
+            t = fix_zero_o_confusion(para)
+            t = fix_double_periods(t)
+            t = fix_degree_celsius(t)
+            t = fix_scientific_exponent_notation(t)
+            t = fix_known_term_casing(t, casing_reference)
+            t = apply_known_science_notation(t)
+            t = replace_greek_math(t)
+            t = escape_user_content(t)
+            t = escape_ampersands_not_entities(t)
+            t = convert_remaining_non_ascii(t)
+            fixed.append(t)
+        block_html = to_html_paragraphs(fixed).replace("\n", "")
+        sections.append(
+            f"<!-- VLM RECOVERY -- page {page_idx+1} flagged as low-confidence "
+            f"({vlm_model}); please verify against the source PDF and merge into "
+            f"the paragraph above if correct -->\n{block_html}"
+        )
+    return "\n\n".join(sections)
+
 def find_abstract_page(doc, max_first_pages=15) -> Optional[int]:
    """Find the abstract page using fast PDF text extraction only."""
    page_count = min(max_first_pages, doc.page_count)
@@ -582,7 +726,8 @@ def group_words_into_lines(words: List[OCRWord], y_tol_ratio=0.03):
         lines.append(sorted(current, key=lambda ww: ww.bbox[0]))
     return lines
 
-def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_threshold: float = 0.60, pdf_path: Optional[Path] = None):
+def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_threshold: float = 0.60, pdf_path: Optional[Path] = None,
+                             vlm_review_mode: Optional[str] = None, vlm_trigger_threshold: int = DEFAULT_VLM_TRIGGER_THRESHOLD):
     """Return raw OCR words (with boxes) from start_page until a stop heading or max_pages.
 
     Args:
@@ -593,10 +738,21 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
                              Increase to filter more noise, decrease to catch more text.
         pdf_path: Path to the PDF on disk, needed to re-open it in the isolated
                   per-page OCR subprocess (see ocr_page_isolated).
+        vlm_review_mode: None (off, default), "targeted" (only pages that look
+                  suspicious -- see _page_is_suspicious), or "always" (every page).
+                  NOTE: no VLM call is made here -- this only *flags* pages
+                  (a cheap, local, no-network decision). See the "Optional VLM
+                  review pass" section for why the actual calls are deferred
+                  to main(), strictly after all PaddleOCR work in the batch.
+        vlm_trigger_threshold: see _page_is_suspicious. Only used when
+                  vlm_review_mode == "targeted".
     """
     collected = []
     end_page = start_page
     src_path = pdf_path if pdf_path is not None else Path(doc.name)
+
+    vlm_flagged_pages: List[int] = []
+    prior_segment_counts: List[int] = []
 
     print(f"  Extracting text from pages {start_page+1} to {min(start_page+max_pages, doc.page_count)}...")
     print(f"  (Confidence threshold: {confidence_threshold*100:.0f}%, filtering low-confidence detections)")
@@ -605,6 +761,13 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         print(f"    Processing page {p+1} with PaddleOCR...", end='', flush=True)
         page_words = ocr_page_isolated(src_path, p, dpi=350, confidence_threshold=confidence_threshold)
         print(f" done ({len(page_words)} text segments found)")
+
+        if vlm_review_mode:
+            suspicious = vlm_review_mode == "always" or _page_is_suspicious(len(page_words), prior_segment_counts, vlm_trigger_threshold)
+            if suspicious:
+                print(f"    Page {p+1} flagged for deferred VLM review ({len(page_words)} segments)")
+                vlm_flagged_pages.append(p)
+            prior_segment_counts.append(len(page_words))
 
         # mark page index
         for w in page_words: w.page = p
@@ -651,7 +814,7 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         if stop:
             break
 
-    return collected, end_page
+    return collected, end_page, vlm_flagged_pages
 
 # ---- Superscript/Subscript detection by baseline ----
 def baseline_clusters(words: List[OCRWord], band_px=8):
@@ -738,6 +901,11 @@ def _looks_like_page_number(text: str) -> bool:
         return True
     if re.fullmatch(r"[ivxlcdm]+", compact, re.IGNORECASE):
         return True
+    # Allow "1" to be misrecognized as "i" in roman numerals, but only for short sequences
+    if len(compact) <= 5:
+        normalized = compact.replace("1", "i")
+        if re.fullmatch(r"[ivxlcdm]+", normalized, re.IGNORECASE):
+            return True
     return False
 
 
@@ -1155,9 +1323,10 @@ def to_html_paragraphs(paragraphs: List[str]) -> str:
     return "\n".join(f"<p>{p}</p>" for p in paragraphs if p.strip())
 
 # ---- Main processing ----
-def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages: int, confidence_threshold: float = 0.60, force_single_paragraph: bool = False):
+def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages: int, confidence_threshold: float = 0.60, force_single_paragraph: bool = False,
+                 vlm_review_mode: Optional[str] = None, vlm_trigger_threshold: int = DEFAULT_VLM_TRIGGER_THRESHOLD):
     """Process a PDF and extract abstract text.
-    
+
     Args:
         pdf_path: Path to PDF file
         out_dir: Output directory
@@ -1166,6 +1335,13 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
         confidence_threshold: Filter out OCR detections below this confidence (0.0-1.0).
                              Default 0.60. Increase to filter more noise.
         force_single_paragraph: Merge all extracted text into one paragraph.
+        vlm_review_mode, vlm_trigger_threshold: see extract_abstract_region.
+                             vlm_review_mode is None (off) by default -- this is an
+                             opt-in feature. No VLM call happens in this function or
+                             its subprocess -- flagged pages are written to a sidecar
+                             manifest for main()'s deferred VLM phase to pick up after
+                             every PDF in the batch has finished its PaddleOCR work
+                             (see the "Optional VLM review pass" section for why).
     """
 
     print(f"\n{'='*70}")
@@ -1204,7 +1380,10 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
 
 
         print(f"\n  Starting OCR extraction (this may take a moment)...")
-        words, end_idx = extract_abstract_region(doc, start_p, max_pages=(end_p-start_p+1), confidence_threshold=confidence_threshold, pdf_path=pdf_path)
+        words, end_idx, vlm_flagged_pages = extract_abstract_region(
+            doc, start_p, max_pages=(end_p-start_p+1), confidence_threshold=confidence_threshold, pdf_path=pdf_path,
+            vlm_review_mode=vlm_review_mode, vlm_trigger_threshold=vlm_trigger_threshold,
+        )
         if not words:
             print(f"  ⚠ No text extracted")
             return
@@ -1247,7 +1426,17 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
         # Write HTML output
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / f"{pdf_path.stem} draft.txt").write_text(html_text, encoding="utf-8")
-        
+
+        # Pages flagged for VLM review (see extract_abstract_region) are NOT
+        # reviewed here -- leave a sidecar manifest for main()'s deferred VLM
+        # phase, which runs strictly after every PDF in the batch has finished
+        # its PaddleOCR work (see the "Optional VLM review pass" section for
+        # why: an Ollama model resident on the GPU has been observed to break
+        # PaddleOCR's own init for any call made while it's loaded).
+        if vlm_review_mode and vlm_flagged_pages:
+            sidecar = out_dir / f"{pdf_path.stem} draft.vlm_pending.json"
+            sidecar.write_text(json.dumps({"pdf_path": str(pdf_path), "pages": vlm_flagged_pages}), encoding="utf-8")
+
         print(f"  ✓ SUCCESS")
         print(f"  Pages used: {start_p+1} to {end_idx+1}")
 
@@ -1294,7 +1483,21 @@ def main():
     # process for exactly one PDF (see the crash-isolation loop below).
     # Not meant to be passed by hand.
     parser.add_argument("--single-pdf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--vlm-review", action="store_true",
+                         help="Opt-in: use a local Ollama vision model as a second-pass review for pages "
+                              "that look suspicious (or all pages, with --vlm-review-mode always). Gracefully "
+                              "skipped if Ollama/the model isn't available. Output lands as a separate, "
+                              "clearly-labeled block per page for manual review, not spliced into the draft.")
+    parser.add_argument("--vlm-review-mode", choices=["targeted", "always"], default="targeted",
+                         help="targeted (default): only review pages with a suspiciously low OCR segment "
+                              "count. always: review every abstract page. Only applies with --vlm-review.")
+    parser.add_argument("--vlm-model", default=DEFAULT_VLM_MODEL, help=f"Ollama model tag to use. Default: {DEFAULT_VLM_MODEL}")
+    parser.add_argument("--vlm-trigger-threshold", type=int, default=DEFAULT_VLM_TRIGGER_THRESHOLD,
+                         help=f"Segment-count floor below which a page is flagged for VLM review in targeted mode. Default: {DEFAULT_VLM_TRIGGER_THRESHOLD}")
+    parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help=f"Ollama server URL. Default: {DEFAULT_OLLAMA_URL}")
     args = parser.parse_args()
+
+    vlm_review_mode = args.vlm_review_mode if args.vlm_review else None
 
     in_dir = Path(args.input)
     out_dir = Path(args.out)
@@ -1305,6 +1508,7 @@ def main():
 
     if args.single_pdf:
         # If --single-pdf is provided, process just that one PDF and exit.
+        # No VLM call happens here -- see process_pdf's docstring.
         process_pdf(
             Path(args.single_pdf),
             out_dir,
@@ -1312,6 +1516,8 @@ def main():
             max_first_pages=15,
             confidence_threshold=args.confidence_threshold,
             force_single_paragraph=args.force_single_paragraph,
+            vlm_review_mode=vlm_review_mode,
+            vlm_trigger_threshold=args.vlm_trigger_threshold,
         )
         return
 
@@ -1346,6 +1552,13 @@ def main():
             cmd += ["--override-csv", args.override_csv]
         if args.force_single_paragraph:
             cmd += ["--force-single-paragraph"]
+        if args.vlm_review:
+            # Only what extract_abstract_region needs to *flag* pages (a local,
+            # no-network decision) -- --vlm-model/--ollama-url aren't needed by
+            # the child, since no VLM call is ever made from inside it (see the
+            # "Optional VLM review pass" section for why).
+            cmd += ["--vlm-review", "--vlm-review-mode", args.vlm_review_mode,
+                    "--vlm-trigger-threshold", str(args.vlm_trigger_threshold)]
 
         success = False
         for attempt in (1, 2):
@@ -1361,6 +1574,46 @@ def main():
     print(f"\n\nProcessed {len(pdfs)} PDFs. Text files saved to {out_dir}")
     if failures:
         print(f"⚠ {len(failures)} PDF(s) failed even after retry: {', '.join(failures)}")
+
+    # Deferred VLM review phase -- runs only now, strictly after every PDF's
+    # PaddleOCR work (across the whole batch) is fully done. Never move this
+    # earlier / interleave it with the loop above: see the "CRITICAL" note in
+    # the "Optional VLM review pass" section for why that breaks PaddleOCR.
+    if args.vlm_review:
+        pending = sorted(out_dir.glob("*.vlm_pending.json"))
+        if pending:
+            print(f"\n{'='*70}")
+            print(f"VLM review pass ({len(pending)} document(s) with flagged pages)")
+            print(f"{'='*70}")
+            vlm_ok = _vlm_available(args.vlm_model, args.ollama_url)
+            if not vlm_ok:
+                print(f"ℹ VLM review requested but unavailable (Ollama/{args.vlm_model} not reachable at {args.ollama_url}) -- skipping, drafts left as OCR-only output")
+            for sidecar in pending:
+                if vlm_ok:
+                    try:
+                        manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+                        vlm_pdf_path = Path(manifest["pdf_path"])
+                        vlm_pages = manifest["pages"]
+                        print(f"  {vlm_pdf_path.name}: reviewing {len(vlm_pages)} flagged page(s)...", end="", flush=True)
+                        with fitz.open(vlm_pdf_path) as vlm_doc:
+                            vlm_casing_reference = build_casing_reference(vlm_doc)
+                        vlm_blocks = []
+                        for vlm_page in vlm_pages:
+                            vlm_text = vlm_transcribe_page(vlm_pdf_path, vlm_page, model=args.vlm_model, ollama_url=args.ollama_url)
+                            if vlm_text:
+                                vlm_blocks.append((vlm_page, vlm_text))
+                        if vlm_blocks:
+                            supplementary = _build_vlm_supplementary_html(vlm_blocks, vlm_casing_reference, args.vlm_model)
+                            draft_path = out_dir / f"{vlm_pdf_path.stem} draft.txt"
+                            if draft_path.exists():
+                                existing = draft_path.read_text(encoding="utf-8")
+                                draft_path.write_text(existing + "\n\n" + supplementary, encoding="utf-8")
+                            print(f" done ({len(vlm_blocks)} recovered)")
+                        else:
+                            print(" done (none recovered)")
+                    except Exception as e:
+                        print(f" ⚠ failed: {e}")
+                sidecar.unlink(missing_ok=True)
 
 if __name__ == "__main__":
     main()
