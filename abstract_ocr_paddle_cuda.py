@@ -200,9 +200,10 @@ ISOTOPE_NOTATION_SUP = {
     "89Mo": "<sup>89</sup>Mo", "89Mom": "<sup>89</sup>Mo<sup>m</sup>",
     "90Mo": "<sup>90</sup>Mo", "92Mo": "<sup>92</sup>Mo",
 }
-# Unit OCR fixes: common misreads of units
+# Unit/identifier OCR fixes: common misreads confirmed against source scans.
 UNIT_OCR_FIXES = {
     "GFa": "GPa",
+    "ilvBll2": "ilvB112",
 }
 # Non-chemical subscript notation confirmed by exact text match (e.g. "K2"
 # for a dust-resistivity coefficient). Kept as its own dict, distinct from
@@ -223,6 +224,7 @@ SCIENCE_PHRASE_FIXES = {
     "ft.2": "ft.<sup>2</sup>",
     "Les )": "Les<sup>-</sup>)",
     "Rec )": "Rec<sup>-</sup>)",
+    "leu-l": "leu-1",
 }
 
 def apply_known_science_notation(text: str) -> str:
@@ -277,6 +279,23 @@ def fix_scientific_exponent_notation(text: str) -> str:
     if not text:
         return text
     return _SCI_EXPONENT_RE.sub(lambda m: f"×10<sup>{m.group(1)}</sup>", text)
+
+# Common abbreviations that end with a period but are not sentence-ending. We don't want to remove the period from these, but we do want to avoid treating them as sentence boundaries when reconstructing paragraphs.
+_ABBREVIATIONS_WITH_PERIOD = {
+    "etc", "vs", "dr", "mr", "mrs", "ms", "prof", "fig", "figs", "eq", "eqs",
+    "vol", "vols", "al", "cf", "approx", "ca", "no", "nos", "pp", "sp", "spp",
+}
+_STRAY_PERIOD_RE = re.compile(r"\b([A-Za-z]{2,})\.\s(?=[a-z])")
+
+def fix_stray_period_before_lowercase(text: str) -> str:
+    if not text:
+        return text
+    def _norm(m: "re.Match") -> str:
+        word = m.group(1)
+        if word.lower() in _ABBREVIATIONS_WITH_PERIOD:
+            return m.group(0)
+        return word + " "
+    return _STRAY_PERIOD_RE.sub(_norm, text)
 
 # ---- Mixed-case term casing fixes
 
@@ -644,6 +663,7 @@ def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str, str]], casing
         for para in vlm_paragraphs:
             t = fix_zero_o_confusion(para)
             t = fix_double_periods(t)
+            t = fix_stray_period_before_lowercase(t)
             t = fix_degree_celsius(t)
             t = fix_scientific_exponent_notation(t)
             t = fix_known_term_casing(t, casing_reference)
@@ -1517,6 +1537,7 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
         for paragraph in paragraphs:
             t = fix_zero_o_confusion(paragraph)
             t = fix_double_periods(t)
+            t = fix_stray_period_before_lowercase(t)
             t = fix_degree_celsius(t)
             t = fix_scientific_exponent_notation(t)
             t = fix_known_term_casing(t, casing_reference)
