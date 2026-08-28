@@ -620,15 +620,25 @@ def vlm_transcribe_page(pdf_path: Path, page_index: int, model: str = DEFAULT_VL
             pass
     return None
 
-def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str]], casing_reference: dict, vlm_model: str) -> str:
-    """Turn (page_index, raw_vlm_text) pairs into HTML-comment-labeled
+# Human-readable label per flag reason -- see _page_is_suspicious (reason
+# "low_confidence") and the equation-placeholder section below (reason
+# "equation"). Keeping this as a small lookup, not inline string logic, so
+# a new reason only needs one new entry here.
+_VLM_FLAG_REASON_LABELS = {
+    "low_confidence": "flagged as low-confidence",
+    "equation": "flagged for equation content (transcription unverified -- "
+                "see the [EQUATION] placeholder(s) in the paragraph above)",
+}
+
+def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str, str]], casing_reference: dict, vlm_model: str) -> str:
+    """Turn (page_index, reason, raw_vlm_text) triples into HTML-comment-labeled
     supplementary blocks, running each through the same per-paragraph fixup
     chain as normal paragraphs (fix_zero_o_confusion, apply_known_science_notation,
     etc. -- harmless even on already-clean VLM text). See the "Optional VLM
     review pass" section for why these are appended, not spliced into the draft.
     """
     sections = []
-    for page_idx, vlm_text in vlm_blocks:
+    for page_idx, reason, vlm_text in vlm_blocks:
         vlm_paragraphs = [p.strip() for p in re.split(r"\n\s*\n", vlm_text) if p.strip()]
         fixed = []
         for para in vlm_paragraphs:
@@ -644,12 +654,114 @@ def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str]], casing_refe
             t = convert_remaining_non_ascii(t)
             fixed.append(t)
         block_html = to_html_paragraphs(fixed).replace("\n", "")
+        label = _VLM_FLAG_REASON_LABELS.get(reason, "flagged for review")
         sections.append(
-            f"<!-- VLM RECOVERY -- page {page_idx+1} flagged as low-confidence "
+            f"<!-- VLM RECOVERY -- page {page_idx+1} {label} "
             f"({vlm_model}); please verify against the source PDF and merge into "
             f"the paragraph above if correct -->\n{block_html}"
         )
     return "\n\n".join(sections)
+
+# ---- Equation-region placeholder (isolated -- see ENABLE_EQUATION_PLACEHOLDERS) ----
+# A garbled OCR fragment ("$(K22$ 1.04 .087 (K21") is obviously broken --
+# nobody mistakes it for real content. A fluent VLM transcription of the
+# same equation could be subtly wrong and not look broken at all (both a 3B
+# and a 7B model made the identical sub/superscript mistake on one test
+# equation -- consistent with either a genuinely ambiguous scan or a shared
+# training-data prior overriding the actual pixels; one data point can't
+# tell which). So equations get a stricter bar than recovered prose: any
+# detected equation region always becomes an explicit
+# "[EQUATION - VERIFY MANUALLY]" placeholder in the *primary* draft text --
+# never OCR garbage, never a trusted-looking transcription -- while the
+# VLM's attempt (if --vlm-review is also on) still appears as clearly
+# unverified reference material in the usual supplementary block.
+#
+# Detection is a narrow, deliberately non-general heuristic calibrated
+# against real OCR-line geometry from a confirmed case (Thesis76.K355's two
+# stacked-fraction equations), not the general "any equation" problem: a
+# line is equation-like if it's narrow (PaddleOCR line-grouping merges a
+# whole equation into one detection box, so it's much narrower than a full
+# prose line) AND has no real word-like token, AND is either abnormally
+# tall (a fraction's numerator+denominator collapsed into one sparse
+# detection) or contains a stray "$" or multiple short fragments (a
+# garbled multi-token equation line). Misses inline/single-line/wide
+# equations -- accepted for now, not a general detector.
+#
+# To disable this whole layer (e.g. once VLM math transcription is trusted
+# enough to use directly): flip ENABLE_EQUATION_PLACEHOLDERS to False.
+# Nothing else in the file needs to change.
+ENABLE_EQUATION_PLACEHOLDERS = True
+
+_WORDLIKE_TOKEN_RE = re.compile(r"[A-Za-z]{2,}")
+
+def _line_is_equation_like(line: List[OCRWord], median_height: float, median_width: float) -> bool:
+    stats = _line_stats(line)
+    width = stats["x2"] - stats["x1"]
+    if width > 0.5 * median_width:
+        return False
+    texts = [(w.text or "").strip() for w in line]
+    if any(_WORDLIKE_TOKEN_RE.search(t) for t in texts):
+        return False
+    height = stats["bottom"] - stats["top"]
+    tall = height >= 1.5 * median_height
+    has_stray_symbol = any("$" in t for t in texts)
+    multi_fragment = len(texts) >= 2
+    return tall or has_stray_symbol or multi_fragment
+
+def _find_equation_line_groups(lines: List[List[OCRWord]]) -> List[List[List[OCRWord]]]:
+    """Group consecutive equation-like lines (see _line_is_equation_like)
+    into equation regions. Usually one line per region in practice -- a
+    stacked fraction typically collapses into a single OCR-grouped line --
+    but adjacent equation-like lines are merged so a region formatted
+    differently isn't split into several back-to-back placeholders."""
+    real_lines = [ln for ln in lines if ln]
+    if not real_lines:
+        return []
+    heights = [_line_stats(ln)["bottom"] - _line_stats(ln)["top"] for ln in real_lines]
+    widths = [_line_stats(ln)["x2"] - _line_stats(ln)["x1"] for ln in real_lines]
+    median_height = max(1.0, median(heights))
+    median_width = max(1.0, median(widths))
+
+    groups: List[List[List[OCRWord]]] = []
+    current: List[List[OCRWord]] = []
+    for ln in real_lines:
+        if _line_is_equation_like(ln, median_height, median_width):
+            current.append(ln)
+        else:
+            if current:
+                groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+def _replace_equation_groups_with_placeholders(page_words: List[OCRWord],
+                                                groups: List[List[List[OCRWord]]],
+                                                page_index: int) -> List[OCRWord]:
+    """Remove each equation region's words and splice in one synthetic
+    placeholder OCRWord per region, positioned at the region's bounding
+    box. Downstream code (mark_sup_sub_lines, paragraph reconstruction)
+    only needs page/bbox/text on an OCRWord and re-sorts by position, so
+    the placeholder needs no special-casing anywhere else in the pipeline.
+    """
+    if not groups:
+        return page_words
+    remove_ids = set()
+    placeholders: List[OCRWord] = []
+    for i, group in enumerate(groups, 1):
+        group_words = [w for ln in group for w in ln]
+        if not group_words:
+            continue
+        remove_ids.update(id(w) for w in group_words)
+        x1 = min(w.bbox[0] for w in group_words)
+        y1 = min(w.bbox[1] for w in group_words)
+        x2 = max(w.bbox[2] for w in group_words)
+        y2 = max(w.bbox[3] for w in group_words)
+        suffix = f" {i}" if len(groups) > 1 else ""
+        label = f"[EQUATION{suffix} - VERIFY MANUALLY, PAGE {page_index+1}]"
+        placeholders.append(OCRWord(page=page_index, text=label, conf=1.0, bbox=(x1, y1, x2, y2)))
+    kept = [w for w in page_words if id(w) not in remove_ids]
+    return kept + placeholders
 
 def find_abstract_page(doc, max_first_pages=15) -> Optional[int]:
    """Find the abstract page using fast PDF text extraction only."""
@@ -746,12 +858,19 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
                   to main(), strictly after all PaddleOCR work in the batch.
         vlm_trigger_threshold: see _page_is_suspicious. Only used when
                   vlm_review_mode == "targeted".
+
+    Returns (collected_words, end_page, vlm_flagged_pages), where
+    vlm_flagged_pages is a list of (page_index, reason) pairs -- reason is
+    "low_confidence" or "equation" (see ENABLE_EQUATION_PLACEHOLDERS).
+    Equation-region detection/placeholder substitution always runs
+    (independent of vlm_review_mode); pages only get added to
+    vlm_flagged_pages when vlm_review_mode is set.
     """
     collected = []
     end_page = start_page
     src_path = pdf_path if pdf_path is not None else Path(doc.name)
 
-    vlm_flagged_pages: List[int] = []
+    vlm_flagged_pages: dict = {}  # page_index -> reason ("low_confidence" or "equation")
     prior_segment_counts: List[int] = []
 
     print(f"  Extracting text from pages {start_page+1} to {min(start_page+max_pages, doc.page_count)}...")
@@ -766,7 +885,7 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
             suspicious = vlm_review_mode == "always" or _page_is_suspicious(len(page_words), prior_segment_counts, vlm_trigger_threshold)
             if suspicious:
                 print(f"    Page {p+1} flagged for deferred VLM review ({len(page_words)} segments)")
-                vlm_flagged_pages.append(p)
+                vlm_flagged_pages[p] = "low_confidence"
             prior_segment_counts.append(len(page_words))
 
         # mark page index
@@ -798,6 +917,17 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
                 dropped_ids.update(id(w) for w in ln)
         page_words = [w for w in page_words if id(w) not in dropped_ids]
 
+        # See "Equation-region placeholder" section: replace anything that
+        # looks like a stacked-fraction equation with an explicit
+        # placeholder before it ever reaches the normal text pipeline.
+        if ENABLE_EQUATION_PLACEHOLDERS:
+            eq_groups = _find_equation_line_groups(group_words_into_lines(page_words))
+            if eq_groups:
+                print(f"    Page {p+1}: {len(eq_groups)} equation region(s) replaced with placeholder")
+                page_words = _replace_equation_groups_with_placeholders(page_words, eq_groups, p)
+                if vlm_review_mode:
+                    vlm_flagged_pages[p] = "equation"
+
         lines = group_words_into_lines(page_words)
 
         # If we hit a stop heading, terminate
@@ -814,7 +944,7 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         if stop:
             break
 
-    return collected, end_page, vlm_flagged_pages
+    return collected, end_page, list(vlm_flagged_pages.items())
 
 # ---- Superscript/Subscript detection by baseline ----
 def baseline_clusters(words: List[OCRWord], band_px=8):
@@ -1435,7 +1565,8 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
         # PaddleOCR's own init for any call made while it's loaded).
         if vlm_review_mode and vlm_flagged_pages:
             sidecar = out_dir / f"{pdf_path.stem} draft.vlm_pending.json"
-            sidecar.write_text(json.dumps({"pdf_path": str(pdf_path), "pages": vlm_flagged_pages}), encoding="utf-8")
+            # vlm_flagged_pages is a list of [page_index, reason] pairs.
+            sidecar.write_text(json.dumps({"pdf_path": str(pdf_path), "flagged_pages": vlm_flagged_pages}), encoding="utf-8")
 
         print(f"  ✓ SUCCESS")
         print(f"  Pages used: {start_p+1} to {end_idx+1}")
@@ -1593,15 +1724,15 @@ def main():
                     try:
                         manifest = json.loads(sidecar.read_text(encoding="utf-8"))
                         vlm_pdf_path = Path(manifest["pdf_path"])
-                        vlm_pages = manifest["pages"]
-                        print(f"  {vlm_pdf_path.name}: reviewing {len(vlm_pages)} flagged page(s)...", end="", flush=True)
+                        vlm_flagged = manifest["flagged_pages"]  # [[page_index, reason], ...]
+                        print(f"  {vlm_pdf_path.name}: reviewing {len(vlm_flagged)} flagged page(s)...", end="", flush=True)
                         with fitz.open(vlm_pdf_path) as vlm_doc:
                             vlm_casing_reference = build_casing_reference(vlm_doc)
                         vlm_blocks = []
-                        for vlm_page in vlm_pages:
+                        for vlm_page, vlm_reason in vlm_flagged:
                             vlm_text = vlm_transcribe_page(vlm_pdf_path, vlm_page, model=args.vlm_model, ollama_url=args.ollama_url)
                             if vlm_text:
-                                vlm_blocks.append((vlm_page, vlm_text))
+                                vlm_blocks.append((vlm_page, vlm_reason, vlm_text))
                         if vlm_blocks:
                             supplementary = _build_vlm_supplementary_html(vlm_blocks, vlm_casing_reference, args.vlm_model)
                             draft_path = out_dir / f"{vlm_pdf_path.stem} draft.txt"
