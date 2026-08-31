@@ -789,11 +789,12 @@ def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
 # shared prefix (confirmed unsafe on real data -- "Fu"/"eta_f", and
 # "ε"/"epsilon" where OCR was already the more correct rendering).
 #
-# Equation-placeholder-marker content never merges here -- always
-# report-only. (A prior version of this branch tried inserting the VLM's
-# equation transcription alongside the placeholder; reverted -- see the
-# "Inline diff-merge" plan for what's being tried instead, and why that
-# needs the placeholder-vs-diff-span relationship kept clean first.)
+# Equation-placeholder-marker content never merges through this
+# classify/merge path -- always flagged here. It's handled by the
+# separate _apply_equation_recovery below instead, which replaces the
+# placeholder itself rather than trying to merge a fragmented diff span
+# (see that function's docstring for why per-opcode merging can't reach
+# these).
 _EQUATION_PLACEHOLDER_MARKER = "[EQUATION"
 _MERGE_ANCHOR_WORDS = 4
 _MERGE_MAX_ADDITION_CHARS = 8
@@ -834,17 +835,6 @@ def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merg
             return "merge"  # short trailing addition, e.g. a dropped superscript
     return "flag"
 
-def _wrap_vlm_merge(text: str, ocr_span: str, vlm_span: str) -> str:
-    """Visibly mark auto-applied text that *replaces* something OCR
-    already produced -- same "always show your work, never blend
-    silently" precedent as the equation placeholders and the VLM
-    recovery blocks. Greppable, trivially strippable once this pass is
-    trusted enough to blend in. Only used for "replace"-tag merges --
-    pure insertions (nothing there to second-guess) go in unmarked, see
-    _apply_vlm_diff_merges."""
-    title = html.escape(f'OCR: "{ocr_span}" | VLM: "{vlm_span}"', quote=True)
-    return f'<span class="vlm-merge" title="{title}">{text}</span>'
-
 def _normalize_for_primary_text(text: str) -> str:
     """Approximate how raw OCR/VLM text ends up rendered in the final
     draft, for the narrow purpose of locating (or inserting) it there --
@@ -859,6 +849,64 @@ def _normalize_for_primary_text(text: str) -> str:
     detection, etc.) -- those are context-dependent on the whole
     paragraph, not meaningful to apply to a short span in isolation."""
     return convert_remaining_non_ascii(replace_greek_math(text))
+
+_EQUATION_LABEL_NUM_RE = re.compile(r"\[EQUATION(?:\s+(\d+))?")
+
+def _apply_equation_recovery(primary: str, page_idx: int,
+                              opcodes: List[Tuple[str, List[str], List[str]]]) -> Tuple[str, List[int]]:
+    """For a page with any equation-placeholder-touching diff span,
+    replace each equation placeholder with its own VLM-recovered content
+    -- unmarked, same as any other pure insertion (this is adding real
+    content where a placeholder stood in for "nothing usable was
+    recovered yet", not second-guessing anything OCR itself produced).
+    A separate mechanism from the per-opcode word-diff merge above, not
+    an extension of it -- see the module comment above
+    _classify_diff_span for why per-opcode merging can't reach these
+    (the placeholder is one atomic token in the real pipeline, but this
+    module's word-level tokenization fragments it and glues the pieces
+    onto whatever's adjacent).
+
+    Groups contributing opcodes by which specific placeholder they touch
+    -- parsed straight from the "[EQUATION N" text present in every
+    contributing span, not by position or order. Confirmed necessary: a
+    naive "concatenate everything touching any placeholder, replace only
+    the first one" approach glues unrelated equations together with no
+    separator (K355's two equations on one page ended up as one run-on
+    expression) and leaves the second placeholder behind, orphaned, with
+    its real content already misattributed to the first. Each group only
+    ever replaces its own placeholder; a group whose placeholder can't be
+    found in `primary` is left flagged, same as if it had never merged.
+
+    Returns (updated_primary, contributing_indices) -- contributing_indices
+    are the opcodes' indices whose text actually made it into a
+    replacement (i.e., that specific placeholder was found), for report
+    annotation.
+    """
+    groups: dict = {}  # equation number as parsed (or None) -> [(idx, vlm_span), ...]
+    for idx, (tag, ocr_words, vlm_words) in enumerate(opcodes):
+        if tag == "equal":
+            continue
+        ocr_span = " ".join(ocr_words) or "(nothing)"
+        vlm_span = " ".join(vlm_words) or "(nothing)"
+        if _EQUATION_PLACEHOLDER_MARKER not in ocr_span and _EQUATION_PLACEHOLDER_MARKER not in vlm_span:
+            continue
+        m = _EQUATION_LABEL_NUM_RE.search(ocr_span) or _EQUATION_LABEL_NUM_RE.search(vlm_span)
+        eq_num = m.group(1) if m else None  # None -- the page's only region, unnumbered placeholder
+        if vlm_span != "(nothing)":
+            groups.setdefault(eq_num, []).append((idx, vlm_span))
+
+    contributing: List[int] = []
+    for eq_num, entries in groups.items():
+        suffix = f" {eq_num}" if eq_num else ""
+        label_pattern = re.compile(r"\[EQUATION" + re.escape(suffix) + r" - VERIFY MANUALLY, PAGE " + str(page_idx + 1) + r"\]")
+        match = label_pattern.search(primary)
+        if not match:
+            continue
+        combined_vlm = " ".join(vlm_span for _, vlm_span in entries)
+        addition = _normalize_for_primary_text(combined_vlm)
+        primary = primary[:match.start()] + addition + primary[match.end():]
+        contributing.extend(idx for idx, _ in entries)
+    return primary, contributing
 
 def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, str]]) -> Tuple[str, str]:
     """Apply "merge"-classified spans directly into draft_text's primary
@@ -896,22 +944,18 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                         matches = list(re.finditer(re.escape(anchor), primary, re.IGNORECASE))
                         if len(matches) == 1:
                             pos = matches[0].end()
-                            # Plain insertion -- no visible marker. We're
-                            # only ever adding content that wasn't there,
-                            # never touching/replacing anything OCR
-                            # already produced, so there's nothing to
-                            # flag for a human to double-check against.
-                            addition = vlm_normalized
-                            primary = primary[:pos] + " " + addition + primary[pos:]
+                            primary = primary[:pos] + " " + vlm_normalized + primary[pos:]
                             merged_idx.add(idx)
                 elif tag == "replace":
                     ocr_normalized = _normalize_for_primary_text(ocr_span)
                     matches = list(re.finditer(re.escape(ocr_normalized), primary, re.IGNORECASE))
                     if len(matches) == 1:
                         m = matches[0]
-                        replacement = _wrap_vlm_merge(vlm_normalized, ocr_span, vlm_span)
-                        primary = primary[:m.start()] + replacement + primary[m.end():]
+                        primary = primary[:m.start()] + vlm_normalized + primary[m.end():]
                         merged_idx.add(idx)
+
+        primary, eq_idx = _apply_equation_recovery(primary, page_idx, opcodes)
+        merged_idx |= set(eq_idx)
 
         report_lines = []
         for idx, (tag, ocr_words, vlm_words) in enumerate(opcodes):
@@ -925,9 +969,8 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             continue
         sections.append(
             f"<!-- OCR/VLM DIFF REPORT -- page {page_idx+1}, [MERGED] lines were "
-            f"applied inline above -- plain (unmarked) if added, "
-            f"<span class=\"vlm-merge\"> if it replaced existing text -- "
-            f"[FLAGGED] lines were not -->\n" + "\n".join(report_lines)
+            f"applied inline above (unmarked), [FLAGGED] lines were not -->\n"
+            + "\n".join(report_lines)
         )
     return primary + rest, "\n\n".join(sections)
 
@@ -1926,13 +1969,13 @@ def main():
     parser.add_argument("--vlm-diff-merge", action="store_true",
                          help="Experimental, opt-in: like --vlm-diff-review (implies it -- no need to pass "
                               "both), but also applies the subset of diff spans judged safe directly into "
-                              "the primary draft text. Pure insertions (OCR detected nothing there at all) "
-                              "go in unmarked, no length cap; anything that replaces text OCR already "
-                              "produced (a short trailing addition, or a pure case fix) is wrapped in a "
-                              "visible marker instead of blended in silently. Everything else (substitutions "
-                              "with no shared prefix, character-confusion substitutions, anything touching "
-                              "the equation-placeholder marker) stays report-only, same as --vlm-diff-review "
-                              "alone. See the diff-merge section for the real-data reasoning behind the split.")
+                              "the primary draft text, unmarked -- a pure insertion (OCR detected nothing "
+                              "there at all, no length cap), a short trailing addition or pure case fix on "
+                              "text OCR already matched, or an equation-placeholder's recovered content "
+                              "(replacing that specific placeholder only). Everything else (substitutions "
+                              "with no shared prefix, character-confusion substitutions) stays report-only, "
+                              "same as --vlm-diff-review alone. See the diff-merge section for the real-data "
+                              "reasoning behind the split.")
     args = parser.parse_args()
 
     vlm_review_mode = args.vlm_review_mode if args.vlm_review else None
