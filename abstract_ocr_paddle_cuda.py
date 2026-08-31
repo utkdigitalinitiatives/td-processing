@@ -556,20 +556,36 @@ VLM_PROMPT = (
 
 _vlm_availability_cache: dict = {}
 
-def _vlm_available(model: str, ollama_url: str) -> bool:
-    """Check once (cached) whether Ollama is reachable and `model` is pulled."""
+def _vlm_available(model: str, ollama_url: str, attempts: int = 4, retry_delay: float = 2.0) -> bool:
+    """Check (cached) whether Ollama is reachable and `model` is pulled.
+
+    Retries a few times with a short delay before giving up. A single
+    impatient check isn't reliable right after a machine restart -- Ollama's
+    background service can take several seconds to start listening on its
+    HTTP port, and a one-shot 3s-timeout GET made right in that window reads
+    as "unavailable" even though the service is only moments from being
+    ready (confirmed: --vlm-diff-review run alone right after a reboot got
+    skipped this way, while --vlm-review run alongside it happened to check
+    late enough -- via either extra elapsed time or the shared cache below
+    -- to see Ollama already up. That's a timing accident, not a real
+    dependency between the two flags, so it's fixed here for both.)
+    """
     cache_key = (model, ollama_url)
     if cache_key in _vlm_availability_cache:
         return _vlm_availability_cache[cache_key]
     available = False
     if _requests is not None:
-        try:
-            resp = _requests.get(f"{ollama_url}/api/tags", timeout=3)
-            if resp.status_code == 200:
-                names = {m.get("name") for m in resp.json().get("models", [])}
-                available = model in names
-        except Exception:
-            available = False
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = _requests.get(f"{ollama_url}/api/tags", timeout=3)
+                if resp.status_code == 200:
+                    names = {m.get("name") for m in resp.json().get("models", [])}
+                    available = model in names
+                break  # reachable (even if the model itself isn't pulled) -- no point retrying
+            except Exception:
+                available = False
+            if attempt < attempts:
+                time.sleep(retry_delay)
     _vlm_availability_cache[cache_key] = available
     return available
 
