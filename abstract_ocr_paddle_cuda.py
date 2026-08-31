@@ -774,17 +774,26 @@ def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
 # "Inline diff-merge" plan) ----
 # Classifies each diff span above and, for the ones judged safe, applies
 # the VLM's correction directly into the primary draft text instead of
-# only reporting it. The rules below are deliberately narrow and were
-# derived from a real diff report (Thesis76.K355), not guessed. Two
-# shapes are trusted: a short pure insertion (a dropped sub/superscript-
-# sized token, e.g. "(nothing)" -> "rho_p") and a short trailing addition
-# on top of text OCR already got right (OCR's span is an exact prefix of
-# VLM's, e.g. "ε)/ε" -> "ε)/ε<sup>3</sup>"). Everything else stays
-# report-only: multi-word insertions (real content recovery -- that's
-# --vlm-review's job), character-confusion substitutions like l/1 (the
-# maps' job), and substitutions with no shared prefix (confirmed unsafe
-# on real data -- "Fu"/"eta_f", and "ε"/"epsilon" where OCR was already
-# the more correct rendering).
+# only reporting it. The rules below were derived from a real diff report
+# (Thesis76.K355), not guessed. Two shapes are trusted: any pure
+# insertion, no length cap (OCR reported nothing there at all -- a
+# missed detection box, not a misread -- and the VLM's observed failure
+# mode is misreading or recontextualizing content that's really there,
+# not inventing whole passages that aren't, so there's nothing for a
+# length threshold to guard against), and a short trailing addition on
+# top of text OCR already got right (OCR's span is an exact prefix of
+# VLM's, e.g. "ε)/ε" -> "ε)/ε<sup>3</sup>", still length-capped -- this
+# one *is* replacing/extending something OCR already committed to).
+# Everything else here stays report-only: character-confusion
+# substitutions like l/1 (the maps' job), and substitutions with no
+# shared prefix (confirmed unsafe on real data -- "Fu"/"eta_f", and
+# "ε"/"epsilon" where OCR was already the more correct rendering).
+#
+# Equation-placeholder-marker content never merges here -- always
+# report-only. (A prior version of this branch tried inserting the VLM's
+# equation transcription alongside the placeholder; reverted -- see the
+# "Inline diff-merge" plan for what's being tried instead, and why that
+# needs the placeholder-vs-diff-span relationship kept clean first.)
 _EQUATION_PLACEHOLDER_MARKER = "[EQUATION"
 _MERGE_ANCHOR_WORDS = 4
 _MERGE_MAX_ADDITION_CHARS = 8
@@ -801,20 +810,22 @@ def _visible_len(text: str) -> int:
 def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merge", "flag"]:
     """Decide whether one diff span is safe to auto-apply ("merge") or
     should stay report-only ("flag"). ocr_span/vlm_span are the rendered
-    "(nothing)"-or-text strings, same as in the diff report."""
+    "(nothing)"-or-text strings, same as in the diff report. Equation-
+    placeholder-touching spans always flag."""
     if _EQUATION_PLACEHOLDER_MARKER in ocr_span or _EQUATION_PLACEHOLDER_MARKER in vlm_span:
-        # The equation-placeholder marker text leaks into the raw OCR
-        # side of the diff (placeholder substitution runs before the
-        # per-page OCR text is captured -- see extract_abstract_region).
-        # These spans compare a placeholder marker against real content
-        # and must never be touched.
         return "flag"
     if tag == "delete":
         # OCR has content the VLM doesn't transcribe -- never
         # auto-remove OCR content, only ever add or correct it.
         return "flag"
     if tag == "insert":
-        return "merge" if _visible_len(vlm_span) <= _MERGE_MAX_ADDITION_CHARS else "flag"
+        # No length cap -- unlike a "replace", OCR isn't reporting
+        # anything here at all (a missed detection box, not a
+        # misread), and the VLM's failure mode is misreading or
+        # recontextualizing content that's really there, not
+        # inventing whole passages that aren't -- so there's nothing
+        # for a length threshold to be guarding against.
+        return "merge"
     if tag == "replace":
         if vlm_span.lower() == ocr_span.lower():
             return "merge"  # pure case fix
@@ -824,10 +835,13 @@ def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merg
     return "flag"
 
 def _wrap_vlm_merge(text: str, ocr_span: str, vlm_span: str) -> str:
-    """Visibly mark auto-applied text -- same "always show your work,
-    never blend silently" precedent as the equation placeholders and the
-    VLM recovery blocks. Greppable, trivially strippable once this pass
-    is trusted enough to blend in."""
+    """Visibly mark auto-applied text that *replaces* something OCR
+    already produced -- same "always show your work, never blend
+    silently" precedent as the equation placeholders and the VLM
+    recovery blocks. Greppable, trivially strippable once this pass is
+    trusted enough to blend in. Only used for "replace"-tag merges --
+    pure insertions (nothing there to second-guess) go in unmarked, see
+    _apply_vlm_diff_merges."""
     title = html.escape(f'OCR: "{ocr_span}" | VLM: "{vlm_span}"', quote=True)
     return f'<span class="vlm-merge" title="{title}">{text}</span>'
 
@@ -866,13 +880,12 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
     sections = []
     for page_idx, ocr_text, vlm_text in diff_blocks:
         opcodes = _diff_opcodes(ocr_text, vlm_text)
-        report_lines = []
+        merged_idx = set()
         for idx, (tag, ocr_words, vlm_words) in enumerate(opcodes):
             if tag == "equal":
                 continue
             ocr_span = " ".join(ocr_words) or "(nothing)"
             vlm_span = " ".join(vlm_words) or "(nothing)"
-            merged = False
             if _classify_diff_span(tag, ocr_span, vlm_span) == "merge":
                 vlm_normalized = _normalize_for_primary_text(vlm_span)
                 if tag == "insert":
@@ -883,9 +896,14 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                         matches = list(re.finditer(re.escape(anchor), primary, re.IGNORECASE))
                         if len(matches) == 1:
                             pos = matches[0].end()
-                            addition = _wrap_vlm_merge(vlm_normalized, ocr_span, vlm_span)
+                            # Plain insertion -- no visible marker. We're
+                            # only ever adding content that wasn't there,
+                            # never touching/replacing anything OCR
+                            # already produced, so there's nothing to
+                            # flag for a human to double-check against.
+                            addition = vlm_normalized
                             primary = primary[:pos] + " " + addition + primary[pos:]
-                            merged = True
+                            merged_idx.add(idx)
                 elif tag == "replace":
                     ocr_normalized = _normalize_for_primary_text(ocr_span)
                     matches = list(re.finditer(re.escape(ocr_normalized), primary, re.IGNORECASE))
@@ -893,15 +911,23 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                         m = matches[0]
                         replacement = _wrap_vlm_merge(vlm_normalized, ocr_span, vlm_span)
                         primary = primary[:m.start()] + replacement + primary[m.end():]
-                        merged = True
-            label = "[MERGED]" if merged else "[FLAGGED]"
+                        merged_idx.add(idx)
+
+        report_lines = []
+        for idx, (tag, ocr_words, vlm_words) in enumerate(opcodes):
+            if tag == "equal":
+                continue
+            ocr_span = " ".join(ocr_words) or "(nothing)"
+            vlm_span = " ".join(vlm_words) or "(nothing)"
+            label = "[MERGED]" if idx in merged_idx else "[FLAGGED]"
             report_lines.append(f'  {label} OCR: "{ocr_span}"  |  VLM: "{vlm_span}"')
         if not report_lines:
             continue
         sections.append(
             f"<!-- OCR/VLM DIFF REPORT -- page {page_idx+1}, [MERGED] lines were "
-            f"applied inline above (see <span class=\"vlm-merge\">), [FLAGGED] "
-            f"lines were not -->\n" + "\n".join(report_lines)
+            f"applied inline above -- plain (unmarked) if added, "
+            f"<span class=\"vlm-merge\"> if it replaced existing text -- "
+            f"[FLAGGED] lines were not -->\n" + "\n".join(report_lines)
         )
     return primary + rest, "\n\n".join(sections)
 
@@ -1900,12 +1926,13 @@ def main():
     parser.add_argument("--vlm-diff-merge", action="store_true",
                          help="Experimental, opt-in: like --vlm-diff-review (implies it -- no need to pass "
                               "both), but also applies the subset of diff spans judged safe directly into "
-                              "the primary draft text (marked inline, never blended in silently). Only two "
-                              "shapes are trusted -- a short pure insertion, and a short trailing addition "
-                              "on text OCR already matched -- everything else (long insertions, character-"
-                              "confusion substitutions, substitutions with no shared prefix) stays report-"
-                              "only, same as --vlm-diff-review alone. See the diff-merge section for the "
-                              "real-data reasoning behind the split.")
+                              "the primary draft text. Pure insertions (OCR detected nothing there at all) "
+                              "go in unmarked, no length cap; anything that replaces text OCR already "
+                              "produced (a short trailing addition, or a pure case fix) is wrapped in a "
+                              "visible marker instead of blended in silently. Everything else (substitutions "
+                              "with no shared prefix, character-confusion substitutions, anything touching "
+                              "the equation-placeholder marker) stays report-only, same as --vlm-diff-review "
+                              "alone. See the diff-merge section for the real-data reasoning behind the split.")
     args = parser.parse_args()
 
     vlm_review_mode = args.vlm_review_mode if args.vlm_review else None
