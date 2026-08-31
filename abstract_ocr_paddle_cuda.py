@@ -639,6 +639,25 @@ def vlm_transcribe_page(pdf_path: Path, page_index: int, model: str = DEFAULT_VL
             pass
     return None
 
+def _unload_vlm_model(model: str, ollama_url: str) -> None:
+    """Explicitly unload the model from Ollama (keep_alive=0) once every
+    deferred VLM phase in this run is done. Confirmed necessary: Ollama
+    keeps a model resident for minutes after last use, and re-running the
+    script again in that window -- a normal thing to do while
+    iterating/testing, or just processing back-to-back batches -- hits the
+    exact same GPU-contention bug the deferred-execution design exists to
+    avoid within a single run: PaddleOCR's own init silently fails on every
+    page ("0 text segments found") for the *next* run too. Best-effort
+    cleanup only, never raises -- not correctness-critical for the run
+    that's already finished, just hygiene for whatever runs next.
+    """
+    if _requests is None:
+        return
+    try:
+        _requests.post(f"{ollama_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=10)
+    except Exception:
+        pass
+
 # Human-readable label per flag reason -- see _page_is_suspicious (reason
 # "low_confidence") and the equation-placeholder section below (reason
 # "equation"). Keeping this as a small lookup, not inline string logic, so
@@ -682,7 +701,53 @@ def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str, str]], casing
         )
     return "\n\n".join(sections)
 
-# ---- Equation-region placeholder 
+# ---- Full OCR/VLM diff pass (--vlm-diff-review, isolated from the recovery
+# pathway above) ----
+# _page_is_suspicious only catches pages that look sparse -- it can't catch
+# a page where OCR produced a normal-looking amount of text that's subtly
+# wrong (confirmed on Thesis76.K82: "PAo" for "PAO", a missing superscript
+# on "(Her )", on pages with 25/37 segments -- well above the flag
+# threshold, so --vlm-review never touches that document at all). This is
+# a different, unconditional pass: every page gets sent to the VLM
+# regardless of suspicion, and instead of attempting any recovery/merge,
+# the two independent transcriptions are diffed and the differences are
+# printed as a report -- never touching the primary draft text. Whether a
+# given difference "looks like" a dropped sub/superscript versus a VLM
+# slip (see the fail/fall finding on K82 -- the VLM's own transcription
+# isn't reliable enough to trust automatically either) is left for a human
+# to judge for now; classifying that automatically is future work, not
+# this pass's job.
+def _diff_ocr_vs_vlm(ocr_text: str, vlm_text: str) -> str:
+    """Word-level diff between OCR's and the VLM's independent
+    transcription of the same page. Returns "" if they agree."""
+    ocr_words = ocr_text.split()
+    vlm_words = vlm_text.split()
+    matcher = difflib.SequenceMatcher(None, ocr_words, vlm_words, autojunk=False)
+    lines = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        ocr_span = " ".join(ocr_words[i1:i2]) or "(nothing)"
+        vlm_span = " ".join(vlm_words[j1:j2]) or "(nothing)"
+        lines.append(f'  OCR: "{ocr_span}"  |  VLM: "{vlm_span}"')
+    return "\n".join(lines)
+
+def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
+    """diff_blocks: (page_index, ocr_text, vlm_text) triples. One section
+    per page that has at least one difference; pages that fully agree are
+    skipped -- no noise for pages OCR already got right."""
+    sections = []
+    for page_idx, ocr_text, vlm_text in diff_blocks:
+        diff = _diff_ocr_vs_vlm(ocr_text, vlm_text)
+        if not diff:
+            continue
+        sections.append(
+            f"<!-- OCR/VLM DIFF REPORT -- page {page_idx+1}, informational only, "
+            f"no inline changes made -->\n{diff}"
+        )
+    return "\n\n".join(sections)
+
+# ---- Equation-region placeholder
 # The OCR pipeline has no reliable way to detect stacked fractions or other
 # multi-line equations, so we insert a placeholder in the paragraph text for
 # each detected equation region.
@@ -836,7 +901,8 @@ def group_words_into_lines(words: List[OCRWord], y_tol_ratio=0.03):
     return lines
 
 def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_threshold: float = 0.60, pdf_path: Optional[Path] = None,
-                             vlm_review_mode: Optional[str] = None, vlm_trigger_threshold: int = DEFAULT_VLM_TRIGGER_THRESHOLD):
+                             vlm_review_mode: Optional[str] = None, vlm_trigger_threshold: int = DEFAULT_VLM_TRIGGER_THRESHOLD,
+                             vlm_diff_review: bool = False):
     """Return raw OCR words (with boxes) from start_page until a stop heading or max_pages.
 
     Args:
@@ -856,18 +922,28 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         vlm_trigger_threshold: see _page_is_suspicious. Only used when
                   vlm_review_mode == "targeted".
 
-    Returns (collected_words, end_page, vlm_flagged_pages), where
-    vlm_flagged_pages is a list of (page_index, reason) pairs -- reason is
-    "low_confidence" or "equation" (see ENABLE_EQUATION_PLACEHOLDERS).
-    Equation-region detection/placeholder substitution always runs
-    (independent of vlm_review_mode); pages only get added to
-    vlm_flagged_pages when vlm_review_mode is set.
+    Returns (collected_words, end_page, vlm_flagged_pages, vlm_diff_pages,
+    page_ocr_texts). vlm_flagged_pages is a list of (page_index, reason)
+    pairs -- reason is "low_confidence" or "equation" (see
+    ENABLE_EQUATION_PLACEHOLDERS). Equation-region detection/placeholder
+    substitution always runs (independent of vlm_review_mode); pages only
+    get added to vlm_flagged_pages when vlm_review_mode is set.
+
+    vlm_diff_pages/page_ocr_texts are for the separate --vlm-diff-review
+    pass (see that section): when vlm_diff_review is True, EVERY page in
+    range is added to vlm_diff_pages unconditionally (no suspicion check --
+    this is a full second pass, not a targeted one), and page_ocr_texts
+    captures that page's own OCR text for the deferred diff against the
+    VLM's independent transcription of the same page. Kept architecturally
+    separate from vlm_flagged_pages -- these are two independent systems.
     """
     collected = []
     end_page = start_page
     src_path = pdf_path if pdf_path is not None else Path(doc.name)
 
     vlm_flagged_pages: dict = {}  # page_index -> reason ("low_confidence" or "equation")
+    vlm_diff_pages: List[int] = []
+    page_ocr_texts: dict = {}  # page_index -> plain OCR text, for --vlm-diff-review
     prior_segment_counts: List[int] = []
 
     print(f"  Extracting text from pages {start_page+1} to {min(start_page+max_pages, doc.page_count)}...")
@@ -930,18 +1006,32 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         # If we hit a stop heading, terminate
         stop = False
         filtered_words = []
+        pre_stop_lines = []
         for ln in lines:
             text = " ".join(w.text for w in ln).strip()
             if STOP_HEADINGS_RE.match(text):
                 stop = True
                 break
             filtered_words.extend(ln)
+            pre_stop_lines.append(ln)
         collected.extend(filtered_words)
+
+        # See "Full OCR/VLM diff pass" section: capture only the part of
+        # this page that's actually abstract content -- i.e. up to the same
+        # stop-heading boundary the primary text already respects (a hard
+        # content-boundary fact, not the "suspicion" heuristic this pass is
+        # meant to bypass). A page entirely past that boundary (e.g. a
+        # Table of Contents page) contributes nothing and isn't reviewed --
+        # confirmed necessary: without this, Thesis76.K82's TOC page got
+        # diff-reviewed and produced a page of page-number/dot-leader noise.
+        if vlm_diff_review and pre_stop_lines:
+            page_ocr_texts[p] = " ".join(" ".join(w.text for w in ln) for ln in pre_stop_lines)
+            vlm_diff_pages.append(p)
         end_page = p
         if stop:
             break
 
-    return collected, end_page, list(vlm_flagged_pages.items())
+    return collected, end_page, list(vlm_flagged_pages.items()), vlm_diff_pages, page_ocr_texts
 
 # ---- Superscript/Subscript detection by baseline ----
 def baseline_clusters(words: List[OCRWord], band_px=8):
@@ -1451,7 +1541,8 @@ def to_html_paragraphs(paragraphs: List[str]) -> str:
 
 # ---- Main processing ----
 def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages: int, confidence_threshold: float = 0.60, force_single_paragraph: bool = False,
-                 vlm_review_mode: Optional[str] = None, vlm_trigger_threshold: int = DEFAULT_VLM_TRIGGER_THRESHOLD):
+                 vlm_review_mode: Optional[str] = None, vlm_trigger_threshold: int = DEFAULT_VLM_TRIGGER_THRESHOLD,
+                 vlm_diff_review: bool = False):
     """Process a PDF and extract abstract text.
 
     Args:
@@ -1469,6 +1560,10 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
                              manifest for main()'s deferred VLM phase to pick up after
                              every PDF in the batch has finished its PaddleOCR work
                              (see the "Optional VLM review pass" section for why).
+        vlm_diff_review: opt-in, off by default. Independent of vlm_review_mode --
+                             see the "Full OCR/VLM diff pass" section. Also writes its
+                             own separate sidecar for main()'s deferred phase; never
+                             calls the VLM from here either, same reasoning as above.
     """
 
     print(f"\n{'='*70}")
@@ -1507,9 +1602,9 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
 
 
         print(f"\n  Starting OCR extraction (this may take a moment)...")
-        words, end_idx, vlm_flagged_pages = extract_abstract_region(
+        words, end_idx, vlm_flagged_pages, vlm_diff_pages, page_ocr_texts = extract_abstract_region(
             doc, start_p, max_pages=(end_p-start_p+1), confidence_threshold=confidence_threshold, pdf_path=pdf_path,
-            vlm_review_mode=vlm_review_mode, vlm_trigger_threshold=vlm_trigger_threshold,
+            vlm_review_mode=vlm_review_mode, vlm_trigger_threshold=vlm_trigger_threshold, vlm_diff_review=vlm_diff_review,
         )
         if not words:
             print(f"  ⚠ No text extracted")
@@ -1565,6 +1660,18 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
             sidecar = out_dir / f"{pdf_path.stem} draft.vlm_pending.json"
             # vlm_flagged_pages is a list of [page_index, reason] pairs.
             sidecar.write_text(json.dumps({"pdf_path": str(pdf_path), "flagged_pages": vlm_flagged_pages}), encoding="utf-8")
+
+        # Separate, independent sidecar for the --vlm-diff-review pass (see
+        # the "Full OCR/VLM diff pass" section) -- own file, own manifest
+        # shape, own deferred-phase handler. Not merged with the sidecar
+        # above: these are two parallel systems, not one extending the other.
+        if vlm_diff_review and vlm_diff_pages:
+            diff_sidecar = out_dir / f"{pdf_path.stem} draft.diff_pending.json"
+            diff_sidecar.write_text(json.dumps({
+                "pdf_path": str(pdf_path),
+                "pages": vlm_diff_pages,
+                "page_ocr_texts": {str(p): page_ocr_texts.get(p, "") for p in vlm_diff_pages},
+            }), encoding="utf-8")
 
         print(f"  ✓ SUCCESS")
         print(f"  Pages used: {start_p+1} to {end_idx+1}")
@@ -1624,6 +1731,14 @@ def main():
     parser.add_argument("--vlm-trigger-threshold", type=int, default=DEFAULT_VLM_TRIGGER_THRESHOLD,
                          help=f"Segment-count floor below which a page is flagged for VLM review in targeted mode. Default: {DEFAULT_VLM_TRIGGER_THRESHOLD}")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help=f"Ollama server URL. Default: {DEFAULT_OLLAMA_URL}")
+    parser.add_argument("--vlm-diff-review", action="store_true",
+                         help="Opt-in, independent of --vlm-review: run the VLM on EVERY abstract page "
+                              "(no suspicion check) and print a word-level diff against OCR's own text "
+                              "at the bottom of the draft. Never modifies the primary draft text -- "
+                              "purely a report for catching cases OCR got wrong without looking sparse "
+                              "(e.g. a confidently-misread character, a dropped superscript) that "
+                              "--vlm-review's segment-count trigger can't see. Requires Ollama/the model "
+                              "the same way --vlm-review does.")
     args = parser.parse_args()
 
     vlm_review_mode = args.vlm_review_mode if args.vlm_review else None
@@ -1647,6 +1762,7 @@ def main():
             force_single_paragraph=args.force_single_paragraph,
             vlm_review_mode=vlm_review_mode,
             vlm_trigger_threshold=args.vlm_trigger_threshold,
+            vlm_diff_review=args.vlm_diff_review,
         )
         return
 
@@ -1688,6 +1804,8 @@ def main():
             # "Optional VLM review pass" section for why).
             cmd += ["--vlm-review", "--vlm-review-mode", args.vlm_review_mode,
                     "--vlm-trigger-threshold", str(args.vlm_trigger_threshold)]
+        if args.vlm_diff_review:
+            cmd += ["--vlm-diff-review"]
 
         success = False
         for attempt in (1, 2):
@@ -1743,6 +1861,51 @@ def main():
                     except Exception as e:
                         print(f" ⚠ failed: {e}")
                 sidecar.unlink(missing_ok=True)
+
+    # Deferred OCR/VLM diff phase -- see "Full OCR/VLM diff pass" section.
+    # Independent of the --vlm-review phase above: own sidecar file, own
+    # manifest shape, own output section. Same non-negotiable timing rule
+    # applies (runs only after every PDF's PaddleOCR work is fully done).
+    if args.vlm_diff_review:
+        diff_pending = sorted(out_dir.glob("*.diff_pending.json"))
+        if diff_pending:
+            print(f"\n{'='*70}")
+            print(f"OCR/VLM diff pass ({len(diff_pending)} document(s))")
+            print(f"{'='*70}")
+            vlm_ok = _vlm_available(args.vlm_model, args.ollama_url)
+            if not vlm_ok:
+                print(f"ℹ OCR/VLM diff pass requested but unavailable (Ollama/{args.vlm_model} not reachable at {args.ollama_url}) -- skipping, drafts left as OCR-only output")
+            for sidecar in diff_pending:
+                if vlm_ok:
+                    try:
+                        manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+                        diff_pdf_path = Path(manifest["pdf_path"])
+                        diff_pages = manifest["pages"]
+                        diff_ocr_texts = manifest["page_ocr_texts"]  # {"page_index_str": ocr_text}
+                        print(f"  {diff_pdf_path.name}: diffing {len(diff_pages)} page(s) against the VLM...", end="", flush=True)
+                        diff_blocks = []
+                        for diff_page in diff_pages:
+                            vlm_text = vlm_transcribe_page(diff_pdf_path, diff_page, model=args.vlm_model, ollama_url=args.ollama_url)
+                            if vlm_text:
+                                diff_blocks.append((diff_page, diff_ocr_texts.get(str(diff_page), ""), vlm_text))
+                        report = _build_vlm_diff_report_html(diff_blocks)
+                        if report:
+                            draft_path = out_dir / f"{diff_pdf_path.stem} draft.txt"
+                            if draft_path.exists():
+                                existing = draft_path.read_text(encoding="utf-8")
+                                draft_path.write_text(existing + "\n\n" + report, encoding="utf-8")
+                            print(" done (differences found)")
+                        else:
+                            print(" done (no differences)")
+                    except Exception as e:
+                        print(f" ⚠ failed: {e}")
+                sidecar.unlink(missing_ok=True)
+
+    # See _unload_vlm_model: release the model now so it can't poison a
+    # later run's PaddleOCR calls. Only relevant if a VLM phase actually
+    # ran above (an unloaded model unload is a harmless no-op either way).
+    if args.vlm_review or args.vlm_diff_review:
+        _unload_vlm_model(args.vlm_model, args.ollama_url)
 
 if __name__ == "__main__":
     main()
