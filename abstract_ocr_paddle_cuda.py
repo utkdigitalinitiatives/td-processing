@@ -1013,7 +1013,19 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                             pos = matches[0].end()
                             # Restore the period if the match landed without one.
                             prefix = "." if had_period and primary[pos - 1:pos] != "." else ""
-                            primary = primary[:pos] + prefix + " " + vlm_normalized + primary[pos:]
+                            # An "insert" means OCR found nothing at all here -- if that
+                            # nothing happened to span a page boundary, the paragraph
+                            # splitter's blunt "new page, so always split" rule (unlike
+                            # its gap-based within-page splits) already stranded a
+                            # </p><p> right at this point. The VLM text bridging the gap
+                            # shows that break was never real, so absorb it instead of
+                            # splicing in before it (same fix as _apply_equation_recovery
+                            # already applies for placeholder boundaries).
+                            brk = re.match(r"\s*</p>\s*<p>\s*", primary[pos:])
+                            if brk:
+                                primary = primary[:pos] + prefix + " " + vlm_normalized + " " + primary[pos + brk.end():]
+                            else:
+                                primary = primary[:pos] + prefix + " " + vlm_normalized + primary[pos:]
                             merged_idx.add(idx)
                 elif tag == "replace":
                     ocr_normalized = _normalize_for_primary_text(ocr_span)
