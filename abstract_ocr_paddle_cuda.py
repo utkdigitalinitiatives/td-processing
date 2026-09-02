@@ -808,6 +808,30 @@ def _visible_len(text: str) -> int:
     threshold has to measure the actual added content, not its markup."""
     return len(_TAG_RE.sub("", text))
 
+# Greek-letter detector for the classify rule below -- reuses GREEK_MAP
+# (already defined for replace_greek_math) rather than a second hardcoded
+# list. Recognizes a Greek letter in any valid representation: the
+# literal Unicode glyph, its HTML entity, a bare name, or the ASCII
+# variable-naming convention (name + "_" + subscript, e.g. "eta_f",
+# "rho_p") that's exactly the shape the VLM's own prompt already produces
+# for these.
+_GREEK_LETTER_CHARS = set(GREEK_MAP.keys())
+_GREEK_LETTER_NAMES = {name.strip("&;").lower() for name in GREEK_MAP.values() if name.startswith("&")}
+_GREEK_ASCII_VAR_RE = re.compile(r"^(" + "|".join(_GREEK_LETTER_NAMES) + r")_\w+$", re.IGNORECASE)
+
+def _is_greek_letter_span(text: str) -> bool:
+    """True if any word in text is a Greek letter in any valid
+    representation. Used to decide whether OCR already got a Greek
+    symbol right in *some* form, even if not the same form the VLM
+    used -- see _classify_diff_span."""
+    for w in _TAG_RE.sub("", text).split():
+        if any(ch in _GREEK_LETTER_CHARS for ch in w):
+            return True
+        stripped = w.strip(".,;:()").lower()
+        if stripped in _GREEK_LETTER_NAMES or _GREEK_ASCII_VAR_RE.match(stripped):
+            return True
+    return False
+
 def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merge", "flag"]:
     """Decide whether one diff span is safe to auto-apply ("merge") or
     should stay report-only ("flag"). ocr_span/vlm_span are the rendered
@@ -833,6 +857,14 @@ def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merg
         if (vlm_span.lower().startswith(ocr_span.lower())
                 and _visible_len(vlm_span) - _visible_len(ocr_span) <= _MERGE_MAX_ADDITION_CHARS):
             return "merge"  # short trailing addition, e.g. a dropped superscript
+        if _is_greek_letter_span(vlm_span) and not _is_greek_letter_span(ocr_span):
+            # OCR missed the symbol entirely (e.g. "Fu" for "eta_f") --
+            # the VLM's reading of a Greek letter is trustworthy even
+            # off-prefix. Never fires the other way: if OCR already has
+            # some valid representation of the letter (e.g. the literal
+            # "ε" glyph vs. the VLM's ASCII "epsilon"), OCR's version is
+            # already correct-or-equivalent and stays flagged.
+            return "merge"
     return "flag"
 
 def _normalize_for_primary_text(text: str) -> str:
@@ -851,6 +883,25 @@ def _normalize_for_primary_text(text: str) -> str:
     return convert_remaining_non_ascii(replace_greek_math(text))
 
 _EQUATION_LABEL_NUM_RE = re.compile(r"\[EQUATION(?:\s+(\d+))?")
+_EQUATION_BOUNDARY_EXTRA_WORDS = 3  # matches _MERGE_ANCHOR_WORDS-scale caution
+_PLACEHOLDER_TAIL_MARKER = "verify manually"
+
+def _equation_boundary_words(ocr_words: List[str]) -> Tuple[List[str], List[str]]:
+    """Split one opcode's raw ocr_words into (words before, words after)
+    the "[EQUATION...]" placeholder token. It's one atomic token in the
+    real pipeline but arrives here already whitespace-split, so the
+    opening "[EQUATION" and closing "]" have to be found by content, not
+    position -- and the closing "]" may not even be in this opcode at
+    all if the placeholder itself got fragmented across opcodes (no
+    trailing words are returned in that case -- safer to report nothing
+    than guess)."""
+    start_idx = next((i for i, w in enumerate(ocr_words) if "[EQUATION" in w), None)
+    if start_idx is None:
+        return [], []
+    end_idx = next((i for i in range(start_idx, len(ocr_words)) if "]" in ocr_words[i]), None)
+    if end_idx is None:
+        return ocr_words[:start_idx], []
+    return ocr_words[:start_idx], ocr_words[end_idx + 1:]
 
 def _apply_equation_recovery(primary: str, page_idx: int,
                               opcodes: List[Tuple[str, List[str], List[str]]]) -> Tuple[str, List[int]]:
@@ -877,6 +928,23 @@ def _apply_equation_recovery(primary: str, page_idx: int,
     ever replaces its own placeholder; a group whose placeholder can't be
     found in `primary` is left flagged, same as if it had never merged.
 
+    Also absorbs a short leading/trailing word left over from the
+    boundary opcode's ocr_span, along with a spurious paragraph break in
+    between, when they sit immediately adjacent to the placeholder.
+    Confirmed necessary on real data: K355's diff span is `"Ias
+    [EQUATION 1 - VERIFY MANUALLY, PAGE 4]"` -> `"as K2 = ..."` -- OCR's
+    "Ias" (a misread of "as") landed in the *previous* `<p>`, the
+    placeholder started the next one, so a placeholder-only replacement
+    left "Ias" behind untouched even though it's part of the same merged
+    span. The diff-merge system already has independent (VLM) agreement
+    that this content is continuous, which is exactly the evidence the
+    plain paragraph-splitter doesn't have -- so it's safe to also close
+    the paragraph break here, unlike a blind heuristic change to
+    splitting in general. Bounded to a short (<=3 word) extra, and only
+    acts when the combined leading/trailing+placeholder pattern matches
+    exactly once; falls back to a placeholder-only match otherwise --
+    never worse than before, only better when the adjacency holds.
+
     Returns (updated_primary, contributing_indices) -- contributing_indices
     are the opcodes' indices whose text actually made it into a
     replacement (i.e., that specific placeholder was found), for report
@@ -895,14 +963,75 @@ def _apply_equation_recovery(primary: str, page_idx: int,
         if vlm_span != "(nothing)":
             groups.setdefault(eq_num, []).append((idx, vlm_span))
 
+    # A group's last contributing opcode may not contain the
+    # placeholder's closing "]" (_equation_boundary_words already
+    # signals this via an empty trailing list) -- the tail half of the
+    # same fragmented placeholder token landed in the *next* opcode
+    # instead, without the "[EQUATION" substring itself, so the loop
+    # above never picked it up. Confirmed on real data: K355's second
+    # equation loses its trailing "- 0.087" term this way ("[EQUATION 2"
+    # and "VERIFY MANUALLY, PAGE 4]" -> "0.087" are two separate
+    # opcodes). Only ever look at the immediate next non-equal opcode --
+    # deliberately narrow, not a general multi-fragment reconstruction.
+    claimed = {idx for entries in groups.values() for idx, _ in entries}
+    for eq_num, entries in groups.items():
+        _, trailing = _equation_boundary_words(opcodes[entries[-1][0]][1])
+        if trailing:
+            continue  # placeholder already closed within this group
+        for j in range(entries[-1][0] + 1, len(opcodes)):
+            tag_j, ocr_words_j, vlm_words_j = opcodes[j]
+            if tag_j == "equal":
+                continue
+            if j not in claimed:
+                ocr_span_j = " ".join(ocr_words_j)
+                if _PLACEHOLDER_TAIL_MARKER in ocr_span_j.lower():
+                    vlm_span_j = " ".join(vlm_words_j) or "(nothing)"
+                    if vlm_span_j != "(nothing)":
+                        entries.append((j, vlm_span_j))
+                        claimed.add(j)
+            break  # only the immediate next non-equal opcode is considered
+
     contributing: List[int] = []
     for eq_num, entries in groups.items():
         suffix = f" {eq_num}" if eq_num else ""
-        label_pattern = re.compile(r"\[EQUATION" + re.escape(suffix) + r" - VERIFY MANUALLY, PAGE " + str(page_idx + 1) + r"\]")
-        match = label_pattern.search(primary)
-        if not match:
-            continue
-        combined_vlm = " ".join(vlm_span for _, vlm_span in entries)
+        label_pattern_str = r"\[EQUATION" + re.escape(suffix) + r" - VERIFY MANUALLY, PAGE " + str(page_idx + 1) + r"\]"
+
+        leading_words, _ = _equation_boundary_words(opcodes[entries[0][0]][1])
+        _, trailing_words = _equation_boundary_words(opcodes[entries[-1][0]][1])
+
+        leading_part = ""
+        if leading_words and len(leading_words) <= _EQUATION_BOUNDARY_EXTRA_WORDS:
+            leading_norm = _normalize_for_primary_text(" ".join(leading_words))
+            leading_part = re.escape(leading_norm) + r"(?:\s*</p>\s*<p>)?\s*"
+        trailing_part = ""
+        if trailing_words and len(trailing_words) <= _EQUATION_BOUNDARY_EXTRA_WORDS:
+            trailing_norm = _normalize_for_primary_text(" ".join(trailing_words))
+            trailing_part = r"\s*(?:</p>\s*<p>\s*)?" + re.escape(trailing_norm)
+
+        match = None
+        if leading_part or trailing_part:
+            wide_matches = list(re.finditer(leading_part + label_pattern_str + trailing_part, primary, re.IGNORECASE))
+            if len(wide_matches) == 1:
+                match = wide_matches[0]
+        if match is None:
+            narrow_matches = list(re.finditer(label_pattern_str, primary))
+            if len(narrow_matches) != 1:
+                continue
+            match = narrow_matches[0]
+
+        # Reconstruct from the full contiguous VLM range (first
+        # contributing opcode through last), not just the marker-
+        # touching fragments -- confirmed necessary: the placeholder's
+        # own literal " - " separator can coincidentally text-match an
+        # unrelated "-" elsewhere in the VLM's transcription (K355: the
+        # "-" in "V2/V1 - 0.087"), producing a spurious one-word "equal"
+        # opcode sandwiched between two contributing fragments. That
+        # opcode's VLM text is real content that belongs in the
+        # combination, even though it's not itself marker-touching.
+        first_idx, last_idx = entries[0][0], entries[-1][0]
+        combined_vlm = " ".join(
+            " ".join(opcodes[k][2]) for k in range(first_idx, last_idx + 1) if opcodes[k][2]
+        )
         addition = _normalize_for_primary_text(combined_vlm)
         primary = primary[:match.start()] + addition + primary[match.end():]
         contributing.extend(idx for idx, _ in entries)
@@ -937,14 +1066,53 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             if _classify_diff_span(tag, ocr_span, vlm_span) == "merge":
                 vlm_normalized = _normalize_for_primary_text(vlm_span)
                 if tag == "insert":
-                    anchor_words = (opcodes[idx - 1][1][-_MERGE_ANCHOR_WORDS:]
-                                     if idx > 0 and opcodes[idx - 1][0] == "equal" else [])
+                    # Walk back to the nearest opcode with real,
+                    # currently-findable text in primary -- not just
+                    # opcodes[idx-1], and not only if it's "equal".
+                    # Confirmed necessary on real data: a genuinely
+                    # missing sentence ("(nothing)" -> "The K2 equation")
+                    # sat right after an unmerged "Reynold's" ->
+                    # "Reynolds'" replace, so requiring the immediate
+                    # predecessor to be "equal" found no anchor at all
+                    # even though "Reynold's" itself (left untouched,
+                    # since that replace stayed flagged) was right there
+                    # to anchor on. Only an unmerged prior "insert" is
+                    # skipped -- it never had any OCR-side text in
+                    # primary to anchor on in the first place.
+                    anchor_words = []
+                    for j in range(idx - 1, -1, -1):
+                        prior_tag, prior_ocr_words, prior_vlm_words = opcodes[j]
+                        if prior_tag == "insert" and j not in merged_idx:
+                            continue
+                        words = prior_vlm_words if j in merged_idx else prior_ocr_words
+                        if words:
+                            anchor_words = words[-_MERGE_ANCHOR_WORDS:]
+                            break
                     anchor = _normalize_for_primary_text(" ".join(anchor_words))
                     if anchor:
-                        matches = list(re.finditer(re.escape(anchor), primary, re.IGNORECASE))
+                        # A trailing "." on the anchor may already be
+                        # gone from primary -- fix_stray_period_before_
+                        # lowercase strips a period immediately followed
+                        # by a lowercase word, and that's exactly what
+                        # this OCR text looks like when the real next
+                        # word was dropped entirely and content resumes
+                        # lowercase (confirmed on real data: OCR's
+                        # "...compressive forces. is defined..." reads
+                        # as noise-before-lowercase to that earlier,
+                        # unrelated fixup, so the period's gone by the
+                        # time this anchor searches for it). Make a
+                        # trailing period in the anchor optional rather
+                        # than lose an otherwise-good anchor over it.
+                        had_period = anchor.endswith(".")
+                        anchor_pattern = re.escape(anchor[:-1]) + r"\.?" if had_period else re.escape(anchor)
+                        matches = list(re.finditer(anchor_pattern, primary, re.IGNORECASE))
                         if len(matches) == 1:
                             pos = matches[0].end()
-                            primary = primary[:pos] + " " + vlm_normalized + primary[pos:]
+                            # Restore the period if the match landed
+                            # without one -- otherwise this sentence
+                            # runs straight into the next with no break.
+                            prefix = "." if had_period and primary[pos - 1:pos] != "." else ""
+                            primary = primary[:pos] + prefix + " " + vlm_normalized + primary[pos:]
                             merged_idx.add(idx)
                 elif tag == "replace":
                     ocr_normalized = _normalize_for_primary_text(ocr_span)
