@@ -250,6 +250,9 @@ def apply_known_science_notation(text: str) -> str:
 # Leading-zero-style decimal fractions (".Ol" -> ".01", ".l45" -> ".145")
 _DECIMAL_FRACTION_RE = re.compile(r"(?<![\w.])\.([O0-9lI]{1,4})(?!\w)")
 _ZERO_O_MID_RE = re.compile(r"(?<=\d)O(?=\d)")
+# "z = O." -> "z = 0." -- the (?!\() protects genuine Big-O notation
+# ("O(n2)"), confirmed a real, correct usage right next to this same bug.
+_EQUALS_ZERO_RE = re.compile(r"=(\s*)O(?!\()\b")
 
 def fix_zero_o_confusion(text: str) -> str:
     # Fix common OCR confusion between zero and letter O (and l/I) in decimal fractions.
@@ -262,6 +265,7 @@ def fix_zero_o_confusion(text: str) -> str:
         return "." + fixed
     text = _DECIMAL_FRACTION_RE.sub(_norm, text)
     text = _ZERO_O_MID_RE.sub("0", text)
+    text = _EQUALS_ZERO_RE.sub(lambda m: "=" + m.group(1) + "0", text)
     return text
 
 # Degree symbol OCR confusion: "100oC" or "100O'C" -> "100°C"
@@ -752,12 +756,15 @@ def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
 # VLM's correction directly into primary instead of only reporting it.
 # Trusted shapes: any pure insertion (a missed detection box, not a
 # misread -- VLM's failure mode is misreading real content, not
-# inventing whole passages); a short trailing addition on text OCR
-# already matched (e.g. a dropped superscript); and a Greek letter VLM
-# read that OCR missed entirely (see _is_greek_letter_span). Everything
-# else -- character-confusion swaps (the maps' job), substitutions with
-# no shared prefix, equation-placeholder text (handled separately by
-# _apply_equation_recovery below) -- stays report-only.
+# inventing whole passages); a short trailing OR mid-string addition on
+# text OCR already matched (e.g. a dropped sub/superscript, whether at
+# the end of the span or -- see _common_prefix_len/_common_suffix_len --
+# sandwiched inside real content like "(Her )." -> "(Her<sup>-</sup>).");
+# and a Greek letter VLM read that OCR missed entirely (see
+# _is_greek_letter_span). Everything else -- character-confusion swaps
+# (the maps' job), substitutions with no shared prefix, equation-
+# placeholder text (handled separately by _apply_equation_recovery
+# below) -- stays report-only.
 _EQUATION_PLACEHOLDER_MARKER = "[EQUATION"
 _MERGE_ANCHOR_WORDS = 4
 _MERGE_MAX_ADDITION_CHARS = 8
@@ -789,6 +796,26 @@ def _is_greek_letter_span(text: str) -> bool:
             return True
     return False
 
+# Detects a dropped sub/superscript sitting *inside* a span, not just at
+# the end -- confirmed necessary: "(Her )." -> "(Her<sup>-</sup>)." is the
+# same shape as the trailing-addition case, just with real content (").")
+# after the missing symbol, so it never matches vlm_span.startswith(ocr_span).
+_SUP_SUB_TAG_RE = re.compile(r"<(sup|sub)>[^<]*</\1>")
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for ca, cb in zip(a.lower(), b.lower()):
+        if ca != cb:
+            break
+        n += 1
+    return n
+
+def _common_suffix_len(a: str, b: str, limit: int) -> int:
+    n = 0
+    while n < limit and a[len(a) - 1 - n].lower() == b[len(b) - 1 - n].lower():
+        n += 1
+    return n
+
 def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merge", "flag"]:
     """Decide whether one diff span is safe to auto-apply ("merge") or
     should stay report-only ("flag"). ocr_span/vlm_span are the rendered
@@ -808,6 +835,16 @@ def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merg
             return "merge"  # short trailing addition, e.g. a dropped superscript
         if _is_greek_letter_span(vlm_span) and not _is_greek_letter_span(ocr_span):
             return "merge"  # OCR missed the symbol entirely (e.g. "Fu" for "eta_f")
+        prefix_len = _common_prefix_len(ocr_span, vlm_span)
+        if prefix_len:
+            limit = min(len(ocr_span), len(vlm_span)) - prefix_len
+            suffix_len = _common_suffix_len(ocr_span, vlm_span, limit) if limit > 0 else 0
+            if suffix_len:
+                ocr_middle = ocr_span[prefix_len:len(ocr_span) - suffix_len]
+                vlm_middle = vlm_span[prefix_len:len(vlm_span) - suffix_len]
+                if (not ocr_middle.strip() and _SUP_SUB_TAG_RE.fullmatch(vlm_middle)
+                        and _visible_len(vlm_middle) <= _MERGE_MAX_ADDITION_CHARS):
+                    return "merge"  # dropped sub/superscript mid-string, e.g. "(Her )." -> "(Her<sup>-</sup>)."
     return "flag"
 
 def _normalize_for_primary_text(text: str) -> str:
@@ -995,13 +1032,36 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                 continue
             ocr_span = " ".join(ocr_words) or "(nothing)"
             vlm_span = " ".join(vlm_words) or "(nothing)"
-            label = "[MERGED]" if idx in merged_idx else "[FLAGGED]"
+            if idx in merged_idx:
+                label = "[MERGED]"
+            elif (ocr_span != "(nothing)" and vlm_span != "(nothing)"
+                    and not re.search(re.escape(_normalize_for_primary_text(ocr_span)), primary, re.IGNORECASE)
+                    and re.search(re.escape(_normalize_for_primary_text(vlm_span)), primary, re.IGNORECASE)):
+                # diff-merge made no change here, but something else (an
+                # existing map/fixup run before this pass ever sees the
+                # text) already resolved it -- confirmed by requiring BOTH
+                # that the raw OCR text is gone AND VLM's version is
+                # actually present, not just absence alone. Confirmed
+                # necessary on real data: "Two - dimensionality" -> "Two
+                # dimensionality" (hyphen dropped, not rejoined) would have
+                # false-positived as "already fixed" under an absence-only
+                # check, when the source really has "Two-dimensionality"
+                # and the result is still wrong. Confirmed on K82: 8 of 13
+                # diff lines are genuinely this (already-mapped genotype
+                # notation, stray-period fixes, hyphen rejoins) -- labeling
+                # them the same as a genuinely open item buries the one
+                # that actually needs a look.
+                label = "[ALREADY FIXED]"
+            else:
+                label = "[FLAGGED]"
             report_lines.append(f'  {label} OCR: "{ocr_span}"  |  VLM: "{vlm_span}"')
         if not report_lines:
             continue
         sections.append(
             f"<!-- OCR/VLM DIFF REPORT -- page {page_idx+1}, [MERGED] lines were "
-            f"applied inline above (unmarked), [FLAGGED] lines were not -->\n"
+            f"applied inline above (unmarked), [ALREADY FIXED] lines were resolved "
+            f"by something else before this pass ran, [FLAGGED] lines still need "
+            f"a look -->\n"
             + "\n".join(report_lines)
         )
     return primary + rest, "\n\n".join(sections)
@@ -1015,14 +1075,27 @@ ENABLE_EQUATION_PLACEHOLDERS = True
 
 _WORDLIKE_TOKEN_RE = re.compile(r"[A-Za-z]{2,}")
 
+# Standard math-function abbreviations that shouldn't disqualify a line
+# from equation detection just for containing 2+ letters -- confirmed
+# necessary: "Re[...]" (real part) and "arg[...]" are ordinary notation
+# in complex-analysis papers, not prose, but "Re"/"arg" alone satisfy
+# _WORDLIKE_TOKEN_RE just like a real word would.
+_MATH_NOTATION_WORDS = {
+    "re", "im", "arg", "log", "ln", "exp", "det", "dim", "ker", "deg",
+    "sin", "cos", "tan", "cot", "sec", "csc",
+    "lim", "sup", "inf", "max", "min", "mod", "gcd", "lcm",
+}
+
 def _line_is_equation_like(line: List[OCRWord], median_height: float, median_width: float) -> bool:
     stats = _line_stats(line)
     width = stats["x2"] - stats["x1"]
     if width > 0.5 * median_width:
         return False
     texts = [(w.text or "").strip() for w in line]
-    if any(_WORDLIKE_TOKEN_RE.search(t) for t in texts):
-        return False
+    for t in texts:
+        for m in _WORDLIKE_TOKEN_RE.finditer(t):
+            if m.group().lower() not in _MATH_NOTATION_WORDS:
+                return False
     height = stats["bottom"] - stats["top"]
     tall = height >= 1.5 * median_height
     has_stray_symbol = any("$" in t for t in texts)
