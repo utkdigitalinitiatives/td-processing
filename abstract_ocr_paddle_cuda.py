@@ -558,18 +558,9 @@ _vlm_availability_cache: dict = {}
 
 def _vlm_available(model: str, ollama_url: str, attempts: int = 4, retry_delay: float = 2.0) -> bool:
     """Check (cached) whether Ollama is reachable and `model` is pulled.
-
-    Retries a few times with a short delay before giving up. A single
-    impatient check isn't reliable right after a machine restart -- Ollama's
-    background service can take several seconds to start listening on its
-    HTTP port, and a one-shot 3s-timeout GET made right in that window reads
-    as "unavailable" even though the service is only moments from being
-    ready (confirmed: --vlm-diff-review run alone right after a reboot got
-    skipped this way, while --vlm-review run alongside it happened to check
-    late enough -- via either extra elapsed time or the shared cache below
-    -- to see Ollama already up. That's a timing accident, not a real
-    dependency between the two flags, so it's fixed here for both.)
-    """
+    Retries with a short delay first -- Ollama's background service can
+    take a few seconds to start listening right after a reboot, and a
+    single impatient check reads that as "unavailable"."""
     cache_key = (model, ollama_url)
     if cache_key in _vlm_availability_cache:
         return _vlm_availability_cache[cache_key]
@@ -656,17 +647,11 @@ def vlm_transcribe_page(pdf_path: Path, page_index: int, model: str = DEFAULT_VL
     return None
 
 def _unload_vlm_model(model: str, ollama_url: str) -> None:
-    """Explicitly unload the model from Ollama (keep_alive=0) once every
-    deferred VLM phase in this run is done. Confirmed necessary: Ollama
-    keeps a model resident for minutes after last use, and re-running the
-    script again in that window -- a normal thing to do while
-    iterating/testing, or just processing back-to-back batches -- hits the
-    exact same GPU-contention bug the deferred-execution design exists to
-    avoid within a single run: PaddleOCR's own init silently fails on every
-    page ("0 text segments found") for the *next* run too. Best-effort
-    cleanup only, never raises -- not correctness-critical for the run
-    that's already finished, just hygiene for whatever runs next.
-    """
+    """Unload the model from Ollama (keep_alive=0) once every deferred VLM
+    phase is done -- Ollama keeps it resident for minutes otherwise, and
+    a script re-run in that window hits the same GPU-contention bug
+    (PaddleOCR init silently failing) the deferred-execution design
+    exists to avoid within a single run. Best-effort, never raises."""
     if _requests is None:
         return
     try:
@@ -719,20 +704,11 @@ def _build_vlm_supplementary_html(vlm_blocks: List[Tuple[int, str, str]], casing
 
 # ---- Full OCR/VLM diff pass (--vlm-diff-review, isolated from the recovery
 # pathway above) ----
-# _page_is_suspicious only catches pages that look sparse -- it can't catch
-# a page where OCR produced a normal-looking amount of text that's subtly
-# wrong (confirmed on Thesis76.K82: "PAo" for "PAO", a missing superscript
-# on "(Her )", on pages with 25/37 segments -- well above the flag
-# threshold, so --vlm-review never touches that document at all). This is
-# a different, unconditional pass: every page gets sent to the VLM
-# regardless of suspicion, and instead of attempting any recovery/merge,
-# the two independent transcriptions are diffed and the differences are
-# printed as a report -- never touching the primary draft text. Whether a
-# given difference "looks like" a dropped sub/superscript versus a VLM
-# slip (see the fail/fall finding on K82 -- the VLM's own transcription
-# isn't reliable enough to trust automatically either) is left for a human
-# to judge for now; classifying that automatically is future work, not
-# this pass's job.
+# Unlike --vlm-review's suspicion-based trigger, every page gets sent to
+# the VLM here regardless of segment count -- catches subtly-wrong pages
+# that look normal (confirmed on K82: "PAo"/"PAO", well above the flag
+# threshold). Diffs the two transcriptions and reports differences; never
+# touches the primary draft text.
 def _diff_opcodes(ocr_text: str, vlm_text: str) -> List[Tuple[str, List[str], List[str]]]:
     """Word-level opcodes between OCR's and VLM's text for the same page
     (difflib.SequenceMatcher, word-tokenized). Includes "equal" runs too --
@@ -772,29 +748,16 @@ def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
 
 # ---- Inline diff-merge (--vlm-diff-merge, experimental -- see the
 # "Inline diff-merge" plan) ----
-# Classifies each diff span above and, for the ones judged safe, applies
-# the VLM's correction directly into the primary draft text instead of
-# only reporting it. The rules below were derived from a real diff report
-# (Thesis76.K355), not guessed. Two shapes are trusted: any pure
-# insertion, no length cap (OCR reported nothing there at all -- a
-# missed detection box, not a misread -- and the VLM's observed failure
-# mode is misreading or recontextualizing content that's really there,
-# not inventing whole passages that aren't, so there's nothing for a
-# length threshold to guard against), and a short trailing addition on
-# top of text OCR already got right (OCR's span is an exact prefix of
-# VLM's, e.g. "ε)/ε" -> "ε)/ε<sup>3</sup>", still length-capped -- this
-# one *is* replacing/extending something OCR already committed to).
-# Everything else here stays report-only: character-confusion
-# substitutions like l/1 (the maps' job), and substitutions with no
-# shared prefix (confirmed unsafe on real data -- "Fu"/"eta_f", and
-# "ε"/"epsilon" where OCR was already the more correct rendering).
-#
-# Equation-placeholder-marker content never merges through this
-# classify/merge path -- always flagged here. It's handled by the
-# separate _apply_equation_recovery below instead, which replaces the
-# placeholder itself rather than trying to merge a fragmented diff span
-# (see that function's docstring for why per-opcode merging can't reach
-# these).
+# Classifies each diff span above and, for spans judged safe, applies the
+# VLM's correction directly into primary instead of only reporting it.
+# Trusted shapes: any pure insertion (a missed detection box, not a
+# misread -- VLM's failure mode is misreading real content, not
+# inventing whole passages); a short trailing addition on text OCR
+# already matched (e.g. a dropped superscript); and a Greek letter VLM
+# read that OCR missed entirely (see _is_greek_letter_span). Everything
+# else -- character-confusion swaps (the maps' job), substitutions with
+# no shared prefix, equation-placeholder text (handled separately by
+# _apply_equation_recovery below) -- stays report-only.
 _EQUATION_PLACEHOLDER_MARKER = "[EQUATION"
 _MERGE_ANCHOR_WORDS = 4
 _MERGE_MAX_ADDITION_CHARS = 8
@@ -802,19 +765,13 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 def _visible_len(text: str) -> int:
     """Length with HTML tags stripped -- a sub/superscript addition is
-    always wrapped in <sup>...</sup>/<sub>...</sub> (confirmed on real
-    data: "ε)/ε" -> "ε)/ε<sup>3</sup>" adds 12 raw characters for a
-    1-character payload), so the "is this short enough to trust"
-    threshold has to measure the actual added content, not its markup."""
+    always tag-wrapped, so the length threshold has to measure the
+    actual added content, not its markup."""
     return len(_TAG_RE.sub("", text))
 
 # Greek-letter detector for the classify rule below -- reuses GREEK_MAP
-# (already defined for replace_greek_math) rather than a second hardcoded
-# list. Recognizes a Greek letter in any valid representation: the
-# literal Unicode glyph, its HTML entity, a bare name, or the ASCII
-# variable-naming convention (name + "_" + subscript, e.g. "eta_f",
-# "rho_p") that's exactly the shape the VLM's own prompt already produces
-# for these.
+# rather than a second hardcoded list. Matches any valid representation:
+# glyph, HTML entity, bare name, or the "eta_f"/"rho_p" ASCII convention.
 _GREEK_LETTER_CHARS = set(GREEK_MAP.keys())
 _GREEK_LETTER_NAMES = {name.strip("&;").lower() for name in GREEK_MAP.values() if name.startswith("&")}
 _GREEK_ASCII_VAR_RE = re.compile(r"^(" + "|".join(_GREEK_LETTER_NAMES) + r")_\w+$", re.IGNORECASE)
@@ -839,17 +796,9 @@ def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merg
     placeholder-touching spans always flag."""
     if _EQUATION_PLACEHOLDER_MARKER in ocr_span or _EQUATION_PLACEHOLDER_MARKER in vlm_span:
         return "flag"
-    if tag == "delete":
-        # OCR has content the VLM doesn't transcribe -- never
-        # auto-remove OCR content, only ever add or correct it.
+    if tag == "delete":  # never auto-remove OCR content
         return "flag"
-    if tag == "insert":
-        # No length cap -- unlike a "replace", OCR isn't reporting
-        # anything here at all (a missed detection box, not a
-        # misread), and the VLM's failure mode is misreading or
-        # recontextualizing content that's really there, not
-        # inventing whole passages that aren't -- so there's nothing
-        # for a length threshold to be guarding against.
+    if tag == "insert":  # no length cap -- see module comment above
         return "merge"
     if tag == "replace":
         if vlm_span.lower() == ocr_span.lower():
@@ -858,28 +807,16 @@ def _classify_diff_span(tag: str, ocr_span: str, vlm_span: str) -> Literal["merg
                 and _visible_len(vlm_span) - _visible_len(ocr_span) <= _MERGE_MAX_ADDITION_CHARS):
             return "merge"  # short trailing addition, e.g. a dropped superscript
         if _is_greek_letter_span(vlm_span) and not _is_greek_letter_span(ocr_span):
-            # OCR missed the symbol entirely (e.g. "Fu" for "eta_f") --
-            # the VLM's reading of a Greek letter is trustworthy even
-            # off-prefix. Never fires the other way: if OCR already has
-            # some valid representation of the letter (e.g. the literal
-            # "ε" glyph vs. the VLM's ASCII "epsilon"), OCR's version is
-            # already correct-or-equivalent and stays flagged.
-            return "merge"
+            return "merge"  # OCR missed the symbol entirely (e.g. "Fu" for "eta_f")
     return "flag"
 
 def _normalize_for_primary_text(text: str) -> str:
     """Approximate how raw OCR/VLM text ends up rendered in the final
-    draft, for the narrow purpose of locating (or inserting) it there --
-    reuses the same Greek/math-symbol and non-ASCII-to-entity conversions
-    the real per-paragraph fixup chain applies (replace_greek_math,
-    convert_remaining_non_ascii). Confirmed necessary on real data: raw
-    OCR/VLM text has a literal "ε", the final draft already has
-    "&epsilon;" -- without this, searching for the raw character always
-    comes up empty and a genuinely mergeable span (ε)/ε -> ε)/ε<sup>3</sup>)
-    falls back to [FLAGGED] for no real reason. Deliberately doesn't
-    attempt the rest of the fixup chain (casing reference, stray-period
-    detection, etc.) -- those are context-dependent on the whole
-    paragraph, not meaningful to apply to a short span in isolation."""
+    draft, for locating (or inserting) it there -- applies the same
+    Greek/math-symbol and non-ASCII-to-entity conversions the real
+    fixup chain does, since raw text has "ε" where the draft already
+    has "&epsilon;". Skips the rest of the chain (casing, stray-period
+    detection) -- too context-dependent for a short span in isolation."""
     return convert_remaining_non_ascii(replace_greek_math(text))
 
 _EQUATION_LABEL_NUM_RE = re.compile(r"\[EQUATION(?:\s+(\d+))?")
@@ -888,13 +825,9 @@ _PLACEHOLDER_TAIL_MARKER = "verify manually"
 
 def _equation_boundary_words(ocr_words: List[str]) -> Tuple[List[str], List[str]]:
     """Split one opcode's raw ocr_words into (words before, words after)
-    the "[EQUATION...]" placeholder token. It's one atomic token in the
-    real pipeline but arrives here already whitespace-split, so the
-    opening "[EQUATION" and closing "]" have to be found by content, not
-    position -- and the closing "]" may not even be in this opcode at
-    all if the placeholder itself got fragmented across opcodes (no
-    trailing words are returned in that case -- safer to report nothing
-    than guess)."""
+    the "[EQUATION...]" placeholder token, found by content since it
+    arrives whitespace-split. No trailing words if the closing "]" isn't
+    in this opcode -- the placeholder itself got fragmented further."""
     start_idx = next((i for i, w in enumerate(ocr_words) if "[EQUATION" in w), None)
     if start_idx is None:
         return [], []
@@ -905,49 +838,25 @@ def _equation_boundary_words(ocr_words: List[str]) -> Tuple[List[str], List[str]
 
 def _apply_equation_recovery(primary: str, page_idx: int,
                               opcodes: List[Tuple[str, List[str], List[str]]]) -> Tuple[str, List[int]]:
-    """For a page with any equation-placeholder-touching diff span,
-    replace each equation placeholder with its own VLM-recovered content
-    -- unmarked, same as any other pure insertion (this is adding real
-    content where a placeholder stood in for "nothing usable was
-    recovered yet", not second-guessing anything OCR itself produced).
-    A separate mechanism from the per-opcode word-diff merge above, not
-    an extension of it -- see the module comment above
-    _classify_diff_span for why per-opcode merging can't reach these
-    (the placeholder is one atomic token in the real pipeline, but this
-    module's word-level tokenization fragments it and glues the pieces
-    onto whatever's adjacent).
+    """Replace each equation placeholder with its own VLM-recovered
+    content, unmarked. Separate from the per-opcode merge above -- the
+    placeholder is one atomic token but arrives fragmented, so no single
+    opcode reliably locates it.
 
-    Groups contributing opcodes by which specific placeholder they touch
-    -- parsed straight from the "[EQUATION N" text present in every
-    contributing span, not by position or order. Confirmed necessary: a
-    naive "concatenate everything touching any placeholder, replace only
-    the first one" approach glues unrelated equations together with no
-    separator (K355's two equations on one page ended up as one run-on
-    expression) and leaves the second placeholder behind, orphaned, with
-    its real content already misattributed to the first. Each group only
-    ever replaces its own placeholder; a group whose placeholder can't be
-    found in `primary` is left flagged, same as if it had never merged.
+    Groups contributing opcodes by which specific "[EQUATION N" they
+    touch, not by order -- naively replacing only the first placeholder
+    with everything glues unrelated equations together with no separator
+    and orphans the rest (confirmed on K355). A group whose placeholder
+    isn't found in `primary` stays flagged.
 
-    Also absorbs a short leading/trailing word left over from the
-    boundary opcode's ocr_span, along with a spurious paragraph break in
-    between, when they sit immediately adjacent to the placeholder.
-    Confirmed necessary on real data: K355's diff span is `"Ias
-    [EQUATION 1 - VERIFY MANUALLY, PAGE 4]"` -> `"as K2 = ..."` -- OCR's
-    "Ias" (a misread of "as") landed in the *previous* `<p>`, the
-    placeholder started the next one, so a placeholder-only replacement
-    left "Ias" behind untouched even though it's part of the same merged
-    span. The diff-merge system already has independent (VLM) agreement
-    that this content is continuous, which is exactly the evidence the
-    plain paragraph-splitter doesn't have -- so it's safe to also close
-    the paragraph break here, unlike a blind heuristic change to
-    splitting in general. Bounded to a short (<=3 word) extra, and only
-    acts when the combined leading/trailing+placeholder pattern matches
-    exactly once; falls back to a placeholder-only match otherwise --
-    never worse than before, only better when the adjacency holds.
+    Also absorbs a short (<=3 word) leading/trailing word from the
+    boundary opcode, plus a paragraph break between it and the
+    placeholder, when adjacent -- e.g. a misread word stranded in the
+    previous `<p>` by the paragraph-splitter (confirmed on K355: "Ias").
+    Falls back to a placeholder-only match if the wider pattern doesn't
+    match uniquely.
 
-    Returns (updated_primary, contributing_indices) -- contributing_indices
-    are the opcodes' indices whose text actually made it into a
-    replacement (i.e., that specific placeholder was found), for report
+    Returns (updated_primary, contributing_indices) for report
     annotation.
     """
     groups: dict = {}  # equation number as parsed (or None) -> [(idx, vlm_span), ...]
@@ -963,16 +872,9 @@ def _apply_equation_recovery(primary: str, page_idx: int,
         if vlm_span != "(nothing)":
             groups.setdefault(eq_num, []).append((idx, vlm_span))
 
-    # A group's last contributing opcode may not contain the
-    # placeholder's closing "]" (_equation_boundary_words already
-    # signals this via an empty trailing list) -- the tail half of the
-    # same fragmented placeholder token landed in the *next* opcode
-    # instead, without the "[EQUATION" substring itself, so the loop
-    # above never picked it up. Confirmed on real data: K355's second
-    # equation loses its trailing "- 0.087" term this way ("[EQUATION 2"
-    # and "VERIFY MANUALLY, PAGE 4]" -> "0.087" are two separate
-    # opcodes). Only ever look at the immediate next non-equal opcode --
-    # deliberately narrow, not a general multi-fragment reconstruction.
+    # If the placeholder's closing "]" got split into a separate opcode, the
+    # trailing words are in that opcode, not the one that touched the placeholder. Walk forward to find it and absorb it into the group, so the
+    # boundary words are complete for the regex match below. Only the immediate next non-equal opcode is considered, since a placeholder's closing "]" is always adjacent to it in the OCR/VLM text.
     claimed = {idx for entries in groups.values() for idx, _ in entries}
     for eq_num, entries in groups.items():
         _, trailing = _equation_boundary_words(opcodes[entries[-1][0]][1])
@@ -1019,15 +921,6 @@ def _apply_equation_recovery(primary: str, page_idx: int,
                 continue
             match = narrow_matches[0]
 
-        # Reconstruct from the full contiguous VLM range (first
-        # contributing opcode through last), not just the marker-
-        # touching fragments -- confirmed necessary: the placeholder's
-        # own literal " - " separator can coincidentally text-match an
-        # unrelated "-" elsewhere in the VLM's transcription (K355: the
-        # "-" in "V2/V1 - 0.087"), producing a spurious one-word "equal"
-        # opcode sandwiched between two contributing fragments. That
-        # opcode's VLM text is real content that belongs in the
-        # combination, even though it's not itself marker-touching.
         first_idx, last_idx = entries[0][0], entries[-1][0]
         combined_vlm = " ".join(
             " ".join(opcodes[k][2]) for k in range(first_idx, last_idx + 1) if opcodes[k][2]
@@ -1038,17 +931,14 @@ def _apply_equation_recovery(primary: str, page_idx: int,
     return primary, contributing
 
 def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, str]]) -> Tuple[str, str]:
-    """Apply "merge"-classified spans directly into draft_text's primary
-    paragraph content, page by page in order, and render the same report
-    _build_vlm_diff_report_html would -- annotated per line with whether
-    it was actually merged, and left [FLAGGED] (with the rest, unchanged)
-    when a "merge"-classified span couldn't be safely located.
+    """Apply "merge"-classified spans into draft_text's primary paragraph
+    content, page by page, and render the same report
+    _build_vlm_diff_report_html would, annotated [MERGED]/[FLAGGED].
 
-    Returns (updated_draft_text, report_str). draft_text is never
-    mutated past its primary paragraph prefix -- both existing append
-    points (the VLM recovery block, this same diff report) begin with
-    "\\n\\n<!--", so anything already appended by an earlier phase in
-    this run is split off first and reattached untouched.
+    Returns (updated_draft_text, report_str). Never mutates past the
+    primary paragraph prefix -- both existing append points (VLM
+    recovery block, this report) start with "\\n\\n<!--", split off
+    first and reattached untouched.
     """
     marker = "\n\n<!--"
     split_at = draft_text.find(marker)
@@ -1066,19 +956,7 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             if _classify_diff_span(tag, ocr_span, vlm_span) == "merge":
                 vlm_normalized = _normalize_for_primary_text(vlm_span)
                 if tag == "insert":
-                    # Walk back to the nearest opcode with real,
-                    # currently-findable text in primary -- not just
-                    # opcodes[idx-1], and not only if it's "equal".
-                    # Confirmed necessary on real data: a genuinely
-                    # missing sentence ("(nothing)" -> "The K2 equation")
-                    # sat right after an unmerged "Reynold's" ->
-                    # "Reynolds'" replace, so requiring the immediate
-                    # predecessor to be "equal" found no anchor at all
-                    # even though "Reynold's" itself (left untouched,
-                    # since that replace stayed flagged) was right there
-                    # to anchor on. Only an unmerged prior "insert" is
-                    # skipped -- it never had any OCR-side text in
-                    # primary to anchor on in the first place.
+                    # Find the last non-insert opcode before this one, and use its last few words as an anchor to locate where to insert the new content. If no prior non-insert opcode exists, skip the merge -- we don't want to prepend content to the start of a paragraph.
                     anchor_words = []
                     for j in range(idx - 1, -1, -1):
                         prior_tag, prior_ocr_words, prior_vlm_words = opcodes[j]
@@ -1090,27 +968,13 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                             break
                     anchor = _normalize_for_primary_text(" ".join(anchor_words))
                     if anchor:
-                        # A trailing "." on the anchor may already be
-                        # gone from primary -- fix_stray_period_before_
-                        # lowercase strips a period immediately followed
-                        # by a lowercase word, and that's exactly what
-                        # this OCR text looks like when the real next
-                        # word was dropped entirely and content resumes
-                        # lowercase (confirmed on real data: OCR's
-                        # "...compressive forces. is defined..." reads
-                        # as noise-before-lowercase to that earlier,
-                        # unrelated fixup, so the period's gone by the
-                        # time this anchor searches for it). Make a
-                        # trailing period in the anchor optional rather
-                        # than lose an otherwise-good anchor over it.
+                        # If the anchor ends with a period, allow the match to be found with or without the period (the VLM may have dropped it). If the anchor is found multiple times, skip the merge -- we don't want to risk inserting in the wrong place. If it's found once, insert the new content immediately after it, restoring a period if it was dropped.
                         had_period = anchor.endswith(".")
                         anchor_pattern = re.escape(anchor[:-1]) + r"\.?" if had_period else re.escape(anchor)
                         matches = list(re.finditer(anchor_pattern, primary, re.IGNORECASE))
                         if len(matches) == 1:
                             pos = matches[0].end()
-                            # Restore the period if the match landed
-                            # without one -- otherwise this sentence
-                            # runs straight into the next with no break.
+                            # Restore the period if the match landed without one.
                             prefix = "." if had_period and primary[pos - 1:pos] != "." else ""
                             primary = primary[:pos] + prefix + " " + vlm_normalized + primary[pos:]
                             merged_idx.add(idx)
@@ -1325,12 +1189,9 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
     get added to vlm_flagged_pages when vlm_review_mode is set.
 
     vlm_diff_pages/page_ocr_texts are for the separate --vlm-diff-review
-    pass (see that section): when vlm_diff_review is True, EVERY page in
-    range is added to vlm_diff_pages unconditionally (no suspicion check --
-    this is a full second pass, not a targeted one), and page_ocr_texts
-    captures that page's own OCR text for the deferred diff against the
-    VLM's independent transcription of the same page. Kept architecturally
-    separate from vlm_flagged_pages -- these are two independent systems.
+    pass: when vlm_diff_review is True, every page in range is added
+    unconditionally (no suspicion check), and page_ocr_texts captures
+    each page's own OCR text for the deferred diff against the VLM.
     """
     collected = []
     end_page = start_page
@@ -1411,14 +1272,9 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
             pre_stop_lines.append(ln)
         collected.extend(filtered_words)
 
-        # See "Full OCR/VLM diff pass" section: capture only the part of
-        # this page that's actually abstract content -- i.e. up to the same
-        # stop-heading boundary the primary text already respects (a hard
-        # content-boundary fact, not the "suspicion" heuristic this pass is
-        # meant to bypass). A page entirely past that boundary (e.g. a
-        # Table of Contents page) contributes nothing and isn't reviewed --
-        # confirmed necessary: without this, Thesis76.K82's TOC page got
-        # diff-reviewed and produced a page of page-number/dot-leader noise.
+        # Only the part of this page that's actually abstract content --
+        # up to the same stop-heading boundary the primary text respects
+        # (a TOC page contributes nothing and isn't reviewed).
         if vlm_diff_review and pre_stop_lines:
             page_ocr_texts[p] = " ".join(" ".join(w.text for w in ln) for ln in pre_stop_lines)
             vlm_diff_pages.append(p)
@@ -1955,10 +1811,9 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
                              manifest for main()'s deferred VLM phase to pick up after
                              every PDF in the batch has finished its PaddleOCR work
                              (see the "Optional VLM review pass" section for why).
-        vlm_diff_review: opt-in, off by default. Independent of vlm_review_mode --
-                             see the "Full OCR/VLM diff pass" section. Also writes its
-                             own separate sidecar for main()'s deferred phase; never
-                             calls the VLM from here either, same reasoning as above.
+        vlm_diff_review: opt-in, off by default, independent of vlm_review_mode.
+                             Writes its own sidecar for main()'s deferred phase;
+                             never calls the VLM here either, same reasoning as above.
     """
 
     print(f"\n{'='*70}")
@@ -2056,10 +1911,7 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
             # vlm_flagged_pages is a list of [page_index, reason] pairs.
             sidecar.write_text(json.dumps({"pdf_path": str(pdf_path), "flagged_pages": vlm_flagged_pages}), encoding="utf-8")
 
-        # Separate, independent sidecar for the --vlm-diff-review pass (see
-        # the "Full OCR/VLM diff pass" section) -- own file, own manifest
-        # shape, own deferred-phase handler. Not merged with the sidecar
-        # above: these are two parallel systems, not one extending the other.
+        # Separate sidecar for the --vlm-diff-review pass -- own file, own deferred-phase handler.
         if vlm_diff_review and vlm_diff_pages:
             diff_sidecar = out_dir / f"{pdf_path.stem} draft.diff_pending.json"
             diff_sidecar.write_text(json.dumps({
@@ -2128,28 +1980,17 @@ def main():
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help=f"Ollama server URL. Default: {DEFAULT_OLLAMA_URL}")
     parser.add_argument("--vlm-diff-review", action="store_true",
                          help="Opt-in, independent of --vlm-review: run the VLM on EVERY abstract page "
-                              "(no suspicion check) and print a word-level diff against OCR's own text "
-                              "at the bottom of the draft. Never modifies the primary draft text -- "
-                              "purely a report for catching cases OCR got wrong without looking sparse "
-                              "(e.g. a confidently-misread character, a dropped superscript) that "
-                              "--vlm-review's segment-count trigger can't see. Requires Ollama/the model "
-                              "the same way --vlm-review does.")
+                              "and print a word-level diff against OCR's own text at the bottom of the "
+                              "draft. Never modifies the primary draft text -- catches cases OCR got "
+                              "wrong without looking sparse, which --vlm-review's trigger can't see.")
     parser.add_argument("--vlm-diff-merge", action="store_true",
-                         help="Experimental, opt-in: like --vlm-diff-review (implies it -- no need to pass "
-                              "both), but also applies the subset of diff spans judged safe directly into "
-                              "the primary draft text, unmarked -- a pure insertion (OCR detected nothing "
-                              "there at all, no length cap), a short trailing addition or pure case fix on "
-                              "text OCR already matched, or an equation-placeholder's recovered content "
-                              "(replacing that specific placeholder only). Everything else (substitutions "
-                              "with no shared prefix, character-confusion substitutions) stays report-only, "
-                              "same as --vlm-diff-review alone. See the diff-merge section for the real-data "
-                              "reasoning behind the split.")
+                         help="Experimental, opt-in: like --vlm-diff-review (implies it), but also applies "
+                              "the diff spans judged safe directly into the primary draft text, unmarked -- "
+                              "see the diff-merge section for which shapes qualify and why.")
     args = parser.parse_args()
 
     vlm_review_mode = args.vlm_review_mode if args.vlm_review else None
-    # --vlm-diff-merge builds on --vlm-diff-review's data collection --
-    # either flag alone is enough to turn it on, so the user never needs
-    # to pass both for the merge behavior to work.
+    # --vlm-diff-merge builds on --vlm-diff-review's data collection -- either flag alone turns it on.
     vlm_diff_review_enabled = args.vlm_diff_review or args.vlm_diff_merge
 
     in_dir = Path(args.input)
@@ -2214,11 +2055,8 @@ def main():
             cmd += ["--vlm-review", "--vlm-review-mode", args.vlm_review_mode,
                     "--vlm-trigger-threshold", str(args.vlm_trigger_threshold)]
         if vlm_diff_review_enabled:
-            # The child only needs to *collect* per-page OCR text (a local,
-            # no-network decision, same as --vlm-review above) -- actual
-            # merging happens in the deferred phase below, in this parent
-            # process, so the child never needs to know about
-            # --vlm-diff-merge specifically.
+            # Child only collects per-page OCR text; merging happens in
+            # the parent's deferred phase below.
             cmd += ["--vlm-diff-review"]
 
         success = False
@@ -2276,10 +2114,8 @@ def main():
                         print(f" ⚠ failed: {e}")
                 sidecar.unlink(missing_ok=True)
 
-    # Deferred OCR/VLM diff phase -- see "Full OCR/VLM diff pass" section.
-    # Independent of the --vlm-review phase above: own sidecar file, own
-    # manifest shape, own output section. Same non-negotiable timing rule
-    # applies (runs only after every PDF's PaddleOCR work is fully done).
+    # Deferred OCR/VLM diff phase -- independent of --vlm-review above, own
+    # sidecar/output, same timing rule (only after all PaddleOCR work is done).
     if vlm_diff_review_enabled:
         diff_pending = sorted(out_dir.glob("*.diff_pending.json"))
         if diff_pending:
@@ -2306,10 +2142,7 @@ def main():
                         existing = draft_path.read_text(encoding="utf-8") if draft_path.exists() else ""
                         if args.vlm_diff_merge:
                             updated, report = _apply_vlm_diff_merges(existing, diff_blocks) if existing else ("", "")
-                            # Count real per-span report lines only -- the section
-                            # header's own explanatory text ("...[MERGED] lines were
-                            # applied...") also contains the literal substring
-                            # "[MERGED]" and would otherwise inflate this.
+                            # Count report lines only -- the header text itself contains "[MERGED]" too.
                             merged_count = sum(1 for line in report.splitlines() if line.strip().startswith("[MERGED]"))
                         else:
                             updated, report = existing, _build_vlm_diff_report_html(diff_blocks)
@@ -2324,9 +2157,7 @@ def main():
                         print(f" ⚠ failed: {e}")
                 sidecar.unlink(missing_ok=True)
 
-    # See _unload_vlm_model: release the model now so it can't poison a
-    # later run's PaddleOCR calls. Only relevant if a VLM phase actually
-    # ran above (an unloaded model unload is a harmless no-op either way).
+    # Release the model so it can't poison a later run's PaddleOCR calls (see _unload_vlm_model).
     if args.vlm_review or vlm_diff_review_enabled:
         _unload_vlm_model(args.vlm_model, args.ollama_url)
 
