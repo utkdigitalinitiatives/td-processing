@@ -10,8 +10,6 @@ __pycache__/
 # remove these lines if you do want them versioned.
 inputs/
 outputs/
-completed_drafts/
-temp folder/
 
 # Local secrets, if a .env is ever added (load_dotenv() looks for one; none
 # is required today, but keep it out if one shows up)
