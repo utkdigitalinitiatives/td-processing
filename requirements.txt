@@ -1,0 +1,11 @@
+# Direct dependencies only (pip resolves the rest -- paddleocr/paddlepaddle
+# alone pull in opencv, pandas, and several other transitive packages).
+# Requires Python 3.11 -- paddlepaddle 3.0.0 has no 3.12/3.13 wheel yet.
+numpy==2.4.4
+paddleocr==3.4.0
+paddlepaddle==3.0.0
+pillow==12.1.1
+pymupdf==1.28.2
+python-dotenv==1.2.2
+requests==2.34.2
+tqdm==4.70.0
