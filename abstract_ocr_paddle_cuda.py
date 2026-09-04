@@ -175,11 +175,6 @@ MATH_MAP = {
 
 # ---- Known scientific notation, matched by exact text rather than OCR geometry ----
 # Problem: OCR often misreads superscripts/subscripts, and we have no visual offset info at the line level to detect them. So we only tag known scientific tokens by exact text match here.
-SCIENTIFIC_NOTATION_SUP = {
-    "R2": "R<sup>2</sup>", "r2": "r<sup>2</sup>",
-    "R3": "R<sup>3</sup>", "r3": "r<sup>3</sup>",
-    "cm2": "cm<sup>2</sup>",
-}
 CHEMICAL_FORMULA_SUB = {
     "H2O": "H<sub>2</sub>O", "CO2": "CO<sub>2</sub>", "O2": "O<sub>2</sub>", "N2": "N<sub>2</sub>",
     "NH3": "NH<sub>3</sub>", "NH4": "NH<sub>4</sub>", "SO2": "SO<sub>2</sub>", "SO4": "SO<sub>4</sub>",
@@ -200,43 +195,15 @@ ISOTOPE_NOTATION_SUP = {
     "89Mo": "<sup>89</sup>Mo", "89Mom": "<sup>89</sup>Mo<sup>m</sup>",
     "90Mo": "<sup>90</sup>Mo", "92Mo": "<sup>92</sup>Mo",
 }
-# Unit/identifier OCR fixes: common misreads confirmed against source scans.
-UNIT_OCR_FIXES = {
-    "GFa": "GPa",
-    "ilvBll2": "ilvB112",
-}
-# Non-chemical subscript notation confirmed by exact text match (e.g. "K2"
-# for a dust-resistivity coefficient). Kept as its own dict, distinct from
-# CHEMICAL_FORMULA_SUB, since these aren't chemical formulas.
-SUBSCRIPT_NOTATION_SUB = {
-    "K2": "K<sub>2</sub>",
-}
-_KNOWN_SCIENCE_NOTATION = {**SCIENTIFIC_NOTATION_SUP, **CHEMICAL_FORMULA_SUB, **ISOTOPE_NOTATION_SUP, **UNIT_OCR_FIXES, **SUBSCRIPT_NOTATION_SUB}
+_KNOWN_SCIENCE_NOTATION = {**CHEMICAL_FORMULA_SUB, **ISOTOPE_NOTATION_SUP}
 _SCIENCE_TOKEN_RE = re.compile(r"\b\w+\b")
 
-# Common OCR misreads of scientific phrases that are not single tokens, so we can't catch them with the token regex above. These are applied by exact text match.
-SCIENCE_PHRASE_FIXES = {
-    "Ca 2+": "Ca<sup>2+</sup>",
-    "Mg 2+": "Mg<sup>2+</sup>",
-    "2.Oug": "2.0µg",
-    "log ft": "log <i>ft</i>",
-    "K-2": "K<sub>2</sub>",
-    "ft.2": "ft.<sup>2</sup>",
-    "Les )": "Les<sup>-</sup>)",
-    "Rec )": "Rec<sup>-</sup>)",
-    "leu-l": "leu-1",
-}
-
 def apply_known_science_notation(text: str) -> str:
-    """Tag known statistical/chemical/unit tokens (e.g. 'R2', 'CO2', 'GFa')
-    by exact text match, since the OCR line-level boxes give us no visual
-    offset to detect them by position. See _KNOWN_SCIENCE_NOTATION and
-    SCIENCE_PHRASE_FIXES above."""
+    """Tag known chemical/isotope tokens (e.g. 'CO2', '89Zr') by exact text
+    match, since the OCR line-level boxes give us no visual offset to
+    detect them by position. See _KNOWN_SCIENCE_NOTATION above."""
     if not text:
         return text
-    for phrase, replacement in SCIENCE_PHRASE_FIXES.items():
-        if phrase in text:
-            text = text.replace(phrase, replacement)
     if _KNOWN_SCIENCE_NOTATION:
         text = _SCIENCE_TOKEN_RE.sub(
             lambda m: _KNOWN_SCIENCE_NOTATION.get(m.group(0), m.group(0)), text
@@ -447,23 +414,27 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
     rec_texts = page_result.get('rec_texts', [])
     rec_scores = page_result.get('rec_scores', [])
     rec_polys = page_result.get('rec_polys', page_result.get('dt_polys', []))
-    
+    doc_angle = page_result.get('doc_preprocessor_res', {}).get('angle', 0)
+    img_h, img_w = img_array.shape[0], img_array.shape[1]
+    if doc_angle not in (0, 180):
+        print(f"  ⚠ page reported unexpected doc-orientation angle {doc_angle}, bbox coordinates may be wrong")
+
     # Iterate through detected text
     for i, text in enumerate(rec_texts):
         try:
             if not text or not text.strip():
                 continue
-            
+
             # Get confidence score
             conf = float(rec_scores[i]) if i < len(rec_scores) else 0.95
-            
+
             # Filter out noise and low-confidence detections
             if conf < confidence_threshold:
                 continue
-            
+
             if is_noise(text.strip(), conf):
                 continue
-            
+
             # Get bounding box polygon [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
             if i < len(rec_polys):
                 bbox_points = rec_polys[i]
@@ -473,11 +444,15 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
                 y_min = int(min(ys))
                 x_max = int(max(xs))
                 y_max = int(max(ys))
+                if doc_angle == 180:
+                    # Map back out of the rotated frame the classifier corrected into.
+                    x_min, x_max = img_w - x_max, img_w - x_min
+                    y_min, y_max = img_h - y_max, img_h - y_min
             else:
                 # Fallback bbox if polygon missing
                 x_min, y_min, x_max, y_max = 0, 0, 100, 20
-            
-            words.append(OCRWord(page=-1, text=text.strip(), conf=conf, 
+
+            words.append(OCRWord(page=-1, text=text.strip(), conf=conf,
                                bbox=(x_min, y_min, x_max, y_max)))
         except Exception as e:
             # Skip malformed entries but continue processing
@@ -754,17 +729,12 @@ def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
 # "Inline diff-merge" plan) ----
 # Classifies each diff span above and, for spans judged safe, applies the
 # VLM's correction directly into primary instead of only reporting it.
-# Trusted shapes: any pure insertion (a missed detection box, not a
-# misread -- VLM's failure mode is misreading real content, not
-# inventing whole passages); a short trailing OR mid-string addition on
-# text OCR already matched (e.g. a dropped sub/superscript, whether at
-# the end of the span or -- see _common_prefix_len/_common_suffix_len --
-# sandwiched inside real content like "(Her )." -> "(Her<sup>-</sup>).");
-# and a Greek letter VLM read that OCR missed entirely (see
-# _is_greek_letter_span). Everything else -- character-confusion swaps
-# (the maps' job), substitutions with no shared prefix, equation-
-# placeholder text (handled separately by _apply_equation_recovery
-# below) -- stays report-only.
+# Trusted shapes: any pure insertion (a missed detection box, not a misread -- VLM's failure mode is misreading real content, not inventing whole passages);
+# a short trailing OR mid-string addition on text OCR already matched (e.g. a dropped sub/superscript, whether at
+# the end of the span or -- see _common_prefix_len/_common_suffix_len -- sandwiched inside real content;
+# and a Greek letter VLM read that OCR missed entirely (see _is_greek_letter_span). 
+# Everything else -- character-confusion swaps, (the maps' job), substitutions with no shared prefix, equation- placeholder text 
+# (handled separately by _apply_equation_recovery below) -- stays report-only.
 _EQUATION_PLACEHOLDER_MARKER = "[EQUATION"
 _MERGE_ANCHOR_WORDS = 4
 _MERGE_MAX_ADDITION_CHARS = 8
@@ -778,7 +748,7 @@ def _visible_len(text: str) -> int:
 
 # Greek-letter detector for the classify rule below -- reuses GREEK_MAP
 # rather than a second hardcoded list. Matches any valid representation:
-# glyph, HTML entity, bare name, or the "eta_f"/"rho_p" ASCII convention.
+# glyph, HTML entity, bare name, or ASCII convention.
 _GREEK_LETTER_CHARS = set(GREEK_MAP.keys())
 _GREEK_LETTER_NAMES = {name.strip("&;").lower() for name in GREEK_MAP.values() if name.startswith("&")}
 _GREEK_ASCII_VAR_RE = re.compile(r"^(" + "|".join(_GREEK_LETTER_NAMES) + r")_\w+$", re.IGNORECASE)
@@ -796,10 +766,7 @@ def _is_greek_letter_span(text: str) -> bool:
             return True
     return False
 
-# Detects a dropped sub/superscript sitting *inside* a span, not just at
-# the end -- confirmed necessary: "(Her )." -> "(Her<sup>-</sup>)." is the
-# same shape as the trailing-addition case, just with real content (").")
-# after the missing symbol, so it never matches vlm_span.startswith(ocr_span).
+# Detects a dropped sub/superscript sitting *inside* a span, not just at the end 
 _SUP_SUB_TAG_RE = re.compile(r"<(sup|sub)>[^<]*</\1>")
 
 def _common_prefix_len(a: str, b: str) -> int:
@@ -889,7 +856,7 @@ def _apply_equation_recovery(primary: str, page_idx: int,
     Also absorbs a short (<=3 word) leading/trailing word from the
     boundary opcode, plus a paragraph break between it and the
     placeholder, when adjacent -- e.g. a misread word stranded in the
-    previous `<p>` by the paragraph-splitter (confirmed on K355: "Ias").
+    previous `<p>` by the paragraph-splitter (confirmed on K355).
     Falls back to a placeholder-only match if the wider pattern doesn't
     match uniquely.
 
@@ -909,9 +876,7 @@ def _apply_equation_recovery(primary: str, page_idx: int,
         if vlm_span != "(nothing)":
             groups.setdefault(eq_num, []).append((idx, vlm_span))
 
-    # If the placeholder's closing "]" got split into a separate opcode, the
-    # trailing words are in that opcode, not the one that touched the placeholder. Walk forward to find it and absorb it into the group, so the
-    # boundary words are complete for the regex match below. Only the immediate next non-equal opcode is considered, since a placeholder's closing "]" is always adjacent to it in the OCR/VLM text.
+    # Identify all opcodes that contribute to any equation group
     claimed = {idx for entries in groups.values() for idx, _ in entries}
     for eq_num, entries in groups.items():
         _, trailing = _equation_boundary_words(opcodes[entries[-1][0]][1])
@@ -993,7 +958,7 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             if _classify_diff_span(tag, ocr_span, vlm_span) == "merge":
                 vlm_normalized = _normalize_for_primary_text(vlm_span)
                 if tag == "insert":
-                    # Find the last non-insert opcode before this one, and use its last few words as an anchor to locate where to insert the new content. If no prior non-insert opcode exists, skip the merge -- we don't want to prepend content to the start of a paragraph.
+                    # Find the last non-insert opcode before this one, and use its last few words as an anchor to locate where to insert the new content. If no prior non-insert opcode exists, skip the merge
                     anchor_words = []
                     for j in range(idx - 1, -1, -1):
                         prior_tag, prior_ocr_words, prior_vlm_words = opcodes[j]
@@ -1005,7 +970,9 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                             break
                     anchor = _normalize_for_primary_text(" ".join(anchor_words))
                     if anchor:
-                        # If the anchor ends with a period, allow the match to be found with or without the period (the VLM may have dropped it). If the anchor is found multiple times, skip the merge -- we don't want to risk inserting in the wrong place. If it's found once, insert the new content immediately after it, restoring a period if it was dropped.
+                        # If the anchor ends with a period, allow the match to be found with or without the period 
+                        # If the anchor is found multiple times, skip the merge -- we don't want to risk inserting in the wrong place.
+                        # If it's found once, insert the new content immediately after it, restoring a period if it was dropped.
                         had_period = anchor.endswith(".")
                         anchor_pattern = re.escape(anchor[:-1]) + r"\.?" if had_period else re.escape(anchor)
                         matches = list(re.finditer(anchor_pattern, primary, re.IGNORECASE))
@@ -1013,14 +980,7 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                             pos = matches[0].end()
                             # Restore the period if the match landed without one.
                             prefix = "." if had_period and primary[pos - 1:pos] != "." else ""
-                            # An "insert" means OCR found nothing at all here -- if that
-                            # nothing happened to span a page boundary, the paragraph
-                            # splitter's blunt "new page, so always split" rule (unlike
-                            # its gap-based within-page splits) already stranded a
-                            # </p><p> right at this point. The VLM text bridging the gap
-                            # shows that break was never real, so absorb it instead of
-                            # splicing in before it (same fix as _apply_equation_recovery
-                            # already applies for placeholder boundaries).
+                            # If the anchor is at a paragraph break, insert the new content in the next paragraph, otherwise insert it inline.
                             brk = re.match(r"\s*</p>\s*<p>\s*", primary[pos:])
                             if brk:
                                 primary = primary[:pos] + prefix + " " + vlm_normalized + " " + primary[pos + brk.end():]
@@ -1049,20 +1009,7 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             elif (ocr_span != "(nothing)" and vlm_span != "(nothing)"
                     and not re.search(re.escape(_normalize_for_primary_text(ocr_span)), primary, re.IGNORECASE)
                     and re.search(re.escape(_normalize_for_primary_text(vlm_span)), primary, re.IGNORECASE)):
-                # diff-merge made no change here, but something else (an
-                # existing map/fixup run before this pass ever sees the
-                # text) already resolved it -- confirmed by requiring BOTH
-                # that the raw OCR text is gone AND VLM's version is
-                # actually present, not just absence alone. Confirmed
-                # necessary on real data: "Two - dimensionality" -> "Two
-                # dimensionality" (hyphen dropped, not rejoined) would have
-                # false-positived as "already fixed" under an absence-only
-                # check, when the source really has "Two-dimensionality"
-                # and the result is still wrong. Confirmed on K82: 8 of 13
-                # diff lines are genuinely this (already-mapped genotype
-                # notation, stray-period fixes, hyphen rejoins) -- labeling
-                # them the same as a genuinely open item buries the one
-                # that actually needs a look.
+                # The VLM's span is present in the primary text, but the OCR's span is not. This means that the VLM's correction was applied by some other mechanism (e.g., a previous pass or manual edit), so we mark it as already fixed.
                 label = "[ALREADY FIXED]"
             else:
                 label = "[FLAGGED]"
@@ -1087,11 +1034,8 @@ ENABLE_EQUATION_PLACEHOLDERS = True
 
 _WORDLIKE_TOKEN_RE = re.compile(r"[A-Za-z]{2,}")
 
-# Standard math-function abbreviations that shouldn't disqualify a line
-# from equation detection just for containing 2+ letters -- confirmed
-# necessary: "Re[...]" (real part) and "arg[...]" are ordinary notation
-# in complex-analysis papers, not prose, but "Re"/"arg" alone satisfy
-# _WORDLIKE_TOKEN_RE just like a real word would.
+# A small set of common math notation words that are allowed in an
+# equation-like line. Any other word-like token (2+ letters) in a line
 _MATH_NOTATION_WORDS = {
     "re", "im", "arg", "log", "ln", "exp", "det", "dim", "ker", "deg",
     "sin", "cos", "tan", "cot", "sec", "csc",
@@ -1318,10 +1262,7 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         # line-grouping. Checking isolation at the line level -- rather than
         # relying on _is_margin_page_number_word's text-pattern + margin-band
         # check alone -- matters when an abstract's last paragraph ends near
-        # the bottom of the page: isotope numbers ("241AmO2"), exponents
-        # ("10-5"), and "M," all match the bare page-number pattern and sit
-        # in that same bottom margin band, but they share their line with
-        # real body text, so they must never be dropped just for that.
+        # the bottom of the page
         pre_lines = group_words_into_lines(page_words)
         dropped_ids = set()
         for ln in pre_lines:
