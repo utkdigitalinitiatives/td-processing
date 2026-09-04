@@ -11,3 +11,13 @@ __pycache__/
 inputs/
 outputs/
 completed_drafts/
+temp folder/
+
+# Local secrets, if a .env is ever added (load_dotenv() looks for one; none
+# is required today, but keep it out if one shows up)
+.env
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
