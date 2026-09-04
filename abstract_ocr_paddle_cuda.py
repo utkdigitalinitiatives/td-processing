@@ -95,8 +95,8 @@ def init_paddle_ocr() -> PaddleOCR:
         # NOTE: current PaddleOCR/PaddleX builds use the 'text_det_*' names below,
         # not the legacy 'det_db_*' names. A generous unclip_ratio matters here:
         # too small and the text detector fails to merge a full line's bounding
-        # box when the line contains a superscript/subscript (e.g. "R2" in "R2
-        # for..."), silently dropping that entire line before OCR even runs on it.
+        # box when the line contains a superscript/subscript silently dropping 
+        # that entire line before OCR even runs on it.
         'text_det_thresh': 0.3,
         'text_det_box_thresh': 0.5,
         'text_det_unclip_ratio': 1.5,
@@ -174,7 +174,9 @@ MATH_MAP = {
 }
 
 # ---- Known scientific notation, matched by exact text rather than OCR geometry ----
-# Problem: OCR often misreads superscripts/subscripts, and we have no visual offset info at the line level to detect them. So we only tag known scientific tokens by exact text match here.
+# Problem: OCR often misreads superscripts/subscripts, and we have no visual
+# offset info at the line level to detect them. So we only tag known scientific
+# tokens by exact text match here.
 CHEMICAL_FORMULA_SUB = {
     "H2O": "H<sub>2</sub>O", "CO2": "CO<sub>2</sub>", "O2": "O<sub>2</sub>", "N2": "N<sub>2</sub>",
     "NH3": "NH<sub>3</sub>", "NH4": "NH<sub>4</sub>", "SO2": "SO<sub>2</sub>", "SO4": "SO<sub>4</sub>",
@@ -222,8 +224,10 @@ _ZERO_O_MID_RE = re.compile(r"(?<=\d)O(?=\d)")
 _EQUALS_ZERO_RE = re.compile(r"=(\s*)O(?!\()\b")
 
 def fix_zero_o_confusion(text: str) -> str:
-    # Fix common OCR confusion between zero and letter O (and l/I) in decimal fractions.
-    # Note: l/I are often misrecognized as 1, but we don't want to blindly replace them in words, so we only fix them in decimal fractions (".l45" -> ".145").
+    # Fix common OCR confusion between zero and letter O (and l/I) in decimal
+    # fractions. Note: l/I are often misrecognized as 1, but we don't want to
+    # blindly replace them in words, so we only fix them in decimal fractions
+    # (".l45" -> ".145").
     if not text:
         return text
     def _norm(m: "re.Match") -> str:
@@ -251,7 +255,9 @@ def fix_scientific_exponent_notation(text: str) -> str:
         return text
     return _SCI_EXPONENT_RE.sub(lambda m: f"×10<sup>{m.group(1)}</sup>", text)
 
-# Common abbreviations that end with a period but are not sentence-ending. We don't want to remove the period from these, but we do want to avoid treating them as sentence boundaries when reconstructing paragraphs.
+# Common abbreviations that end with a period but are not sentence-ending. We
+# don't want to remove the period from these, but we do want to avoid treating
+# them as sentence boundaries when reconstructing paragraphs.
 _ABBREVIATIONS_WITH_PERIOD = {
     "etc", "vs", "dr", "mr", "mrs", "ms", "prof", "fig", "figs", "eq", "eqs",
     "vol", "vols", "al", "cf", "approx", "ca", "no", "nos", "pp", "sp", "spp",
@@ -273,7 +279,9 @@ def fix_stray_period_before_lowercase(text: str) -> str:
 _CASING_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 def _is_notable_mixed_case(token: str) -> bool:
-    # True if the token has at least 2 letters and contains both uppercase and lowercase letters, but is not a simple capitalized word (e.g., "The", "Dna-as-typo").
+    # True if the token has at least 2 letters and contains both uppercase and
+    # lowercase letters, but is not a simple capitalized word (e.g., "The",
+    # "Dna-as-typo").
     letters = [c for c in token if c.isalpha()]
     if len(letters) < 2:
         return False
@@ -281,13 +289,15 @@ def _is_notable_mixed_case(token: str) -> bool:
     has_lower = any(c.islower() for c in letters)
     if not (has_upper and has_lower):
         return False
-    # Reject ordinary capitalized words (The, Dna-as-typo) that are not known mixed-case terms.
+    # Reject ordinary capitalized words (The, Dna-as-typo) that are not known
+    # mixed-case terms.
     if letters[0].isupper() and all(c.islower() for c in letters[1:]):
         return False
     return True
 
 def build_casing_reference(doc, min_occurrences: int = 2, min_dominance: float = 0.7) -> dict:
-    # Build a reference dict of known mixed-case terms (dNMP, mRNA, ATPase) from the document text.
+    # Build a reference dict of known mixed-case terms (dNMP, mRNA, ATPase)
+    # from the document text.
     from collections import Counter
     counts: dict = {}
     for i in range(doc.page_count):
@@ -463,7 +473,9 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
 # ---- Per-page OCR process isolation ----
 # PaddleOCR's CPU inference has been observed to crash with a native access
 # violation (an uncatchable segfault, not a Python exception) intermittently.
-# To avoid losing the entire PDF processing, we isolate each page's OCR in a separate subprocess. If a crash occurs, we can retry once or skip the page without affecting the rest of the document.
+# To avoid losing the entire PDF processing, we isolate each page's OCR in a
+# separate subprocess. If a crash occurs, we can retry once or skip the page
+# without affecting the rest of the document.
 def run_ocr_page_worker(pdf_path: Path, page_index: int, dpi: int, confidence_threshold: float, out_json: Path):
     """Child-process entry point: render one page, OCR it, write results as JSON."""
     with fitz.open(pdf_path) as doc:
@@ -506,7 +518,13 @@ def ocr_page_isolated(pdf_path: Path, page_index: int, dpi: int, confidence_thre
     return []
 
 # ---- Optional VLM review pass (Ollama, opt-in) ----
-# See plan notes for why this is opt-in and not the default. The VLM pass is slower than PaddleOCR, so we only trigger it on pages that are suspiciously sparse (e.g., missing a sentence) or have very low OCR confidence. The VLM prompt is tuned to transcribe old typewritten abstracts with minimal hallucination, but it is still a generative model and can produce errors, so we append its output as a separate HTML block for human review rather than splicing it into the main draft.
+# See plan notes for why this is opt-in and not the default. The VLM pass is
+# slower than PaddleOCR, so we only trigger it on pages that are suspiciously
+# sparse (e.g., missing a sentence) or have very low OCR confidence. The VLM
+# prompt is tuned to transcribe old typewritten abstracts with minimal
+# hallucination, but it is still a generative model and can produce errors, so
+# we append its output as a separate HTML block for human review rather than
+# splicing it into the main draft.
 
 DEFAULT_VLM_MODEL = "qwen2.5vl:3b"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -727,14 +745,17 @@ def _build_vlm_diff_report_html(diff_blocks: List[Tuple[int, str, str]]) -> str:
 
 # ---- Inline diff-merge (--vlm-diff-merge, experimental -- see the
 # "Inline diff-merge" plan) ----
-# Classifies each diff span above and, for spans judged safe, applies the
-# VLM's correction directly into primary instead of only reporting it.
-# Trusted shapes: any pure insertion (a missed detection box, not a misread -- VLM's failure mode is misreading real content, not inventing whole passages);
-# a short trailing OR mid-string addition on text OCR already matched (e.g. a dropped sub/superscript, whether at
-# the end of the span or -- see _common_prefix_len/_common_suffix_len -- sandwiched inside real content;
-# and a Greek letter VLM read that OCR missed entirely (see _is_greek_letter_span). 
-# Everything else -- character-confusion swaps, (the maps' job), substitutions with no shared prefix, equation- placeholder text 
-# (handled separately by _apply_equation_recovery below) -- stays report-only.
+# Classifies each diff span above and, for spans judged safe, applies the VLM's
+# correction directly into primary instead of only reporting it. Trusted
+# shapes: any pure insertion (a missed detection box, not a misread -- VLM's
+# failure mode is misreading real content, not inventing whole passages); a
+# short trailing OR mid-string addition on text OCR already matched (e.g. a
+# dropped sub/superscript, whether at the end of the span or -- see
+# _common_prefix_len/_common_suffix_len -- sandwiched inside real content; and
+# a Greek letter VLM read that OCR missed entirely (see _is_greek_letter_span).
+# Everything else -- character-confusion swaps (the maps' job), substitutions
+# with no shared prefix, equation-placeholder text (handled separately by
+# _apply_equation_recovery below) -- stays report-only.
 _EQUATION_PLACEHOLDER_MARKER = "[EQUATION"
 _MERGE_ANCHOR_WORDS = 4
 _MERGE_MAX_ADDITION_CHARS = 8
@@ -958,7 +979,10 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             if _classify_diff_span(tag, ocr_span, vlm_span) == "merge":
                 vlm_normalized = _normalize_for_primary_text(vlm_span)
                 if tag == "insert":
-                    # Find the last non-insert opcode before this one, and use its last few words as an anchor to locate where to insert the new content. If no prior non-insert opcode exists, skip the merge
+                    # Find the last non-insert opcode before this one, and use
+                    # its last few words as an anchor to locate where to insert
+                    # the new content. If no prior non-insert opcode exists,
+                    # skip the merge.
                     anchor_words = []
                     for j in range(idx - 1, -1, -1):
                         prior_tag, prior_ocr_words, prior_vlm_words = opcodes[j]
@@ -970,9 +994,12 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                             break
                     anchor = _normalize_for_primary_text(" ".join(anchor_words))
                     if anchor:
-                        # If the anchor ends with a period, allow the match to be found with or without the period 
-                        # If the anchor is found multiple times, skip the merge -- we don't want to risk inserting in the wrong place.
-                        # If it's found once, insert the new content immediately after it, restoring a period if it was dropped.
+                        # If the anchor ends with a period, allow the match to
+                        # be found with or without the period. If the anchor is
+                        # found multiple times, skip the merge -- we don't want
+                        # to risk inserting in the wrong place. If it's found
+                        # once, insert the new content immediately after it,
+                        # restoring a period if it was dropped.
                         had_period = anchor.endswith(".")
                         anchor_pattern = re.escape(anchor[:-1]) + r"\.?" if had_period else re.escape(anchor)
                         matches = list(re.finditer(anchor_pattern, primary, re.IGNORECASE))
@@ -980,7 +1007,9 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
                             pos = matches[0].end()
                             # Restore the period if the match landed without one.
                             prefix = "." if had_period and primary[pos - 1:pos] != "." else ""
-                            # If the anchor is at a paragraph break, insert the new content in the next paragraph, otherwise insert it inline.
+                            # If the anchor is at a paragraph break, insert the
+                            # new content in the next paragraph, otherwise
+                            # insert it inline.
                             brk = re.match(r"\s*</p>\s*<p>\s*", primary[pos:])
                             if brk:
                                 primary = primary[:pos] + prefix + " " + vlm_normalized + " " + primary[pos + brk.end():]
@@ -1009,7 +1038,10 @@ def _apply_vlm_diff_merges(draft_text: str, diff_blocks: List[Tuple[int, str, st
             elif (ocr_span != "(nothing)" and vlm_span != "(nothing)"
                     and not re.search(re.escape(_normalize_for_primary_text(ocr_span)), primary, re.IGNORECASE)
                     and re.search(re.escape(_normalize_for_primary_text(vlm_span)), primary, re.IGNORECASE)):
-                # The VLM's span is present in the primary text, but the OCR's span is not. This means that the VLM's correction was applied by some other mechanism (e.g., a previous pass or manual edit), so we mark it as already fixed.
+                # The VLM's span is present in the primary text, but the OCR's
+                # span is not. This means that the VLM's correction was applied
+                # by some other mechanism (e.g., a previous pass or manual
+                # edit), so we mark it as already fixed.
                 label = "[ALREADY FIXED]"
             else:
                 label = "[FLAGGED]"
@@ -1776,7 +1808,8 @@ def _paragraphize_marked_lines(marked_lines: List[List[Tuple[OCRWord, Optional[s
 
         split_here = False
         if current["page"] != nxt["page"]:
-            # New page, so always split. But check if the next line is indented enough to be a new paragraph.
+            # New page, so always split. But check if the next line is indented
+            # enough to be a new paragraph.
             metrics = page_metrics.get(nxt["page"], {"typical_gap": 0.0, "median_height": 1.0, "left_margin": 0.0})
             indent = nxt["x1"] - metrics["left_margin"]
             indent_threshold = max(18.0, metrics["median_height"] * 0.9)
@@ -1937,7 +1970,8 @@ def process_pdf(pdf_path: Path, out_dir: Path, overrides: dict, max_first_pages:
             # vlm_flagged_pages is a list of [page_index, reason] pairs.
             sidecar.write_text(json.dumps({"pdf_path": str(pdf_path), "flagged_pages": vlm_flagged_pages}), encoding="utf-8")
 
-        # Separate sidecar for the --vlm-diff-review pass -- own file, own deferred-phase handler.
+        # Separate sidecar for the --vlm-diff-review pass -- own file, own
+        # deferred-phase handler.
         if vlm_diff_review and vlm_diff_pages:
             diff_sidecar = out_dir / f"{pdf_path.stem} draft.diff_pending.json"
             diff_sidecar.write_text(json.dumps({
@@ -2016,7 +2050,8 @@ def main():
     args = parser.parse_args()
 
     vlm_review_mode = args.vlm_review_mode if args.vlm_review else None
-    # --vlm-diff-merge builds on --vlm-diff-review's data collection -- either flag alone turns it on.
+    # --vlm-diff-merge builds on --vlm-diff-review's data collection -- either
+    # flag alone turns it on.
     vlm_diff_review_enabled = args.vlm_diff_review or args.vlm_diff_merge
 
     in_dir = Path(args.input)
@@ -2168,7 +2203,8 @@ def main():
                         existing = draft_path.read_text(encoding="utf-8") if draft_path.exists() else ""
                         if args.vlm_diff_merge:
                             updated, report = _apply_vlm_diff_merges(existing, diff_blocks) if existing else ("", "")
-                            # Count report lines only -- the header text itself contains "[MERGED]" too.
+                            # Count report lines only -- the header text itself
+                            # contains "[MERGED]" too.
                             merged_count = sum(1 for line in report.splitlines() if line.strip().startswith("[MERGED]"))
                         else:
                             updated, report = existing, _build_vlm_diff_report_html(diff_blocks)
@@ -2183,7 +2219,8 @@ def main():
                         print(f" ⚠ failed: {e}")
                 sidecar.unlink(missing_ok=True)
 
-    # Release the model so it can't poison a later run's PaddleOCR calls (see _unload_vlm_model).
+    # Release the model so it can't poison a later run's PaddleOCR calls (see
+    # _unload_vlm_model).
     if args.vlm_review or vlm_diff_review_enabled:
         _unload_vlm_model(args.vlm_model, args.ollama_url)
 
