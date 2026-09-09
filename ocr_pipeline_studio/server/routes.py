@@ -213,8 +213,13 @@ def _run_job(app, job_id: str) -> None:
                 store.update(job_id, page_total=event.get("total", 0))
 
             elif kind == "page_done":
-                store.update(job_id, page_current=event.get("current", 0),
-                             page_total=event.get("total") or job.page_total)
+                # Only the fields this event actually carries are updated, so
+                # a missing total cannot blank out the one page_total already
+                # established -- and nothing is read off the job unlocked.
+                fields = {"page_current": event.get("current", 0)}
+                if event.get("total"):
+                    fields["page_total"] = event["total"]
+                store.update(job_id, **fields)
 
             elif kind == "vlm_phase":
                 # The VLM phase runs once, after all OCR, across the batch.

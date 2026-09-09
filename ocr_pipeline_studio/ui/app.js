@@ -311,15 +311,23 @@
       // Flag chips come straight from the pipeline's own per-page reasons.
       // Pages the script flagged as low-confidence are shown first, since
       // those are the ones worth looking at before anything else.
-      var kinds = {};
+      var pagesByKind = {};
       (doc.flags || []).forEach(function (flag) {
-        kinds[flag.kind] = (kinds[flag.kind] || 0) + 1;
+        (pagesByKind[flag.kind] = pagesByKind[flag.kind] || []).push(flag);
       });
       ["low_confidence", "equation", "diff"].forEach(function (kind) {
-        if (!kinds[kind]) { return; }
+        var flags = pagesByKind[kind];
+        if (!flags) { return; }
         var chip = document.createElement("span");
         chip.className = "chip " + kind;
-        chip.textContent = kindLabel(kind) + " " + kinds[kind];
+        // The chip names the actual pages, not just a count, so the sidebar
+        // answers "where do I look first?" without a click.
+        var pages = flags.map(function (f) { return f.page; });
+        chip.textContent = kindLabel(kind) + " p" + pages.join(",");
+        // Hovering gives the pipeline's own wording for why each was flagged.
+        chip.title = flags.map(function (f) {
+          return "Page " + f.page + ": " + f.labels.join("; ");
+        }).join("\n");
         chips.appendChild(chip);
       });
       if (state.dirty[doc.name]) {
