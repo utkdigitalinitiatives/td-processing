@@ -221,3 +221,18 @@ own. Open the pipeline log on the Run screen to see what it found.
 
 **Installing takes forever / fails on `paddlepaddle`** -- confirm you are in
 the 3.11 venv: `python --version` should say 3.11.x.
+
+**Every page reports "0 text segments found" and no document appears** --
+something has upgraded the OCR packages past the pinned versions. The newer
+paddlepaddle (3.3.x) fails on every page with an internal
+`ConvertPirAttribute2RuntimeAttribute` error that it reports as *zero text*
+rather than as a crash, so the run looks healthy and quietly produces
+nothing. Reinstall the pinned set:
+
+```powershell
+pip install -r requirements.txt --force-reinstall
+```
+
+The three `paddle*` pins in `requirements.txt` are exact for this reason. The
+comments in that file explain what each one is guarding against. Do not
+loosen them without running a real document through end to end afterwards.
