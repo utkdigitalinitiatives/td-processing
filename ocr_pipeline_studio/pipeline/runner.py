@@ -280,6 +280,21 @@ _RE_PAGE_DONE = re.compile(r"Processing page (\d+) with PaddleOCR")
 _RE_VLM_PHASE = re.compile(r"(VLM review pass|OCR/VLM diff pass)")
 _RE_VLM_DOC = re.compile(r"^\s*(.+\.pdf): (reviewing|diffing) (\d+)")
 
+# The three ways the script gives up on a document without writing a draft.
+# Each has a genuinely different cause, and telling them apart is the
+# difference between a user knowing what to do next and guessing. Mapped to
+# plain-language explanations here rather than in the UI, because the wording
+# depends on knowing what the script actually does.
+_DOCUMENT_PROBLEMS = [
+    (re.compile(r"Skipped - could not find abstract"),
+     "no abstract heading found in the first 15 pages"),
+    (re.compile(r"No text extracted"),
+     "OCR read no text on the abstract pages - the OCR engine may be "
+     "misconfigured, or the scan may be unreadable at this threshold"),
+    (re.compile(r"No paragraph text reconstructed"),
+     "text was read but no paragraphs could be rebuilt from it"),
+]
+
 
 def build_abstract_command(
     input_dir: Path,
@@ -381,6 +396,14 @@ def run_abstract_pass(
                 current = int(m.group(1)) - page_from + 1
                 total = (page_to - page_from + 1) if page_to is not None else None
                 emit(event="page_done", current=current, total=total)
+
+            for pattern, explanation in _DOCUMENT_PROBLEMS:
+                if pattern.search(line):
+                    # Attributed to whichever file the script last announced;
+                    # it processes strictly one document at a time, so that is
+                    # unambiguous.
+                    emit(event="file_problem", reason=explanation)
+                    break
 
             if _RE_VLM_PHASE.search(line):
                 emit(event="vlm_phase", detail=line.strip())

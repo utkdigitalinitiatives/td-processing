@@ -76,6 +76,14 @@ python app.py
 A native window opens. Close the window to quit -- the server shuts down with
 it.
 
+**The first run is slower than the rest.** The first time OCR happens,
+PaddleOCR downloads its detection and recognition models into
+`C:\Users\<you>\.paddlex\` (a few hundred MB). That happens once; afterwards
+it loads them from disk. If the very first document seems stuck on page 1 for
+several minutes, this is why. This is the only time the app reaches past your
+own machine other than to Ollama, and it is PaddleOCR's own setup step, not
+something the app sends anywhere.
+
 Every following session is just two commands:
 
 ```powershell

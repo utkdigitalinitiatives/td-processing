@@ -81,8 +81,12 @@ class Job:
         """The single human-readable line the UI puts under the progress bar."""
         if self.status in FINISHED:
             return self.message
-        if self.page_total:
+        # page_current stays 0 until the first page actually finishes, and
+        # "page 0 of 5" reads like a fault rather than a start.
+        if self.page_total and self.page_current:
             return "%s - page %d of %d" % (self.message, self.page_current, self.page_total)
+        if self.page_total:
+            return "%s - %d pages to read" % (self.message, self.page_total)
         return self.message
 
 

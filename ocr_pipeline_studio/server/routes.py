@@ -166,6 +166,11 @@ def _run_job(app, job_id: str) -> None:
         if job is None:
             return
 
+        # Why a document produced no draft, keyed by filename. Filled in from
+        # the script's own warnings so the queue can state the real reason
+        # instead of guessing at one.
+        problems: dict = {}
+
         def report(**event) -> None:
             """Translate one pipeline event into job state.
 
@@ -221,6 +226,13 @@ def _run_job(app, job_id: str) -> None:
                     fields["page_total"] = event["total"]
                 store.update(job_id, **fields)
 
+            elif kind == "file_problem":
+                # Recorded against the file the script is currently on, so the
+                # queue row can say why this document produced nothing.
+                current = store.get(job_id)
+                if current is not None and current.current_file:
+                    problems[current.current_file] = event.get("reason", "")
+
             elif kind == "vlm_phase":
                 # The VLM phase runs once, after all OCR, across the batch.
                 store.update(job_id, status=jobstate.STATUS_OCR,
@@ -251,17 +263,20 @@ def _run_job(app, job_id: str) -> None:
             # produces no draft, so it never appears in ``documents``. Say so
             # rather than leaving it showing "queued" forever.
             produced = {d["filename"] for d in documents}
-            for name in job.files:
-                if name not in produced:
-                    store.set_file_state(job_id, name, "skipped",
-                                         "no abstract found - see the log")
+            skipped = [name for name in job.files if name not in produced]
+            for name in skipped:
+                store.set_file_state(job_id, name, "skipped",
+                                     problems.get(name, "produced no output - see the log"))
 
             if documents:
                 message = "Finished - %d document(s) ready to review." % len(documents)
             else:
-                message = ("Finished, but no abstracts were extracted. "
-                           "The OCR script could not find an abstract heading "
-                           "in these PDFs - see the log.")
+                # Report the reason the script actually gave. Distinct reasons
+                # are joined so a mixed batch does not hide one behind another.
+                reasons = sorted(set(problems.get(n, "") for n in skipped)) or [""]
+                detail = "; ".join(r for r in reasons if r)
+                message = "Finished, but nothing was extracted"
+                message += (": %s." % detail) if detail else " - see the log."
 
             store.update(job_id,
                          status=jobstate.STATUS_DONE,
