@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OCR Pipeline Studio</title>
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+
+<!-- Banner for Ollama reachability. Hidden until we know the answer, so it
+     never flashes a scary message during the first poll. -->
+<div id="ollama-banner" class="banner" hidden></div>
+
+<header class="topbar">
+  <h1>OCR Pipeline Studio</h1>
+  <nav class="tabs">
+    <button class="tab is-active" data-screen="run">Run</button>
+    <button class="tab" data-screen="review" id="tab-review" disabled>Review</button>
+  </nav>
+</header>
+
+<!-- ==================== RUN SCREEN ==================== -->
+<main id="screen-run" class="screen">
+
+  <section class="panel">
+    <h2>1. Choose a model</h2>
+    <p class="hint">
+      These are the vision models actually pulled on this machine
+      (<code>ollama list</code>). Nothing is downloaded automatically -- if the
+      model you want is missing, pull it yourself first.
+    </p>
+    <div class="controls">
+      <label>
+        <span>Vision model</span>
+        <select id="model-select"></select>
+      </label>
+      <label>
+        <span>VLM pass</span>
+        <select id="mode-select"></select>
+      </label>
+    </div>
+    <p class="hint" id="mode-help"></p>
+  </section>
+
+  <section class="panel">
+    <h2>2. Drop your PDFs</h2>
+    <!-- Plain HTML5 drag/drop -- no library. -->
+    <div id="dropzone" class="dropzone">
+      <div class="dropzone-inner">
+        <strong>Drop PDFs here</strong>
+        <span>or <button type="button" id="browse-btn" class="linkish">browse for files</button></span>
+        <small>Several at a time is fine -- they run as one batch.</small>
+      </div>
+      <input type="file" id="file-input" accept="application/pdf" multiple hidden>
+    </div>
+    <ul id="pending-list" class="file-list"></ul>
+    <div class="actions">
+      <button id="run-btn" class="primary" disabled>Run pipeline</button>
+      <button id="clear-btn" class="ghost" disabled>Clear</button>
+    </div>
+    <p id="run-error" class="error" hidden></p>
+  </section>
+
+  <section class="panel" id="progress-panel" hidden>
+    <h2>Progress</h2>
+    <div class="progress-head">
+      <span id="progress-label">Starting...</span>
+      <span id="progress-count" class="muted"></span>
+    </div>
+    <div class="progressbar"><div id="progress-fill"></div></div>
+
+    <!-- Batch queue: one row per file, with its own state. -->
+    <ul id="queue-list" class="file-list queue"></ul>
+
+    <details class="log-details">
+      <summary>Pipeline log</summary>
+      <pre id="log-output" class="log"></pre>
+    </details>
+  </section>
+</main>
+
+<!-- ==================== REVIEW SCREEN ==================== -->
+<main id="screen-review" class="screen" hidden>
+  <div class="review-layout">
+
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>Documents</h2>
+        <span id="doc-count" class="muted"></span>
+      </div>
+      <ul id="doc-list" class="doc-list"></ul>
+      <div class="sidebar-actions">
+        <button id="save-btn" class="ghost">Save edits</button>
+        <button id="export-btn" class="primary">Export</button>
+      </div>
+      <p id="save-status" class="muted small"></p>
+    </aside>
+
+    <section class="workspace">
+      <div class="workspace-head">
+        <div>
+          <h2 id="doc-title">-</h2>
+          <p id="doc-meta" class="muted small"></p>
+        </div>
+        <div class="view-toggle">
+          <button class="tab is-active" data-view="edit">Edit</button>
+          <button class="tab" data-view="diff" id="tab-diff">OCR vs VLM</button>
+          <button class="tab" data-view="recovery" id="tab-recovery">VLM recovery</button>
+        </div>
+      </div>
+
+      <!-- Edit view: raw text on the left, live preview on the right. -->
+      <div id="view-edit" class="view split">
+        <div class="pane">
+          <div class="pane-head">Source <span class="muted small">(HTML from the pipeline)</span></div>
+          <textarea id="editor" spellcheck="false"></textarea>
+        </div>
+        <div class="pane">
+          <div class="pane-head">Preview</div>
+          <div id="preview" class="preview"></div>
+        </div>
+      </div>
+
+      <!-- Diff view: what the VLM read differently from PaddleOCR. -->
+      <div id="view-diff" class="view" hidden>
+        <p class="hint" id="diff-intro"></p>
+        <div id="diff-body"></div>
+      </div>
+
+      <!-- Recovery view: the VLM's own re-read of flagged pages. -->
+      <div id="view-recovery" class="view" hidden>
+        <p class="hint" id="recovery-intro"></p>
+        <div id="recovery-body"></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- Vendored locally on purpose: this app must work with no internet. -->
+<script src="/ui/vendor/markdown-it.min.js"></script>
+<script src="/ui/app.js"></script>
+</body>
+</html>

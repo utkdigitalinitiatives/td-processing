@@ -1,0 +1,22 @@
+# ocr-pipeline-studio dependencies.
+#
+# Install into a Python 3.11 venv ONLY:  py -3.11 -m venv .venv
+# The paddlepaddle/paddleocr family below does not ship wheels for 3.12/3.13,
+# which is why this project pins itself to 3.11.
+
+# --- Desktop app shell ---
+Flask>=3.0,<4.0            # local-only web server (bound to 127.0.0.1)
+pywebview>=5.0,<6.0        # native OS window that points at that local server
+
+# --- Used directly by source_scripts/dedupe.py ---
+PyMuPDF>=1.24              # the "fitz" module: PDF page rendering + page copying
+rapidfuzz>=3.0             # fuzzy text ratio used for duplicate-page detection
+
+# --- Used directly by source_scripts/abstract_ocr_paddle_cuda.py ---
+paddleocr>=2.7             # the OCR engine itself
+paddlepaddle>=2.6          # paddleocr's inference backend (CPU build)
+numpy>=1.24,<2.0           # paddle is built against the 1.x ABI; 2.x can break it
+Pillow>=10.0               # decodes the rendered page images before OCR
+tqdm>=4.66                 # imported at module scope by the OCR script
+python-dotenv>=1.0         # the OCR script calls load_dotenv() on import
+requests>=2.31             # how the OCR script talks to Ollama's REST API
