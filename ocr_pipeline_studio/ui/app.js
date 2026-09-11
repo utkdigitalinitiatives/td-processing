@@ -26,7 +26,8 @@
     documents: [],      // summaries from /status
     current: null,      // full payload for the open document
     dirty: {},          // name -> true when edited but unsaved
-    editTimer: null
+    editTimer: null,
+    lastSkip: null      // a single-span click that could not be carried out
   };
 
   // ---------- tiny DOM helpers ----------
@@ -490,6 +491,19 @@
     }
     row.appendChild(labelCell);
 
+    // If the last click on this exact row could not be carried out, say so
+    // on the row itself. The summary line lives at the top of a long list,
+    // so on its own it is easy to miss and the click looks like it did
+    // nothing at all.
+    var skip = state.lastSkip;
+    if (skip && skip.page === pageNo && skip.index === index) {
+      row.classList.add("did-nothing");
+      var why = document.createElement("div");
+      why.className = "row-note";
+      why.textContent = "Not changed - " + describeSkips([skip]) + ".";
+      row.appendChild(why);
+    }
+
     // Each side is a button. Clicking it puts that reading into the document,
     // so "merge this one" and "put it back" are the same single gesture.
     row.appendChild(buildSideButton(pageNo, index, span, "ocr"));
@@ -524,6 +538,12 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request)
     }).then(function (result) {
+      // Remember a single-span click that achieved nothing, so the row can
+      // say why rather than appearing inert.
+      state.lastSkip = (!request.all && result.skipped.length)
+        ? result.skipped[0]
+        : null;
+
       // The server returns the whole document, so the editor and preview stay
       // in step with what the diff view just did.
       state.current.text = result.text;

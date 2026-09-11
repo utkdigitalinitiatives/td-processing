@@ -207,6 +207,13 @@ textarea#editor {
 .diff-row .side.ocr.is-current { color: #8a2b22; }
 .diff-row .side.vlm.is-current { color: var(--ok); }
 
+/* A click on this row could not be carried out -- say so on the row, since
+   the summary line at the top of a long list is easy to miss. */
+.diff-row.did-nothing { background: #fffaf0; }
+.diff-row .row-note {
+  grid-column: 2 / -1; font-size: 11.5px; color: var(--warn); padding-top: 2px;
+}
+
 /* A span neither side of which can be located in the document. */
 .unclear-mark {
   display: inline-block; margin-top: 2px; font-size: 10px; cursor: help;

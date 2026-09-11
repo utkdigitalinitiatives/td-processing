@@ -558,47 +558,245 @@ def _get_normalizer():
     return _normalizer
 
 
-def span_state(text: str, ocr_span: str, vlm_span: str) -> str:
+# How much text either side of a span we remember in order to recognise it
+# again. Enough to be distinctive in an abstract; short enough that an edit
+# nearby does not invalidate it.
+_CONTEXT_CHARS = 24
+
+# How many characters of surrounding text have to agree before we will accept
+# a candidate as this span's own. A handful of characters can line up by pure
+# chance -- a space, a closing tag -- so a winner below this is treated as no
+# winner at all.
+_MIN_CONTEXT_MATCH = 6
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    """How many characters ``a`` and ``b`` share from the start."""
+    limit = min(len(a), len(b))
+    n = 0
+    while n < limit and a[n] == b[n]:
+        n += 1
+    return n
+
+
+def _common_suffix_len(a: str, b: str) -> int:
+    """How many characters ``a`` and ``b`` share from the end."""
+    limit = min(len(a), len(b))
+    n = 0
+    while n < limit and a[len(a) - 1 - n] == b[len(b) - 1 - n]:
+        n += 1
+    return n
+
+
+def _offsets_of(text: str, needle: str) -> list:
+    """Every position at which ``needle`` occurs in ``text``."""
+    positions = []
+    at = text.find(needle)
+    while at != -1:
+        positions.append(at)
+        at = text.find(needle, at + 1)
+    return positions
+
+
+def make_hint(text: str, offset: int, length: int) -> dict:
+    """Record where a span sits, and what sits either side of it.
+
+    Position alone is not enough to find a span again: any edit earlier in the
+    document shifts it. The surrounding words move with the span, so they
+    identify it even after the text around it has changed.
+    """
+    return {
+        "offset": offset,
+        "before": text[max(0, offset - _CONTEXT_CHARS):offset],
+        "after": text[offset + length:offset + length + _CONTEXT_CHARS],
+    }
+
+
+def _resolve_offset(text: str, needle: str, hint):
+    """Find *this span's own* copy of ``needle``, not just any copy.
+
+    This is what makes a swap reversible. Applying a correction can itself
+    make the words non-unique -- changing "PAo" to "PAO" in a document that
+    already says "PAO" somewhere else -- and from then on a plain text search
+    cannot tell which occurrence belongs to this diff. The remembered position
+    and surrounding words can.
+
+    Returns ``(offset, status)`` with status "ok", "not_found" or "ambiguous".
+    """
+    positions = _offsets_of(text, needle)
+    if not positions:
+        return -1, "not_found"
+    if len(positions) == 1:
+        return positions[0], "ok"
+
+    if not hint:
+        return -1, "ambiguous"
+
+    # Still exactly where we left it.
+    offset = hint.get("offset")
+    if offset in positions:
+        return offset, "ok"
+
+    # Moved, because of an edit earlier in the document. The words either side
+    # of the span moved with it, so they still identify it -- but only
+    # partially: an insertion just before the span truncates what is left of
+    # the remembered text on that side. So each candidate is scored by how
+    # much of its surroundings still agree, rather than demanding an exact
+    # match on both sides.
+    before = hint.get("before", "")
+    after = hint.get("after", "")
+    scored = sorted(
+        (
+            _common_suffix_len(text[:p], before)
+            + _common_prefix_len(text[p + len(needle):], after),
+            p,
+        )
+        for p in positions
+    )
+    best_score, best_position = scored[-1]
+    runner_up = scored[-2][0]
+
+    # A clear winner, with enough agreement to be more than coincidence.
+    if best_score >= _MIN_CONTEXT_MATCH and best_score > runner_up:
+        return best_position, "ok"
+
+    return -1, "ambiguous"
+
+
+def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
     """Which side of this diff the document currently reflects.
 
-    Derived from the text itself rather than remembered in a flag, so it stays
-    correct even after the user edits the textarea by hand. Returns "ocr",
-    "vlm", or "unclear" when both or neither side can be found.
+    Worked out from the text itself rather than stored as a flag, so it stays
+    right even after the user edits the textarea by hand. ``hint`` is the
+    span's last known position, which settles cases the text alone cannot --
+    notably when one reading contains the other ("Her" inside
+    "Her<sup>-</sup>"), where both would otherwise appear present.
+
+    Returns "ocr", "vlm", or "unclear" when neither reading can be located.
     """
     normalize = _get_normalizer()
 
-    # A one-sided span: the model either added text or dropped it. Presence of
-    # the side that does have text is what settles the question.
+    # With a record of where this span sits, answer by looking at that spot
+    # specifically. Note that "the other reading exists somewhere in the
+    # document" is NOT the question -- the same words often appear elsewhere,
+    # and treating that as an answer is what used to make a span look already
+    # applied when it was not. So every occurrence of both readings is scored
+    # on how well its surroundings match what we remember, and the best-placed
+    # one wins.
+    if hint:
+        before = hint.get("before", "")
+        after = hint.get("after", "")
+        best = None  # (context score, length of match, side)
+
+        for side, raw in (("ocr", ocr_span), ("vlm", vlm_span)):
+            if raw == NOTHING_SPAN:
+                continue
+            needle = normalize(raw)
+            for position in _offsets_of(text, needle):
+                score = (
+                    _common_suffix_len(text[:position], before)
+                    + _common_prefix_len(text[position + len(needle):], after)
+                )
+                # Length breaks a tie so that a reading which contains the
+                # other ("Her" inside "Her<sup>-</sup>") is not mistaken for it.
+                candidate = (score, len(needle), side)
+                if best is None or candidate > best:
+                    best = candidate
+
+        if best is not None and best[0] >= _MIN_CONTEXT_MATCH:
+            return best[2]
+
+        # Neither reading sits where this span belongs. For a one-sided span
+        # that is exactly what "the empty side was applied" looks like.
+        if vlm_span == NOTHING_SPAN:
+            return "vlm"
+        if ocr_span == NOTHING_SPAN:
+            return "ocr"
+
+    # No usable position -- fall back to plain presence.
     if vlm_span == NOTHING_SPAN:
         return "ocr" if normalize(ocr_span) in text else "vlm"
     if ocr_span == NOTHING_SPAN:
         return "vlm" if normalize(vlm_span) in text else "ocr"
 
-    ocr_present = normalize(ocr_span) in text
-    vlm_present = normalize(vlm_span) in text
+    ocr_needle = normalize(ocr_span)
+    vlm_needle = normalize(vlm_span)
+    ocr_present = ocr_needle in text
+    vlm_present = vlm_needle in text
     if vlm_present and not ocr_present:
         return "vlm"
     if ocr_present and not vlm_present:
         return "ocr"
+    if ocr_present and vlm_present:
+        # One reading contains the other, so both "match". The longer one is
+        # the specific one, and therefore what the document actually shows.
+        if vlm_needle != ocr_needle:
+            return "vlm" if len(vlm_needle) > len(ocr_needle) else "ocr"
     return "unclear"
 
 
-def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str):
+def _restore_point(text: str, hint):
+    """Where text that was deleted should go back.
+
+    The span left no words behind to search for, so the only record of where
+    it belonged is what sat either side of it. Those neighbours are looked up
+    first, which keeps the restore correct even if the document has shifted
+    since; the remembered position is the fallback.
+    """
+    if not hint:
+        return None
+
+    before = hint.get("before", "")
+    after = hint.get("after", "")
+
+    # The gap is wherever the two remembered sides now meet. Scored the same
+    # way as _resolve_offset, so a partial match still counts: an edit
+    # elsewhere may have eaten into one side of the remembered context.
+    if before and after:
+        joins = _offsets_of(text, before + after)
+        if len(joins) == 1:
+            return joins[0] + len(before)
+
+        tail = before[-8:]
+        candidates = _offsets_of(text, tail)
+        if candidates:
+            scored = sorted(
+                (_common_prefix_len(text[p + len(tail):], after), p)
+                for p in candidates
+            )
+            best_score, best_position = scored[-1]
+            runner_up = scored[-2][0] if len(scored) > 1 else -1
+            if best_score >= _MIN_CONTEXT_MATCH and best_score > runner_up:
+                return best_position + len(tail)
+
+    offset = hint.get("offset")
+    if offset is not None and 0 <= offset <= len(text):
+        return offset
+    return None
+
+
+def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=None):
     """Rewrite one diff span in ``text`` to the chosen side.
 
     ``direction`` is "vlm" to take the model's reading or "ocr" to put the
-    OCR's reading back. Returns ``(new_text, status)`` where status is:
+    OCR's reading back. ``hint`` is the record of where this span was last
+    written, which is what makes the swap reliably reversible -- see
+    _resolve_offset().
+
+    Returns ``(new_text, status, hint)``. The returned hint describes where
+    the span's text now sits and should be passed back in next time; on a
+    refusal the incoming hint is handed back unchanged. Status is one of:
 
       "applied"     -- the swap was made
       "unchanged"   -- that side is already what the document says
       "not_found"   -- the text to replace is not in the document
-      "ambiguous"   -- it appears more than once, so replacing would be a guess
-      "unplaceable" -- the side to remove is "(nothing)", i.e. this is a pure
-                       insertion with no anchor text to find
+      "ambiguous"   -- it occurs in several places and we have no record of
+                       which one is this span's, so replacing would be a guess
+      "unplaceable" -- there is nothing to match against and no remembered
+                       position, so there is nowhere to put the text
 
-    The uniqueness requirement is the same rule the script applies to its own
-    merges. Refusing an ambiguous match is the entire safety property here:
-    replacing the wrong occurrence would corrupt the document somewhere the
+    Refusing an ambiguous match is the safety property that matters here:
+    rewriting the wrong occurrence would corrupt the document somewhere the
     user is not looking.
     """
     normalize = _get_normalizer()
@@ -608,39 +806,86 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str):
     else:
         find_raw, put_raw = vlm_span, ocr_span
 
-    if find_raw == NOTHING_SPAN:
-        # Nothing to search for. The script auto-merges pure insertions using
-        # neighbouring words as an anchor; reproducing that here would mean
-        # reimplementing its anchor logic, so this is reported honestly
-        # instead of guessed at.
-        return text, "unplaceable"
-
-    needle = normalize(find_raw)
     replacement = "" if put_raw == NOTHING_SPAN else normalize(put_raw)
 
-    occurrences = text.count(needle)
-    if occurrences == 0:
-        # Already the other way round is the common, harmless case.
-        other = "" if put_raw == NOTHING_SPAN else normalize(put_raw)
-        if other and other in text:
-            return text, "unchanged"
-        return text, "not_found"
-    if occurrences > 1:
-        return text, "ambiguous"
+    # Restoring something that was deleted: there is no text to search for,
+    # but if we remember where it was taken from we can put it back exactly
+    # there. Without that record there is no honest place to insert it.
+    if find_raw == NOTHING_SPAN:
+        gap = _restore_point(text, hint)
+        if gap is None or not replacement:
+            return text, "unplaceable", None
 
-    new_text = text.replace(needle, replacement, 1)
+        # If the gap sits squarely between two tags, this span was a whole
+        # paragraph of its own -- a heading, typically -- and its <p> wrapper
+        # went with it when it was deleted. Put the wrapper back too, or the
+        # restored words would end up loose between paragraphs.
+        before_char = text[gap - 1] if gap > 0 else ""
+        after_char = text[gap] if gap < len(text) else ""
+        if before_char in ("", ">") and after_char in ("", "<"):
+            insertion = "<p>" + replacement + "</p>"
+            words_at = gap + len("<p>")
+        else:
+            # Deleting the span also closed up the whitespace around it, so
+            # restoring has to reopen it -- otherwise the words fuse onto
+            # their neighbours ("noisemore").
+            lead = "" if before_char in ("", " ", ">") else " "
+            trail = "" if (after_char in ("", " ", "<") or after_char in ".,;:") else " "
+            insertion = lead + replacement + trail
+            words_at = gap + len(lead)
+
+        new_text = text[:gap] + insertion + text[gap:]
+        return new_text, "applied", make_hint(new_text, words_at, len(replacement))
+
+    needle = normalize(find_raw)
+    offset, status = _resolve_offset(text, needle, hint)
+
+    if status == "not_found":
+        # Already showing the other side is the common, harmless case.
+        if replacement and replacement in text:
+            return text, "unchanged", hint
+        return text, "not_found", hint
+    if status == "ambiguous":
+        return text, "ambiguous", hint
+
+    new_text = text[:offset] + replacement + text[offset + len(needle):]
 
     # Deleting a span leaves debris behind: a doubled space where the words
     # were, a space stranded before punctuation, and -- when the span was a
     # whole paragraph, such as a heading the model was told to omit -- an
     # empty <p></p>. Paragraph text in these drafts is single-spaced, so these
     # cleanups are safe and keep the result looking like the rest of the file.
+    #
+    # The tidy-up works outwards from the gap the deletion left, so the
+    # position handed back still points at the span instead of drifting by
+    # however much whitespace got collapsed.
     if not replacement:
-        new_text = re.sub(r"  +", " ", new_text)
-        new_text = re.sub(r"\s+([.,;:])", r"\1", new_text)
-        new_text = re.sub(r"<p>\s*</p>", "", new_text)
+        prefix = re.sub(r"[ \t]+$", "", new_text[:offset])
+        suffix = re.sub(r"^[ \t]+", "", new_text[offset:])
 
-    return new_text, "applied"
+        # Put a single space back only where real words now sit on both
+        # sides; not against a tag boundary, and not before punctuation.
+        needs_space = bool(
+            prefix and suffix
+            and not prefix.endswith(">")
+            and not suffix.startswith("<")
+            and suffix[0] not in ".,;:"
+        )
+        joiner = " " if needs_space else ""
+        new_text = prefix + joiner + suffix
+        offset = len(prefix) + len(joiner)
+
+        # If the span was a whole paragraph -- a heading the model was told to
+        # omit -- the now-empty <p></p> goes too. Searched in a tight window
+        # around the edit so an empty paragraph elsewhere in the document is
+        # never mistaken for this one.
+        emptied = re.compile(r"<p>\s*</p>").search(
+            new_text, max(0, offset - 8), min(len(new_text), offset + 8))
+        if emptied and emptied.start() <= offset <= emptied.end():
+            new_text = new_text[:emptied.start()] + new_text[emptied.end():]
+            offset = emptied.start()
+
+    return new_text, "applied", make_hint(new_text, offset, len(replacement))
 
 
 def collect_outputs(

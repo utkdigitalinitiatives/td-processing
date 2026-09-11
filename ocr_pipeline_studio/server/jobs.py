@@ -71,6 +71,13 @@ class Job:
     documents: list = field(default_factory=list)      # finished output records
     edits: dict = field(default_factory=dict)          # in-memory textarea state
 
+    # Where each diff span was last written, as
+    # ``{document name: {"<page>:<index>": offset}}``. This is what lets the
+    # review screen swap a span back and forth reliably: once a correction has
+    # been applied the same words can occur in two places, and only a
+    # remembered position can say which one belongs to that diff.
+    span_offsets: dict = field(default_factory=dict)
+
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     # Bounded so a very long batch cannot grow the log without limit. 400 lines

@@ -338,19 +338,29 @@ def _find_document(job, name: str):
     return None
 
 
-def _diffs_with_state(diffs: list, text: str) -> list:
+def _span_key(page_no, index) -> str:
+    """Identity of one diff span within a document."""
+    return "%s:%s" % (page_no, index)
+
+
+def _diffs_with_state(diffs: list, text: str, offsets: dict) -> list:
     """Copy the diff blocks, tagging each span with which side the document
     currently shows.
 
     Worked out from the live text on every request rather than stored, so the
     buttons stay honest even after the user has edited the textarea by hand or
-    applied a span and changed their mind.
+    applied a span and changed their mind. ``offsets`` supplies each span's
+    last known position, which resolves the cases the text alone cannot.
     """
     annotated = []
     for page in diffs:
         spans = []
-        for span in page["spans"]:
-            spans.append(dict(span, state=runner.span_state(text, span["ocr"], span["vlm"])))
+        for index, span in enumerate(page["spans"]):
+            hint = offsets.get(_span_key(page["page"], index))
+            spans.append(dict(
+                span,
+                state=runner.span_state(text, span["ocr"], span["vlm"], hint),
+            ))
         annotated.append({"page": page["page"], "spans": spans})
     return annotated
 
@@ -383,7 +393,8 @@ def document(job_id: str, name: str):
         "saved_text": on_disk,
         "dirty": name in job.edits and job.edits[name] != on_disk,
         "flags": doc["flags"],
-        "diffs": _diffs_with_state(doc["diffs"], current),
+        "diffs": _diffs_with_state(doc["diffs"], current,
+                                   job.span_offsets.get(name, {})),
         "recovery": doc["recovery"],
         "page_count": doc["page_count"],
         "duplicates_removed": doc["duplicates_removed"],
@@ -463,18 +474,32 @@ def apply_spans(job_id: str, name: str):
         if not targets:
             return jsonify({"error": "No such diff span."}), 404
 
+    offsets = job.span_offsets.setdefault(name, {})
+
     counts = {"applied": 0, "unchanged": 0, "not_found": 0,
               "ambiguous": 0, "unplaceable": 0}
     skipped = []
     for page_no, index, span in targets:
+        key = _span_key(page_no, index)
+        hint = offsets.get(key)
+
         # Skip spans already showing the requested side, so a bulk apply does
         # not report them as failures.
-        if runner.span_state(text, span["ocr"], span["vlm"]) == direction:
+        if runner.span_state(text, span["ocr"], span["vlm"], hint) == direction:
             counts["unchanged"] += 1
             continue
-        text, status = runner.apply_span(text, span["ocr"], span["vlm"], direction)
+
+        text, status, new_hint = runner.apply_span(
+            text, span["ocr"], span["vlm"], direction, hint)
         counts[status] += 1
-        if status not in ("applied", "unchanged"):
+
+        if status == "applied":
+            # Remember where this span now sits. Positions of the other spans
+            # are deliberately left alone: each record carries the words
+            # either side of its span, so it can still be found after an edit
+            # elsewhere moves it, with no bookkeeping to get wrong.
+            offsets[key] = new_hint
+        else:
             skipped.append({"page": page_no, "index": index, "status": status,
                             "ocr": span["ocr"], "vlm": span["vlm"]})
 
@@ -485,7 +510,7 @@ def apply_spans(job_id: str, name: str):
         "text": text,
         "counts": counts,
         "skipped": skipped,
-        "diffs": _diffs_with_state(doc["diffs"], text),
+        "diffs": _diffs_with_state(doc["diffs"], text, offsets),
     })
 
 
