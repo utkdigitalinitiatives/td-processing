@@ -630,12 +630,15 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str):
 
     new_text = text.replace(needle, replacement, 1)
 
-    # Deleting a span can leave a doubled space behind. Paragraph text in
-    # these drafts is single-spaced, so collapsing runs is safe and keeps the
-    # result looking like the rest of the document.
+    # Deleting a span leaves debris behind: a doubled space where the words
+    # were, a space stranded before punctuation, and -- when the span was a
+    # whole paragraph, such as a heading the model was told to omit -- an
+    # empty <p></p>. Paragraph text in these drafts is single-spaced, so these
+    # cleanups are safe and keep the result looking like the rest of the file.
     if not replacement:
         new_text = re.sub(r"  +", " ", new_text)
         new_text = re.sub(r"\s+([.,;:])", r"\1", new_text)
+        new_text = re.sub(r"<p>\s*</p>", "", new_text)
 
     return new_text, "applied"
 

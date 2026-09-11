@@ -207,6 +207,14 @@ textarea#editor {
 .diff-row .side.ocr.is-current { color: #8a2b22; }
 .diff-row .side.vlm.is-current { color: var(--ok); }
 
+/* A span neither side of which can be located in the document. */
+.unclear-mark {
+  display: inline-block; margin-top: 2px; font-size: 10px; cursor: help;
+  padding: 0 5px; border-radius: 999px;
+  background: #f1f3f6; color: var(--muted); border: 1px dotted #c2cad4;
+}
+.diff-row.state-unclear .side { opacity: .72; }
+
 .bulk-actions {
   display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
   margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line);

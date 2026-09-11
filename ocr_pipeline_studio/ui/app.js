@@ -474,6 +474,20 @@
     var labelCell = document.createElement("div");
     labelCell.className = "label";
     labelCell.textContent = span.label || "diff";
+
+    // "unclear" means neither side was found verbatim in the document -- the
+    // script's own text fixups rewrote this passage after the diff was taken
+    // (rejoining a hyphenated line break, say). Saying so up front is better
+    // than letting the user click a button that can only report failure.
+    if (span.state === "unclear") {
+      var mark = document.createElement("span");
+      mark.className = "unclear-mark";
+      mark.textContent = "manual";
+      mark.title = "Neither reading appears verbatim in the document, so this "
+        + "one cannot be applied automatically. Edit it on the Edit tab.";
+      labelCell.appendChild(document.createElement("br"));
+      labelCell.appendChild(mark);
+    }
     row.appendChild(labelCell);
 
     // Each side is a button. Clicking it puts that reading into the document,
