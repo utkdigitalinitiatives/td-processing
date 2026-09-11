@@ -106,8 +106,8 @@ python app.py
    | OCR only | PaddleOCR alone. Fastest, never contacts Ollama. |
    | Recovery on suspicious pages | Re-reads only pages whose OCR looks unusually sparse. |
    | Recovery on every page | Re-reads every abstract page. |
-   | **OCR/VLM diff report** | Default. Runs the model on every page and reports what it read differently, without touching the draft. |
-   | Diff + auto-merge | Same, but applies the corrections it judges safe. Experimental. |
+   | OCR/VLM diff report | Runs the model on every page and reports what it read differently, without touching the draft. |
+   | **Diff + auto-merge safe fixes** | Default. Same comparison, but the corrections the script judges safe are applied to the draft for you. The rest are listed on the **OCR vs VLM** tab, one click each. |
 
 3. Drop your PDFs and press **Run pipeline**.
 
@@ -127,6 +127,29 @@ The main pane has the raw text on the left and a live preview on the right.
 Type in the left, the right updates as you go. Two more tabs sit above it:
 **OCR vs VLM** shows the differences side by side, and **VLM recovery** shows
 the model's own transcription of flagged pages.
+
+### Applying differences in one click
+
+On the **OCR vs VLM** tab each difference is shown as two buttons: what the
+OCR read on the left, what the vision model read on the right. Whichever one
+the document currently says is outlined and not clickable. **Click the other
+side and it goes straight into the document** -- you never have to find the
+text in the editor yourself. Clicking back reverts it.
+
+**Apply all remaining VLM fixes** does that for every difference still on the
+OCR side at once, and **Revert all to OCR** undoes the lot. Both report what
+they did underneath.
+
+Some differences cannot be applied automatically, and the app says so rather
+than pretending otherwise:
+
+- *text appears more than once* -- the same words occur elsewhere in the
+  abstract, so replacing one would be a guess about which. Edit it by hand.
+- *nothing to match against* -- the model added words the OCR missed
+  entirely, so there is no existing text to swap out.
+
+Nothing here touches the files on disk. Applying, reverting and typing all
+stay in memory until you press **Save edits** or **Export**.
 
 Edits live in memory until you press something. **Save edits** writes them
 back to the `.md` files in `workdir/`; **Export** downloads them (one document

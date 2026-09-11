@@ -77,19 +77,19 @@ VLM_MODES: dict[str, dict] = {
         "help": "Re-reads every abstract page and appends the result for review.",
     },
     "diff": {
-        "label": "OCR/VLM diff report (recommended)",
+        "label": "OCR/VLM diff report (report only)",
         "flags": ["--vlm-diff-review"],
         "help": "Runs the VLM on every page and reports what it read differently. "
                 "Never edits the draft text.",
     },
     "merge": {
-        "label": "OCR/VLM diff + auto-merge safe fixes",
+        "label": "OCR/VLM diff + auto-merge safe fixes (recommended)",
         "flags": ["--vlm-diff-merge"],
-        "help": "Experimental. Like the diff report, but applies the corrections "
-                "it judges safe directly into the draft.",
+        "help": "Applies the corrections the script judges safe straight into the "
+                "draft, and reports the rest so you can apply them in one click.",
     },
 }
-DEFAULT_VLM_MODE = "diff"
+DEFAULT_VLM_MODE = "merge"
 
 
 # --------------------------------------------------------------------------
@@ -520,6 +520,124 @@ def parse_draft(draft_text: str) -> dict:
         "diffs": diffs,
         "flags": [flags[p] for p in sorted(flags)],
     }
+
+
+# --------------------------------------------------------------------------
+# Applying a single diff span to the draft text
+# --------------------------------------------------------------------------
+# The review screen lets the user apply any span the script left FLAGGED with
+# one click, instead of hunting for the text in the editor.
+#
+# The hard part is that a diff span is *raw* text (straight from OCR or from
+# the model) while the draft has already been through the script's fixup
+# chain -- a span reading "ε = 0.05" appears in the draft as "&epsilon; = 0.05".
+# A plain find-and-replace would therefore silently fail on exactly the spans
+# most likely to still be flagged. So we reuse the script's own
+# _normalize_for_primary_text(), which is the function it uses for this same
+# purpose in _apply_vlm_diff_merges(). Reusing it means the UI can never drift
+# out of step with how the script itself locates text.
+
+# The literal the script prints for "this side of the diff has no text".
+NOTHING_SPAN = "(nothing)"
+
+_normalizer = None
+
+
+def _get_normalizer():
+    """Import the original script's text normalizer, once, on first use.
+
+    Deferred rather than imported at module scope because importing
+    vlm_abstract.py pulls in PaddleOCR, which costs about nine seconds. The
+    server warms this in a background thread at startup (see server/__init__)
+    so the first click does not pay that cost.
+    """
+    global _normalizer
+    if _normalizer is None:
+        from pipeline.vlm_abstract import _normalize_for_primary_text
+        _normalizer = _normalize_for_primary_text
+    return _normalizer
+
+
+def span_state(text: str, ocr_span: str, vlm_span: str) -> str:
+    """Which side of this diff the document currently reflects.
+
+    Derived from the text itself rather than remembered in a flag, so it stays
+    correct even after the user edits the textarea by hand. Returns "ocr",
+    "vlm", or "unclear" when both or neither side can be found.
+    """
+    normalize = _get_normalizer()
+
+    # A one-sided span: the model either added text or dropped it. Presence of
+    # the side that does have text is what settles the question.
+    if vlm_span == NOTHING_SPAN:
+        return "ocr" if normalize(ocr_span) in text else "vlm"
+    if ocr_span == NOTHING_SPAN:
+        return "vlm" if normalize(vlm_span) in text else "ocr"
+
+    ocr_present = normalize(ocr_span) in text
+    vlm_present = normalize(vlm_span) in text
+    if vlm_present and not ocr_present:
+        return "vlm"
+    if ocr_present and not vlm_present:
+        return "ocr"
+    return "unclear"
+
+
+def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str):
+    """Rewrite one diff span in ``text`` to the chosen side.
+
+    ``direction`` is "vlm" to take the model's reading or "ocr" to put the
+    OCR's reading back. Returns ``(new_text, status)`` where status is:
+
+      "applied"     -- the swap was made
+      "unchanged"   -- that side is already what the document says
+      "not_found"   -- the text to replace is not in the document
+      "ambiguous"   -- it appears more than once, so replacing would be a guess
+      "unplaceable" -- the side to remove is "(nothing)", i.e. this is a pure
+                       insertion with no anchor text to find
+
+    The uniqueness requirement is the same rule the script applies to its own
+    merges. Refusing an ambiguous match is the entire safety property here:
+    replacing the wrong occurrence would corrupt the document somewhere the
+    user is not looking.
+    """
+    normalize = _get_normalizer()
+
+    if direction == "vlm":
+        find_raw, put_raw = ocr_span, vlm_span
+    else:
+        find_raw, put_raw = vlm_span, ocr_span
+
+    if find_raw == NOTHING_SPAN:
+        # Nothing to search for. The script auto-merges pure insertions using
+        # neighbouring words as an anchor; reproducing that here would mean
+        # reimplementing its anchor logic, so this is reported honestly
+        # instead of guessed at.
+        return text, "unplaceable"
+
+    needle = normalize(find_raw)
+    replacement = "" if put_raw == NOTHING_SPAN else normalize(put_raw)
+
+    occurrences = text.count(needle)
+    if occurrences == 0:
+        # Already the other way round is the common, harmless case.
+        other = "" if put_raw == NOTHING_SPAN else normalize(put_raw)
+        if other and other in text:
+            return text, "unchanged"
+        return text, "not_found"
+    if occurrences > 1:
+        return text, "ambiguous"
+
+    new_text = text.replace(needle, replacement, 1)
+
+    # Deleting a span can leave a doubled space behind. Paragraph text in
+    # these drafts is single-spaced, so collapsing runs is safe and keeps the
+    # result looking like the rest of the document.
+    if not replacement:
+        new_text = re.sub(r"  +", " ", new_text)
+        new_text = re.sub(r"\s+([.,;:])", r"\1", new_text)
+
+    return new_text, "applied"
 
 
 def collect_outputs(

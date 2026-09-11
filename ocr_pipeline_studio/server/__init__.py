@@ -14,6 +14,7 @@ Why a factory instead of a module-level ``app = Flask(__name__)``:
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -57,4 +58,28 @@ def create_app(project_root: Optional[Path] = None) -> Flask:
     from server.routes import bp
     app.register_blueprint(bp)
 
+    _warm_normalizer()
+
     return app
+
+
+def _warm_normalizer() -> None:
+    """Import the OCR script's text normalizer ahead of time, off-thread.
+
+    The review screen's one-click merge needs it, and importing it costs about
+    nine seconds because it drags in PaddleOCR. Doing that lazily would put
+    the whole delay on the user's first click, which would read as the button
+    being broken. Starting it here means the import is long finished by the
+    time anyone reaches the review screen, since a pipeline run takes minutes.
+
+    A daemon thread, and failures are swallowed: this is a warm-up, so if it
+    does not work the lazy import simply happens later, on demand.
+    """
+    def warm() -> None:
+        try:
+            from pipeline.runner import _get_normalizer
+            _get_normalizer()
+        except Exception:
+            pass
+
+    threading.Thread(target=warm, daemon=True, name="warm-normalizer").start()

@@ -412,8 +412,34 @@
 
     $("diff-intro").textContent =
       "Left is what PaddleOCR read; right is what the vision model read on the "
-      + "same page. Spans marked MERGED were applied to the draft automatically; "
-      + "FLAGGED ones were not and still need your eye.";
+      + "same page. Click a side to put it into the document - you do not have "
+      + "to find the text in the editor yourself.";
+
+    // Bulk actions. These sweep every span that is not already on the chosen
+    // side, which is the whole point: the flagged ones are scattered through
+    // the document and hunting for each by hand is the tedious part.
+    var bulk = document.createElement("div");
+    bulk.className = "bulk-actions";
+
+    var remaining = countOnSide(doc.diffs, "ocr");
+    var applyAll = document.createElement("button");
+    applyAll.className = "primary";
+    applyAll.textContent = "Apply all remaining VLM fixes (" + remaining + ")";
+    applyAll.disabled = remaining === 0;
+    on(applyAll, "click", function () { applyDiff({ all: true, direction: "vlm" }); });
+    bulk.appendChild(applyAll);
+
+    var revertAll = document.createElement("button");
+    revertAll.className = "ghost";
+    revertAll.textContent = "Revert all to OCR";
+    on(revertAll, "click", function () { applyDiff({ all: true, direction: "ocr" }); });
+    bulk.appendChild(revertAll);
+
+    var note = document.createElement("span");
+    note.className = "muted small";
+    note.id = "diff-status";
+    bulk.appendChild(note);
+    body.appendChild(bulk);
 
     doc.diffs.forEach(function (page) {
       var section = document.createElement("section");
@@ -423,30 +449,113 @@
       header.textContent = "Page " + page.page + " - " + page.spans.length + " difference(s)";
       section.appendChild(header);
 
-      page.spans.forEach(function (span) {
-        var row = document.createElement("div");
-        var label = (span.label || "DIFF").toLowerCase().replace(/\s+/g, "-");
-        row.className = "diff-row " + label;
-
-        var labelCell = document.createElement("div");
-        labelCell.className = "label";
-        labelCell.textContent = span.label || "diff";
-        row.appendChild(labelCell);
-
-        var ocr = document.createElement("div");
-        ocr.className = "ocr";
-        ocr.textContent = span.ocr;
-        row.appendChild(ocr);
-
-        var vlm = document.createElement("div");
-        vlm.className = "vlm";
-        vlm.textContent = span.vlm;
-        row.appendChild(vlm);
-
-        section.appendChild(row);
+      page.spans.forEach(function (span, index) {
+        section.appendChild(buildDiffRow(page.page, index, span));
       });
       body.appendChild(section);
     });
+  }
+
+  function countOnSide(diffs, side) {
+    var total = 0;
+    (diffs || []).forEach(function (page) {
+      page.spans.forEach(function (span) {
+        if (span.state === side) { total += 1; }
+      });
+    });
+    return total;
+  }
+
+  function buildDiffRow(pageNo, index, span) {
+    var row = document.createElement("div");
+    var label = (span.label || "DIFF").toLowerCase().replace(/\s+/g, "-");
+    row.className = "diff-row " + label + " state-" + (span.state || "unclear");
+
+    var labelCell = document.createElement("div");
+    labelCell.className = "label";
+    labelCell.textContent = span.label || "diff";
+    row.appendChild(labelCell);
+
+    // Each side is a button. Clicking it puts that reading into the document,
+    // so "merge this one" and "put it back" are the same single gesture.
+    row.appendChild(buildSideButton(pageNo, index, span, "ocr"));
+    row.appendChild(buildSideButton(pageNo, index, span, "vlm"));
+
+    return row;
+  }
+
+  function buildSideButton(pageNo, index, span, side) {
+    var button = document.createElement("button");
+    button.className = "side " + side + (span.state === side ? " is-current" : "");
+    button.textContent = span[side];
+
+    if (span.state === side) {
+      // Already what the document says -- shown as the active side rather
+      // than as a button that would do nothing.
+      button.title = "This is what the document currently says.";
+      button.disabled = true;
+    } else {
+      button.title = "Put this reading into the document.";
+      on(button, "click", function () {
+        applyDiff({ page: pageNo, index: index, direction: side });
+      });
+    }
+    return button;
+  }
+
+  function applyDiff(request) {
+    if (!state.current) { return; }
+    api("/apply/" + state.jobId + "/" + encodeURIComponent(state.current.name), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request)
+    }).then(function (result) {
+      // The server returns the whole document, so the editor and preview stay
+      // in step with what the diff view just did.
+      state.current.text = result.text;
+      state.current.diffs = result.diffs;
+      $("editor").value = result.text;
+      renderPreview();
+      state.dirty[state.current.name] = true;
+
+      renderDiff(state.current);
+      renderDocList();
+
+      var status = $("diff-status");
+      if (status) { status.textContent = describeApply(result); }
+    }).catch(function (err) {
+      var status = $("diff-status");
+      if (status) { status.textContent = "Could not apply: " + err.message; }
+    });
+  }
+
+  function describeApply(result) {
+    var counts = result.counts || {};
+    var parts = [];
+    if (counts.applied) { parts.push(counts.applied + " applied"); }
+    if (counts.unchanged) { parts.push(counts.unchanged + " already set"); }
+
+    // Anything the server refused to place is reported rather than hidden --
+    // a silently skipped span would leave the user believing it was applied.
+    var refused = (counts.not_found || 0) + (counts.ambiguous || 0) + (counts.unplaceable || 0);
+    if (refused) {
+      parts.push(refused + " left alone (" + describeSkips(result.skipped) + ")");
+    }
+    return parts.length ? parts.join(", ") + "." : "Nothing to change.";
+  }
+
+  function describeSkips(skipped) {
+    var reasons = {
+      ambiguous: "text appears more than once",
+      not_found: "text not found in the document",
+      unplaceable: "nothing to match against"
+    };
+    var seen = [];
+    (skipped || []).forEach(function (item) {
+      var reason = reasons[item.status] || item.status;
+      if (seen.indexOf(reason) === -1) { seen.push(reason); }
+    });
+    return seen.join("; ");
   }
 
   function renderRecovery(doc) {

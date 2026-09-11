@@ -338,6 +338,23 @@ def _find_document(job, name: str):
     return None
 
 
+def _diffs_with_state(diffs: list, text: str) -> list:
+    """Copy the diff blocks, tagging each span with which side the document
+    currently shows.
+
+    Worked out from the live text on every request rather than stored, so the
+    buttons stay honest even after the user has edited the textarea by hand or
+    applied a span and changed their mind.
+    """
+    annotated = []
+    for page in diffs:
+        spans = []
+        for span in page["spans"]:
+            spans.append(dict(span, state=runner.span_state(text, span["ocr"], span["vlm"])))
+        annotated.append({"page": page["page"], "spans": spans})
+    return annotated
+
+
 @bp.get("/document/<job_id>/<path:name>")
 def document(job_id: str, name: str):
     """Full content for one document: text, flags, diffs, VLM recovery blocks.
@@ -357,15 +374,16 @@ def document(job_id: str, name: str):
 
     md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
     on_disk = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    current = job.edits.get(name, on_disk)
 
     return jsonify({
         "name": doc["name"],
         "filename": doc["filename"],
-        "text": job.edits.get(name, on_disk),
+        "text": current,
         "saved_text": on_disk,
         "dirty": name in job.edits and job.edits[name] != on_disk,
         "flags": doc["flags"],
-        "diffs": doc["diffs"],
+        "diffs": _diffs_with_state(doc["diffs"], current),
         "recovery": doc["recovery"],
         "page_count": doc["page_count"],
         "duplicates_removed": doc["duplicates_removed"],
@@ -394,6 +412,81 @@ def edit(job_id: str, name: str):
     payload = request.get_json(silent=True) or {}
     job.edits[name] = payload.get("text", "")
     return jsonify({"ok": True, "dirty": True})
+
+
+@bp.post("/apply/<job_id>/<path:name>")
+def apply_spans(job_id: str, name: str):
+    """Apply one diff span -- or every span still on the OCR side -- in place.
+
+    This is what saves the user from scrolling the editor to find the words a
+    diff is talking about. Like /edit, it only changes the in-memory copy;
+    nothing reaches disk until Save or Export.
+
+    The request body takes either a single ``{page, index, direction}`` or
+    ``{direction, all: true}`` to sweep every span that is not already on the
+    requested side.
+    """
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    job = store.get(job_id)
+    if job is None:
+        return jsonify({"error": "No such job."}), 404
+
+    doc = _find_document(job, name)
+    if doc is None:
+        return jsonify({"error": "No such document."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    direction = payload.get("direction", "vlm")
+    if direction not in ("vlm", "ocr"):
+        return jsonify({"error": "direction must be 'vlm' or 'ocr'."}), 400
+
+    md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
+    text = job.edits.get(name)
+    if text is None:
+        text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+
+    # Build the list of spans to act on.
+    if payload.get("all"):
+        targets = [
+            (page["page"], index, span)
+            for page in doc["diffs"]
+            for index, span in enumerate(page["spans"])
+        ]
+    else:
+        page_no = payload.get("page")
+        index = payload.get("index")
+        targets = [
+            (page["page"], i, span)
+            for page in doc["diffs"] if page["page"] == page_no
+            for i, span in enumerate(page["spans"]) if i == index
+        ]
+        if not targets:
+            return jsonify({"error": "No such diff span."}), 404
+
+    counts = {"applied": 0, "unchanged": 0, "not_found": 0,
+              "ambiguous": 0, "unplaceable": 0}
+    skipped = []
+    for page_no, index, span in targets:
+        # Skip spans already showing the requested side, so a bulk apply does
+        # not report them as failures.
+        if runner.span_state(text, span["ocr"], span["vlm"]) == direction:
+            counts["unchanged"] += 1
+            continue
+        text, status = runner.apply_span(text, span["ocr"], span["vlm"], direction)
+        counts[status] += 1
+        if status not in ("applied", "unchanged"):
+            skipped.append({"page": page_no, "index": index, "status": status,
+                            "ocr": span["ocr"], "vlm": span["vlm"]})
+
+    job.edits[name] = text
+
+    return jsonify({
+        "ok": True,
+        "text": text,
+        "counts": counts,
+        "skipped": skipped,
+        "diffs": _diffs_with_state(doc["diffs"], text),
+    })
 
 
 @bp.post("/save/<job_id>")
