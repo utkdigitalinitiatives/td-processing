@@ -178,6 +178,14 @@ def decide_rotation(
             # Corroboration beats either detector's own score; in testing this
             # held up on classifier scores as low as 0.48.
             return tl_rotation, "high", "text layer + image agree"
+        # An uncorroborated 180 is refused here for the same reason it is
+        # refused further down when the image is the one proposing it: a bound
+        # thesis is scanned one way round, so a genuinely upside-down page is
+        # rare, while a wrong 180 is what a patch of bad direction vectors
+        # looks like. Checked by eye across two documents, every one of these
+        # was a page that was already the right way up.
+        if tl_rotation == 180:
+            return 180, "review", "only the text layer says 180"
         return tl_rotation, "high", "text layer majority"
 
     # Nothing left to do, but the raw text ran vertically -- so the page already
@@ -231,6 +239,11 @@ def demote_by_neighbours(decisions: list[dict]):
     for d in decisions:
         if d["confidence"] not in ("high", "medium") or not d["rotation"]:
             continue
+        # A page the image independently backed is standing on its own evidence,
+        # not on the text layer, so a bad patch of direction vectors says
+        # nothing about it.
+        if d.get("img_agreed"):
+            continue
         near = sum(
             1
             for offset in range(-NEIGHBOUR_WINDOW, NEIGHBOUR_WINDOW + 1)
@@ -238,7 +251,8 @@ def demote_by_neighbours(decisions: list[dict]):
         )
         if near >= NEIGHBOUR_VOTES:
             d["confidence"] = "review"
-            d["why"] = f"{d['why']}, but {near} neighbours read sideways turned that way"
+            d["contradicted"] = True
+            d["why"] = f"{d['why']}, and {near} neighbours read sideways turned that way"
 
 
 def promote_by_neighbours(decisions: list[dict]):
@@ -263,6 +277,11 @@ def promote_by_neighbours(decisions: list[dict]):
 
     for d in decisions:
         if d["confidence"] != "review" or not d["rotation"]:
+            continue
+        # Neighbours settle a page nothing could read. They do not overrule the
+        # page itself having been read and found still sideways -- that is
+        # direct evidence about this page, and it wins.
+        if d.get("contradicted"):
             continue
         votes = sum(
             1
@@ -329,11 +348,14 @@ def find_and_fix_rotations(
         # geometry does not make it right: where the OCR wrote garbled
         # direction vectors it is confidently and consistently wrong, and
         # nothing else was looking.
-        if (
-            confidence in ("high", "medium")
-            and rotation
-            and not (rotation == img_rotation and img_verified)
-        ):
+        # Two independent signals already pointing the same way is the strongest
+        # evidence available, so a rotation resting on both is left alone. Only
+        # one resting on a single signal gets re-read -- which is the text layer
+        # on its own, or the image on its own where its check confirmed nothing.
+        independently_backed = bool(rotation) and rotation == img_rotation and (
+            img_verified or tl_rotation == rotation
+        )
+        if confidence in ("high", "medium") and rotation and not independently_backed:
             check, check_score = classify_at(page, classifier, rotation, dpi=dpi)
             if check != 0 and check_score >= CONTRADICTION_SCORE:
                 confidence = "review"
@@ -352,6 +374,7 @@ def find_and_fix_rotations(
                 "why": why,
                 "score": round(score, 2),
                 "contradicted": contradicted,
+                "img_agreed": independently_backed,
             }
         )
 
