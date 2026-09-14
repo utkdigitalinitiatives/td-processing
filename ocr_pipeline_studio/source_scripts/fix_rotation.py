@@ -47,6 +47,11 @@ MIN_LINES_FOR_CONFIDENCE = 5
 # Share of lines that must agree before the text layer alone is trusted.
 TEXTLAYER_MAJORITY = 0.8
 
+# How far to look either side of an uncertain page for confident neighbours
+# turning the same way, and how many of them it takes to settle the matter.
+NEIGHBOUR_WINDOW = 2
+NEIGHBOUR_VOTES = 2
+
 
 def textlayer_rotation(page) -> tuple[int | None, int, int]:
     """Reads the /Rotate a page needs from its OCR text layer's line directions.
@@ -203,6 +208,39 @@ def decide_rotation(
     return img_rotation, "review", f"image, low score {score:.2f}"
 
 
+def promote_by_neighbours(decisions: list[dict]):
+    """Settles uncertain pages that sit inside a run of confident ones, in place.
+
+    Sideways material arrives in runs -- an appendix of computer output, a block
+    of wide tables -- and the model reads those pages worst, because a sparse
+    monospace listing lacks the dense line texture it was trained on. Scores
+    dip below the bar on scattered pages in the middle of a run its neighbours
+    were confident about. A page surrounded by confident pages all turning the
+    same way is that same run, so the neighbours settle it.
+
+    Only pages already believed sideways are eligible, and only in the
+    direction the neighbours agree on, so this widens what gets applied without
+    inventing a rotation for a page nothing else suspected.
+    """
+    confident = {
+        d["page"]: d["rotation"]
+        for d in decisions
+        if d["confidence"] in ("high", "medium") and d["rotation"]
+    }
+
+    for d in decisions:
+        if d["confidence"] != "review" or not d["rotation"]:
+            continue
+        votes = sum(
+            1
+            for offset in range(-NEIGHBOUR_WINDOW, NEIGHBOUR_WINDOW + 1)
+            if offset and confident.get(d["page"] + offset) == d["rotation"]
+        )
+        if votes >= NEIGHBOUR_VOTES:
+            d["confidence"] = "medium"
+            d["why"] = f"{d['why']}, but {votes} neighbours agree"
+
+
 def export_rotated_pages(pdf_path: Path, decisions: list[dict], output_dir: Path):
     """Extracts just the affected pages, already rotated, into a review PDF."""
     source_doc = fitz.open(pdf_path)
@@ -263,6 +301,8 @@ def find_and_fix_rotations(
                 "score": round(score, 2),
             }
         )
+
+    promote_by_neighbours(decisions)
 
     to_rotate = [d for d in decisions if d["confidence"] in ("high", "medium")]
 
