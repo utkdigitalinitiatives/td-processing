@@ -52,6 +52,13 @@ TEXTLAYER_MAJORITY = 0.8
 NEIGHBOUR_WINDOW = 2
 NEIGHBOUR_VOTES = 2
 
+# How sure the model has to be before its disagreement overrules a rotation
+# that something else settled. Pages it simply cannot read -- a scatter of dots,
+# a dense block of figures -- come back disagreeing at around 0.6 to 0.7, while
+# a page genuinely left sideways comes back at 0.88 and up. Only the latter is
+# evidence; the former is the model declining to judge.
+CONTRADICTION_SCORE = 0.80
+
 
 def textlayer_rotation(page) -> tuple[int | None, int, int]:
     """Reads the /Rotate a page needs from its OCR text layer's line directions.
@@ -208,6 +215,32 @@ def decide_rotation(
     return img_rotation, "review", f"image, low score {score:.2f}"
 
 
+def demote_by_neighbours(decisions: list[dict]):
+    """Drops pages whose neighbours proved the text layer unreliable there.
+
+    Where OCR wrote bad direction vectors it did so across a stretch of pages,
+    not one, so a page kept only by the text layer while its neighbours were
+    caught reading sideways is almost certainly the same corruption -- just
+    with too little on it for the model to say so outright. Those pages are the
+    ones no single signal can settle, so the run settles them.
+    """
+    caught = {d["page"] for d in decisions if d.get("contradicted")}
+    if not caught:
+        return
+
+    for d in decisions:
+        if d["confidence"] not in ("high", "medium") or not d["rotation"]:
+            continue
+        near = sum(
+            1
+            for offset in range(-NEIGHBOUR_WINDOW, NEIGHBOUR_WINDOW + 1)
+            if offset and (d["page"] + offset) in caught
+        )
+        if near >= NEIGHBOUR_VOTES:
+            d["confidence"] = "review"
+            d["why"] = f"{d['why']}, but {near} neighbours read sideways turned that way"
+
+
 def promote_by_neighbours(decisions: list[dict]):
     """Settles uncertain pages that sit inside a run of confident ones, in place.
 
@@ -276,6 +309,7 @@ def find_and_fix_rotations(
     for page_num in range(len(doc)):
         page = doc[page_num]
 
+        contradicted = False
         tl_rotation, line_count, tl_raw = textlayer_rotation(page)
         img_rotation, score, img_verified = image_rotation(page, classifier, dpi=dpi)
         rotation, confidence, why = decide_rotation(
@@ -288,6 +322,24 @@ def find_and_fix_rotations(
             min_score=min_score,
         )
 
+        # Whatever settled it, a page about to be turned has to read as upright
+        # once turned. The image check above already established exactly that
+        # for its own answer, so only a rotation it did not verify is re-read
+        # here -- which is how the text layer gets checked. Being measured
+        # geometry does not make it right: where the OCR wrote garbled
+        # direction vectors it is confidently and consistently wrong, and
+        # nothing else was looking.
+        if (
+            confidence in ("high", "medium")
+            and rotation
+            and not (rotation == img_rotation and img_verified)
+        ):
+            check, check_score = classify_at(page, classifier, rotation, dpi=dpi)
+            if check != 0 and check_score >= CONTRADICTION_SCORE:
+                confidence = "review"
+                contradicted = True
+                why = f"{why}, but reads sideways turned that way ({check_score:.2f})"
+
         if rotation == 0 and confidence != "review":
             continue
 
@@ -299,9 +351,11 @@ def find_and_fix_rotations(
                 "confidence": confidence,
                 "why": why,
                 "score": round(score, 2),
+                "contradicted": contradicted,
             }
         )
 
+    demote_by_neighbours(decisions)
     promote_by_neighbours(decisions)
 
     to_rotate = [d for d in decisions if d["confidence"] in ("high", "medium")]
