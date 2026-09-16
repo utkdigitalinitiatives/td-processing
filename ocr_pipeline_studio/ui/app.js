@@ -20,8 +20,9 @@
   var md = window.markdownit({ html: true, linkify: false, breaks: false });
 
   var state = {
-    pending: [],        // File objects staged in the drop zone
+    pending: [],        // {file, pages} staged in the drop zone
     jobId: null,
+    fixesOnly: false,   // whether the job on screen was a page-fixes-only run
     poll: null,         // setInterval handle for /status
     documents: [],      // summaries from /status
     current: null,      // full payload for the open document
@@ -143,10 +144,10 @@
       if (!/\.pdf$/i.test(file.name)) { return; }
       // Skip a file already staged, so dropping the same batch twice does not
       // upload it twice.
-      var already = state.pending.some(function (f) {
-        return f.name === file.name && f.size === file.size;
+      var already = state.pending.some(function (entry) {
+        return entry.file.name === file.name && entry.file.size === file.size;
       });
-      if (!already) { state.pending.push(file); }
+      if (!already) { state.pending.push({ file: file, pages: "" }); }
     });
     renderPending();
   }
@@ -154,9 +155,23 @@
   function renderPending() {
     var list = $("pending-list");
     list.innerHTML = "";
-    state.pending.forEach(function (file, index) {
+    var fixesOnly = isFixesOnly();
+    show($("pages-help"), state.pending.length > 0 && !fixesOnly);
+
+    state.pending.forEach(function (entry, index) {
       var li = document.createElement("li");
-      li.appendChild(text(file.name));
+      var name = text(entry.file.name);
+      name.className = "file-name";
+      li.appendChild(name);
+
+      // Abstract pages set by hand. Not offered for a page-fixes-only run,
+      // which never looks for an abstract.
+      if (!fixesOnly) {
+        var pages = pagesInput(entry.pages);
+        on(pages, "input", function () { entry.pages = pages.value; });
+        li.appendChild(pages);
+      }
+
       var remove = document.createElement("button");
       remove.className = "linkish";
       remove.textContent = "remove";
@@ -175,22 +190,80 @@
   // Running the pipeline
   // =====================================================================
 
+  function isFixesOnly() {
+    return $("run-kind").value === "fixes";
+  }
+
+  // Same forms the server accepts: "5-8", "5", or blank for automatic.
+  function validPages(value) {
+    if (!(value || "").trim()) { return true; }
+    var m = /^\s*(\d+)\s*(?:-\s*(\d+))?\s*$/.exec(value);
+    return !!m && +m[1] >= 1 && +(m[2] || m[1]) >= +m[1];
+  }
+
+  function pagesInput(value) {
+    var input = document.createElement("input");
+    input.type = "text";
+    input.className = "pages-input";
+    input.placeholder = "abstract pages: auto";
+    input.title = "Abstract pages as numbered in this PDF, e.g. 5-8. "
+      + "Blank finds them automatically.";
+    input.value = value || "";
+    function check() { input.classList.toggle("is-invalid", !validPages(input.value)); }
+    on(input, "input", check);
+    check();
+    return input;
+  }
+
+  function updateRunKind() {
+    var fixesOnly = isFixesOnly();
+    // The model and VLM pass only matter to the OCR step a fixes-only run skips.
+    $("model-select").disabled = fixesOnly;
+    $("mode-select").disabled = fixesOnly;
+    show($("mode-help"), !fixesOnly);
+    show($("kind-help"), fixesOnly);
+    renderPending();
+  }
+
+  function showRunError(message) {
+    var box = $("run-error");
+    box.textContent = message;
+    show(box, true);
+  }
+
+  function badPagesMessage(names) {
+    return "Check the abstract pages for " + names.join(", ") + " - use a form like 5-8 or 5.";
+  }
+
   function startRun() {
+    var fixesOnly = isFixesOnly();
+    var overrides = {};
+    var bad = [];
+    state.pending.forEach(function (entry) {
+      if (fixesOnly || !entry.pages.trim()) { return; }
+      if (!validPages(entry.pages)) { bad.push(entry.file.name); }
+      overrides[entry.file.name] = entry.pages.trim();
+    });
+    if (bad.length) {
+      showRunError(badPagesMessage(bad));
+      return;
+    }
+
     var form = new FormData();
-    state.pending.forEach(function (file) { form.append("files", file); });
+    state.pending.forEach(function (entry) { form.append("files", entry.file); });
     form.append("model", $("model-select").value);
     form.append("mode", $("mode-select").value);
+    form.append("fixes_only", fixesOnly ? "1" : "0");
+    form.append("overrides", JSON.stringify(overrides));
 
     $("run-btn").disabled = true;
     show($("run-error"), false);
 
     api("/upload", { method: "POST", body: form })
       .then(function (data) {
-        state.jobId = data.job_id;
         state.pending = [];
         renderPending();
-        show($("progress-panel"), true);
-        startPolling();
+        beginJob(data.job_id);
       })
       .catch(function (err) {
         // The most common failure here is the Ollama preflight, whose message
@@ -200,6 +273,19 @@
         show(box, true);
         $("run-btn").disabled = state.pending.length === 0;
       });
+  }
+
+  // Point the screen at a newly started job. The review screen showed the
+  // previous job, so it is closed until this one finishes.
+  function beginJob(jobId) {
+    state.jobId = jobId;
+    state.documents = [];
+    state.current = null;
+    state.dirty = {};
+    $("tab-review").disabled = true;
+    show($("progress-panel"), true);
+    switchScreen("run");
+    startPolling();
   }
 
   function startPolling() {
@@ -255,6 +341,10 @@
         return;
       }
       state.documents = status.documents || [];
+      state.fixesOnly = !!status.fixes_only;
+      // A fixes-only job has no text to save; what it exports is the PDFs.
+      show($("save-btn"), !state.fixesOnly);
+      $("export-btn").textContent = state.fixesOnly ? "Download fixed PDFs" : "Export";
       if (state.documents.length) {
         $("tab-review").disabled = false;
         renderDocList();
@@ -275,7 +365,69 @@
       span.className = "state " + info.state;
       span.textContent = info.detail ? info.state + " - " + info.detail : info.state;
       li.appendChild(span);
+      // Once the job is over, any file can be run again: with its abstract
+      // pages set by hand, or as page fixes only when it has no abstract.
+      if (status.finished && status.status === "done") {
+        li.appendChild(buildRerun(status.job_id, name));
+      }
       list.appendChild(li);
+    });
+  }
+
+  function buildRerun(jobId, name) {
+    var row = document.createElement("div");
+    row.className = "rerun";
+
+    var pages = pagesInput("");
+    row.appendChild(pages);
+
+    var again = document.createElement("button");
+    again.className = "ghost";
+    again.textContent = "Rerun abstract";
+    again.title = "Run the full pipeline on this file again, using the pages typed here.";
+    on(again, "click", function () {
+      if (!validPages(pages.value)) {
+        showRunError(badPagesMessage([name]));
+        return;
+      }
+      var overrides = {};
+      if (pages.value.trim()) { overrides[name] = pages.value.trim(); }
+      rerunFiles(jobId, [name], false, overrides);
+    });
+    row.appendChild(again);
+
+    var fixes = document.createElement("button");
+    fixes.className = "ghost";
+    fixes.textContent = "Page fixes only";
+    fixes.title = "Remove repeats and turn sideways pages, then download the "
+      + "corrected PDF. No OCR.";
+    on(fixes, "click", function () { rerunFiles(jobId, [name], true, {}); });
+    row.appendChild(fixes);
+
+    return row;
+  }
+
+  function rerunFiles(jobId, files, fixesOnly, overrides) {
+    var unsaved = Object.keys(state.dirty).length;
+    if (unsaved && !window.confirm("You have unsaved edits in " + unsaved
+        + " document(s). Rerunning moves on to a new run - continue?")) {
+      return;
+    }
+    show($("run-error"), false);
+    api("/rerun/" + jobId, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        files: files,
+        model: $("model-select").value,
+        mode: $("mode-select").value,
+        fixes_only: fixesOnly,
+        overrides: overrides
+      })
+    }).then(function (data) {
+      beginJob(data.job_id);
+    }).catch(function (err) {
+      showRunError(err.message);
     });
   }
 
@@ -316,6 +468,20 @@
       (doc.flags || []).forEach(function (flag) {
         (pagesByKind[flag.kind] = pagesByKind[flag.kind] || []).push(flag);
       });
+      // Page fixes come first: they happened before OCR, to the whole PDF.
+      if (doc.duplicates_removed) {
+        chips.appendChild(fixChip("dedupe", doc.duplicates_removed + " repeat(s) removed",
+          "Repeated pages taken out before OCR - see the Page fixes tab."));
+      }
+      if (doc.pages_rotated) {
+        chips.appendChild(fixChip("rotate", doc.pages_rotated + " rotated",
+          "Sideways pages turned upright before OCR - see the Page fixes tab."));
+      }
+      if (doc.pages_for_review) {
+        chips.appendChild(fixChip("rotate-review", doc.pages_for_review + " rotation check",
+          "Pages that may be sideways but were left alone - check them on the Page fixes tab."));
+      }
+
       ["low_confidence", "equation", "diff"].forEach(function (kind) {
         var flags = pagesByKind[kind];
         if (!flags) { return; }
@@ -348,6 +514,14 @@
     });
   }
 
+  function fixChip(kind, label, title) {
+    var chip = document.createElement("span");
+    chip.className = "chip " + kind;
+    chip.textContent = label;
+    chip.title = title;
+    return chip;
+  }
+
   function kindLabel(kind) {
     if (kind === "low_confidence") { return "low-conf"; }
     if (kind === "equation") { return "equation"; }
@@ -361,9 +535,14 @@
         $("doc-title").textContent = doc.name;
 
         var meta = [];
+        if (doc.fixes_only) { meta.push("page fixes only"); }
+        if (doc.abstract_pages) {
+          meta.push("abstract pages " + doc.abstract_pages.requested + " set by hand");
+        }
         if (doc.page_count != null) { meta.push(doc.page_count + " pages after dedupe"); }
         if (doc.duplicates_removed) { meta.push(doc.duplicates_removed + " repeated page(s) removed"); }
-        meta.push("model: " + doc.model_used);
+        if (doc.pages_rotated) { meta.push(doc.pages_rotated + " sideways page(s) rotated"); }
+        if (doc.model_used) { meta.push("model: " + doc.model_used); }
         $("doc-meta").textContent = meta.join(" - ");
 
         $("editor").value = doc.text;
@@ -371,13 +550,20 @@
 
         // Tabs are disabled rather than hidden when a mode produced no such
         // data, so the UI never shows a control that silently does nothing.
+        $("tab-edit").disabled = !!doc.fixes_only;
         $("tab-diff").disabled = !(doc.diffs && doc.diffs.length);
         $("tab-recovery").disabled = !(doc.recovery && doc.recovery.length);
+        // Always open for a fixes-only document: the fixes are all it has,
+        // and "none were needed" is itself an answer.
+        $("tab-fixes").disabled = !(doc.fixes_only
+          || (doc.duplicates && doc.duplicates.length)
+          || (doc.rotations && doc.rotations.length));
 
         renderDiff(doc);
         renderRecovery(doc);
+        renderFixes(doc);
         renderDocList();
-        switchView("edit");
+        switchView(doc.fixes_only ? "fixes" : "edit");
       });
   }
 
@@ -392,6 +578,7 @@
     show($("view-edit"), view === "edit");
     show($("view-diff"), view === "diff");
     show($("view-recovery"), view === "recovery");
+    show($("view-fixes"), view === "fixes");
     document.querySelectorAll(".view-toggle .tab").forEach(function (tab) {
       tab.classList.toggle("is-active", tab.dataset.view === view);
     });
@@ -628,6 +815,140 @@
     });
   }
 
+  // ---------- page fixes: dedupe + rotation ----------
+
+  function renderFixes(doc) {
+    var body = $("fixes-body");
+    body.innerHTML = "";
+
+    var duplicates = doc.duplicates || [];
+    var rotations = doc.rotations || [];
+    var applied = rotations.filter(function (r) { return r.applied; });
+    var review = rotations.filter(function (r) { return !r.applied; });
+
+    if (!duplicates.length && !rotations.length) {
+      var empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No repeated or sideways pages were found in this document.";
+      body.appendChild(empty);
+      return;
+    }
+
+    // Page numbers everywhere below are the uploaded PDF's own, so they match
+    // what the user sees when they open their file.
+    if (duplicates.length) {
+      body.appendChild(fixSection(
+        "Repeated pages removed (" + duplicates.length + ")",
+        "Each of these pages matched an earlier page and was taken out before OCR.",
+        duplicates.map(function (d) {
+          return fixCard(
+            [
+              pageFigure(doc, "original", d.dupe_idx, "Page " + d.duplicate_page + " - removed", 0),
+              pageFigure(doc, "original", d.orig_idx, "Page " + d.original_page + " - kept", 0)
+            ],
+            d.score + "% text match, printed page number: " + d.folio
+          );
+        })
+      ));
+    }
+
+    if (applied.length) {
+      body.appendChild(fixSection(
+        "Sideways pages rotated (" + applied.length + ")",
+        "Turned upright before OCR. Only the page's rotation setting changed; "
+          + "the scan itself is untouched.",
+        applied.map(function (r) {
+          return fixCard(
+            [
+              pageFigure(doc, "deduped", r.page_idx, "Page " + r.original_page + " - as scanned", 0),
+              pageFigure(doc, "rotated", r.page_idx, "Turned " + r.rotation + "°", 0)
+            ],
+            r.confidence + " confidence: " + r.why
+          );
+        })
+      ));
+    }
+
+    if (review.length) {
+      body.appendChild(fixSection(
+        "Possibly sideways - left alone (" + review.length + ")",
+        "The evidence was too weak to rotate these automatically. The right-hand "
+          + "image is only a preview of the suggested turn; the PDF was not changed.",
+        review.map(function (r) {
+          return fixCard(
+            [
+              pageFigure(doc, "deduped", r.page_idx, "Page " + r.original_page + " - as scanned", 0),
+              pageFigure(doc, "deduped", r.page_idx, "If turned " + r.rotation + "°", r.rotation)
+            ],
+            r.why
+          );
+        })
+      ));
+    }
+  }
+
+  function fixSection(title, hint, cards) {
+    var section = document.createElement("section");
+    section.className = "fix-section";
+
+    var header = document.createElement("h3");
+    header.textContent = title;
+    section.appendChild(header);
+
+    var note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = hint;
+    section.appendChild(note);
+
+    var grid = document.createElement("div");
+    grid.className = "fix-grid";
+    cards.forEach(function (card) { grid.appendChild(card); });
+    section.appendChild(grid);
+    return section;
+  }
+
+  function fixCard(figures, caption) {
+    var card = document.createElement("div");
+    card.className = "fix-card";
+
+    var pair = document.createElement("div");
+    pair.className = "fix-pair";
+    figures.forEach(function (figure) { pair.appendChild(figure); });
+    card.appendChild(pair);
+
+    var note = document.createElement("p");
+    note.className = "fix-caption";
+    note.textContent = caption;
+    card.appendChild(note);
+    return card;
+  }
+
+  function pageFigure(doc, source, pageIdx, label, previewTurn) {
+    var figure = document.createElement("figure");
+    figure.className = "page-thumb";
+
+    // A square frame, so a portrait page and the same page turned landscape
+    // take up the same space and the card does not jump around.
+    var frame = document.createElement("div");
+    frame.className = "thumb-frame";
+
+    var img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = label;
+    img.src = "/page-image/" + state.jobId + "/" + source + "/" + pageIdx + "/"
+      + encodeURIComponent(doc.name);
+    // /Rotate turns a page clockwise, and so does a positive CSS rotate, so
+    // the preview shows exactly what applying the suggestion would give.
+    if (previewTurn) { img.style.transform = "rotate(" + previewTurn + "deg)"; }
+    frame.appendChild(img);
+    figure.appendChild(frame);
+
+    var caption = document.createElement("figcaption");
+    caption.textContent = label;
+    figure.appendChild(caption);
+    return figure;
+  }
+
   // ---------- editing, saving, exporting ----------
 
   function onEditorInput() {
@@ -698,6 +1019,8 @@
     setupDropzone();
     on($("run-btn"), "click", startRun);
     on($("mode-select"), "change", updateModeHelp);
+    on($("run-kind"), "change", updateRunKind);
+    updateRunKind();
     on($("editor"), "input", onEditorInput);
     on($("save-btn"), "click", saveEdits);
     on($("export-btn"), "click", exportDocs);

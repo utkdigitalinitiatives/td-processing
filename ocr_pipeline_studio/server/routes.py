@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import threading
 import traceback
 import zipfile
@@ -95,17 +96,12 @@ def upload():
     if not uploaded:
         return jsonify({"error": "No files were uploaded."}), 400
 
-    model = request.form.get("model") or runner.DEFAULT_VLM_MODEL
-    mode = request.form.get("mode") or runner.DEFAULT_VLM_MODE
-    if mode not in runner.VLM_MODES:
-        return jsonify({"error": "Unknown VLM mode: %s" % mode}), 400
-
-    # Preflight before anything is written: if Ollama is down or the chosen
-    # model is missing, say so now, in plain words, rather than letting the
-    # job fail deep inside the pipeline.
-    check = runner.preflight(model, current_app.config["OLLAMA_URL"], mode)
-    if not check["ok"]:
-        return jsonify({"error": check["message"]}), 409
+    try:
+        options = _run_options(request.form.get("model"), request.form.get("mode"),
+                               request.form.get("fixes_only"),
+                               request.form.get("overrides") or "{}")
+    except _Refused as exc:
+        return jsonify({"error": exc.message}), exc.status
 
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.create(current_app.config["WORKDIR"])
@@ -126,16 +122,114 @@ def upload():
     if not saved:
         return jsonify({"error": "None of the dropped files were PDFs."}), 400
 
+    return _launch_job(job, saved, options)
+
+
+@bp.post("/rerun/<job_id>")
+def rerun(job_id: str):
+    """Run some of a finished job's files again, as a new job.
+
+    For the files a run got wrong: a thesis whose abstract was missed or
+    misidentified is rerun with its pages set by hand, and one with no
+    abstract at all is rerun as page fixes only. The uploads are copied from
+    the old job, so nothing has to be dropped in again, and the old job's
+    results are left as they were.
+    """
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    old = store.get(job_id)
+    if old is None:
+        return jsonify({"error": "No such job."}), 404
+    if old.status not in jobstate.FINISHED:
+        return jsonify({"error": "That job is still running."}), 409
+
+    payload = request.get_json(silent=True) or {}
+    # Only names the old job actually holds -- never a path from the request.
+    files = [name for name in payload.get("files", []) if name in old.files]
+    if not files:
+        return jsonify({"error": "None of those files belong to that job."}), 400
+
+    try:
+        options = _run_options(payload.get("model"), payload.get("mode"),
+                               payload.get("fixes_only"), payload.get("overrides") or {})
+    except _Refused as exc:
+        return jsonify({"error": exc.message}), exc.status
+
+    job = store.create(current_app.config["WORKDIR"])
+    uploads_dir = job.workdir / runner.UPLOADS_DIRNAME
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        shutil.copy2(old.workdir / runner.UPLOADS_DIRNAME / name, uploads_dir / name)
+
+    return _launch_job(job, files, options)
+
+
+class _Refused(Exception):
+    """A run request that cannot start, with the status to answer it with."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def _run_options(model, mode, fixes_only, overrides) -> dict:
+    """Validate the settings shared by /upload and /rerun.
+
+    ``overrides`` may arrive as a JSON string (a form field) or already
+    decoded (a JSON body). Raises _Refused for anything that should stop the
+    job from starting.
+    """
+    fixes_only = str(fixes_only).lower() in ("1", "true", "yes")
+    model = model or runner.DEFAULT_VLM_MODEL
+    mode = mode or runner.DEFAULT_VLM_MODE
+    if mode not in runner.VLM_MODES:
+        raise _Refused("Unknown VLM mode: %s" % mode)
+
+    if isinstance(overrides, str):
+        try:
+            overrides = json.loads(overrides)
+        except ValueError:
+            raise _Refused("Abstract page overrides could not be read.")
+    if not isinstance(overrides, dict):
+        raise _Refused("Abstract page overrides must be an object.")
+    ranges = {}
+    if not fixes_only:
+        for name, value in overrides.items():
+            try:
+                parsed = runner.parse_page_range(value)
+            except ValueError as exc:
+                raise _Refused("%s: %s" % (name, exc))
+            if parsed is not None:
+                # Keyed the way the saved upload is named, so it matches.
+                ranges[secure_filename(name)] = parsed
+
+    # Preflight before anything is written: if Ollama is down or the chosen
+    # model is missing, say so now, in plain words, rather than letting the
+    # job fail deep inside the pipeline. A page-fixes-only run never calls
+    # Ollama, so it is checked as if the VLM were off.
+    check = runner.preflight(model, current_app.config["OLLAMA_URL"],
+                             "off" if fixes_only else mode)
+    if not check["ok"]:
+        raise _Refused(check["message"], 409)
+
+    return {"model": model, "mode": mode, "fixes_only": fixes_only, "overrides": ranges}
+
+
+def _launch_job(job, files: list, options: dict):
+    """Record a job's settings and start the pipeline on a background thread."""
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
     store.update(
         job.id,
-        files=saved,
-        model=model,
-        mode=mode,
-        file_total=len(saved),
+        files=files,
+        model=options["model"],
+        mode=options["mode"],
+        fixes_only=options["fixes_only"],
+        overrides={n: r for n, r in options["overrides"].items() if n in files},
+        file_total=len(files),
         status=jobstate.STATUS_QUEUED,
         message="Queued.",
     )
-    for name in saved:
+    for name in files:
         store.set_file_state(job.id, name, "queued")
 
     # daemon=True so a half-finished job can never keep the process alive
@@ -148,7 +242,20 @@ def upload():
     )
     thread.start()
 
-    return jsonify({"job_id": job.id, "files": saved, "model": model, "mode": mode})
+    return jsonify({"job_id": job.id, "files": files, "model": options["model"],
+                    "mode": options["mode"], "fixes_only": options["fixes_only"]})
+
+
+def _rotation_detail(rotated: int, review: int) -> str:
+    """One queue-row phrase for a file's rotation pass."""
+    if not rotated and not review:
+        return "no sideways pages"
+    parts = []
+    if rotated:
+        parts.append("%d page(s) rotated" % rotated)
+    if review:
+        parts.append("%d to check by hand" % review)
+    return ", ".join(parts)
 
 
 def _run_job(app, job_id: str) -> None:
@@ -187,6 +294,7 @@ def _run_job(app, job_id: str) -> None:
                 stage = event.get("stage")
                 status = {
                     "dedupe": jobstate.STATUS_DEDUPE,
+                    "rotate": jobstate.STATUS_ROTATE,
                     "ocr": jobstate.STATUS_OCR,
                     "collecting": jobstate.STATUS_COLLECTING,
                 }.get(stage, jobstate.STATUS_OCR)
@@ -203,6 +311,17 @@ def _run_job(app, job_id: str) -> None:
                 detail = ("%d repeated page(s) removed" % removed) if removed else "no repeats"
                 store.set_file_state(job_id, event["filename"], "deduped", detail)
                 store.append_log(job_id, "[dedupe] %s: %s" % (event["filename"], detail))
+
+            elif kind == "rotate_start":
+                store.update(job_id, current_file=event.get("filename"),
+                             file_index=event.get("index", 0),
+                             message="Checking for sideways pages")
+                store.set_file_state(job_id, event["filename"], "rotate")
+
+            elif kind == "rotate_done":
+                detail = _rotation_detail(event.get("rotated", 0), event.get("review", 0))
+                store.set_file_state(job_id, event["filename"], "rotated", detail)
+                store.append_log(job_id, "[rotate] %s: %s" % (event["filename"], detail))
 
             elif kind == "file_index":
                 store.update(job_id, file_index=event.get("index", 0),
@@ -252,12 +371,24 @@ def _run_job(app, job_id: str) -> None:
                 mode=job.mode,
                 ollama_url=app.config["OLLAMA_URL"],
                 report=report,
+                overrides=job.overrides,
+                fixes_only=job.fixes_only,
             )
 
             documents = result["documents"]
             for doc in documents:
-                store.set_file_state(job_id, doc["filename"], "done",
-                                     "%d flag(s)" % len(doc["flags"]))
+                # The page fixes are repeated here because "done" replaces the
+                # dedupe/rotate details the row showed while the job ran.
+                parts = [] if doc["fixes_only"] else ["%d flag(s)" % len(doc["flags"])]
+                if doc["abstract_pages"]:
+                    parts.append("abstract pages %s" % doc["abstract_pages"]["requested"])
+                if doc["duplicates_removed"]:
+                    parts.append("%d repeated page(s) removed" % doc["duplicates_removed"])
+                if doc["pages_rotated"] or doc["pages_for_review"]:
+                    parts.append(_rotation_detail(doc["pages_rotated"], doc["pages_for_review"]))
+                if doc["fixes_only"] and not parts:
+                    parts.append("no page fixes needed")
+                store.set_file_state(job_id, doc["filename"], "done", ", ".join(parts))
 
             # A document the OCR script skipped (no abstract heading found)
             # produces no draft, so it never appears in ``documents``. Say so
@@ -268,7 +399,9 @@ def _run_job(app, job_id: str) -> None:
                 store.set_file_state(job_id, name, "skipped",
                                      problems.get(name, "produced no output - see the log"))
 
-            if documents:
+            if documents and job.fixes_only:
+                message = "Finished - page fixes ready for %d document(s)." % len(documents)
+            elif documents:
                 message = "Finished - %d document(s) ready to review." % len(documents)
             else:
                 # Report the reason the script actually gave. Distinct reasons
@@ -382,13 +515,18 @@ def document(job_id: str, name: str):
     if doc is None:
         return jsonify({"error": "No such document."}), 404
 
-    md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
-    on_disk = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    # A page-fixes-only document has no text at all -- its product is the PDF.
+    on_disk = ""
+    if doc["md_file"]:
+        md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
+        on_disk = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
     current = job.edits.get(name, on_disk)
 
     return jsonify({
         "name": doc["name"],
         "filename": doc["filename"],
+        "fixes_only": doc["fixes_only"],
+        "abstract_pages": doc["abstract_pages"],
         "text": current,
         "saved_text": on_disk,
         "dirty": name in job.edits and job.edits[name] != on_disk,
@@ -399,10 +537,68 @@ def document(job_id: str, name: str):
         "page_count": doc["page_count"],
         "duplicates_removed": doc["duplicates_removed"],
         "duplicates": doc["duplicates"],
+        "pages_rotated": doc["pages_rotated"],
+        "pages_for_review": doc["pages_for_review"],
+        "rotations": doc["rotations"],
         "model_used": doc["model_used"],
         "mode_used": doc["mode_used"],
         "processed_at": doc["processed_at"],
     })
+
+
+# Which copy of a PDF a page image may be drawn from. A fixed map, never a
+# path taken from the request: each key names one of the job's own stage
+# folders, so the route cannot be pointed anywhere else on disk.
+_PAGE_IMAGE_SOURCES = {
+    "original": runner.UPLOADS_DIRNAME,
+    "deduped": runner.DEDUPED_DIRNAME,
+    "rotated": runner.ROTATED_DIRNAME,
+}
+
+# PyMuPDF is not thread-safe, and Flask answers each thumbnail request on its
+# own thread. One lock makes the page renders take turns.
+_render_lock = threading.Lock()
+
+
+@bp.get("/page-image/<job_id>/<source>/<int:page_idx>/<path:name>")
+def page_image(job_id: str, source: str, page_idx: int, name: str):
+    """A PNG of one page, for the before/after views on the Page fixes tab.
+
+    ``page_idx`` is 0-based within the chosen copy. Rendering respects the
+    page's /Rotate, which is exactly what makes a rotation fix visible: the
+    deduped copy shows the page as scanned, the rotated copy as corrected.
+    """
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    job = store.get(job_id)
+    if job is None:
+        return jsonify({"error": "No such job."}), 404
+
+    doc = _find_document(job, name)
+    folder = _PAGE_IMAGE_SOURCES.get(source)
+    if doc is None or folder is None:
+        return jsonify({"error": "No such page."}), 404
+
+    pdf_path = job.workdir / folder / doc["filename"]
+    if not pdf_path.exists():
+        return jsonify({"error": "No such page."}), 404
+
+    import fitz  # PyMuPDF
+
+    with _render_lock:
+        pdf = fitz.open(pdf_path)
+        try:
+            if not 0 <= page_idx < pdf.page_count:
+                return jsonify({"error": "No such page."}), 404
+            # 60 dpi is plenty to judge orientation or spot a repeated page,
+            # and keeps a document with dozens of fixes quick to open.
+            png = pdf[page_idx].get_pixmap(dpi=60).tobytes("png")
+        finally:
+            pdf.close()
+
+    response = send_file(io.BytesIO(png), mimetype="image/png")
+    # A job's stage folders never change once the job has run.
+    response.headers["Cache-Control"] = "private, max-age=3600"
+    return response
 
 
 @bp.post("/edit/<job_id>/<path:name>")
@@ -417,8 +613,11 @@ def edit(job_id: str, name: str):
     job = store.get(job_id)
     if job is None:
         return jsonify({"error": "No such job."}), 404
-    if _find_document(job, name) is None:
+    doc = _find_document(job, name)
+    if doc is None:
         return jsonify({"error": "No such document."}), 404
+    if not doc["md_file"]:
+        return jsonify({"error": "This document has no text - it was a page fixes only run."}), 409
 
     payload = request.get_json(silent=True) or {}
     job.edits[name] = payload.get("text", "")
@@ -450,6 +649,9 @@ def apply_spans(job_id: str, name: str):
     direction = payload.get("direction", "vlm")
     if direction not in ("vlm", "ocr"):
         return jsonify({"error": "direction must be 'vlm' or 'ocr'."}), 400
+
+    if not doc["md_file"]:
+        return jsonify({"error": "This document has no text - it was a page fixes only run."}), 409
 
     md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
     text = job.edits.get(name)
@@ -532,7 +734,7 @@ def save(job_id: str):
     written = []
     for name in names:
         doc = _find_document(job, name)
-        if doc is None or name not in job.edits:
+        if doc is None or not doc["md_file"] or name not in job.edits:
             continue
         path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
         path.write_text(job.edits[name], encoding="utf-8")
@@ -562,6 +764,9 @@ def export():
     if not selected:
         return jsonify({"error": "Nothing selected to export."}), 400
 
+    if job.fixes_only:
+        return _export_fixed_pdfs(job, selected)
+
     def text_for(doc) -> str:
         """Edited text if there is any, otherwise what the pipeline wrote."""
         if doc["name"] in job.edits:
@@ -588,3 +793,32 @@ def export():
     return send_file(buffer, mimetype="application/zip",
                      as_attachment=True,
                      download_name="ocr-pipeline-studio-%s.zip" % job.id)
+
+
+def _export_fixed_pdfs(job, selected: list):
+    """Download a page-fixes-only job's corrected PDFs.
+
+    The file in ``rotated/`` is the finished product: repeats removed, then
+    sideways pages turned. Unlike abstracts these can run to tens of MB, so a
+    batch is zipped to a file in the job folder rather than in memory, and
+    stored uncompressed -- PDF scans are already compressed.
+    """
+    rotated_dir = job.workdir / runner.ROTATED_DIRNAME
+    pdfs = [rotated_dir / d["filename"] for d in selected]
+    missing = [p.name for p in pdfs if not p.exists()]
+    if missing:
+        return jsonify({"error": "Fixed PDF missing for: %s" % ", ".join(missing)}), 404
+
+    if len(pdfs) == 1:
+        return send_file(pdfs[0], mimetype="application/pdf",
+                         as_attachment=True, download_name=pdfs[0].name)
+
+    zip_path = job.workdir / "fixed-pdfs.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as archive:
+        for pdf in pdfs:
+            archive.write(pdf, pdf.name)
+        manifest = job.workdir / runner.OUTPUT_DIRNAME / "manifest.json"
+        if manifest.exists():
+            archive.write(manifest, "manifest.json")
+    return send_file(zip_path, mimetype="application/zip", as_attachment=True,
+                     download_name="fixed-pdfs-%s.zip" % job.id)

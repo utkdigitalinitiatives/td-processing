@@ -1,17 +1,19 @@
-"""Thin adapters around the two original scripts in ``source_scripts/``.
+"""Thin adapters around the original scripts in ``source_scripts/``.
 
-Nothing in this file reimplements what those scripts already do. The two
-copies that live beside this module (``pipeline/dedupe.py`` and
-``pipeline/vlm_abstract.py``) are byte-for-byte the files that were handed to
-us; this module only *calls* them and reshapes their output into something a
-background thread and a JSON API can work with.
+Nothing in this file reimplements what those scripts already do. The copies
+that live beside this module (``pipeline/dedupe.py``,
+``pipeline/fix_rotation.py`` and ``pipeline/vlm_abstract.py``) are
+byte-for-byte the files that were handed to us; this module only *calls* them
+and reshapes their output into something a background thread and a JSON API
+can work with.
 
 Two very different calling styles are used here, and the reason for each
 matters:
 
-``dedupe.py`` is called **in-process, as a normal import**. Its core function
-``find_and_export_duplicates()`` already returns a real Python list, so there
-is nothing awkward to work around.
+``dedupe.py`` and ``fix_rotation.py`` are called **in-process, as a normal
+import**. Their core functions (``find_and_export_duplicates()`` and
+``find_and_fix_rotations()``) already return real Python lists, so there is
+nothing awkward to work around.
 
 ``vlm_abstract.py`` is called **as a subprocess, through its own CLI**. That is
 deliberate and is the single most important design decision in this file:
@@ -35,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -46,6 +49,10 @@ import fitz  # PyMuPDF -- used only to *write* the deduped PDF, see dedupe_pdf()
 
 # The original detector, imported and used exactly as written.
 from pipeline.dedupe import find_and_export_duplicates
+
+# The original rotation fixer, likewise. Importing it only pulls in fitz --
+# the script defers its paddleocr import to where the classifier is built.
+from pipeline.fix_rotation import ORIENTATION_MODEL, find_and_fix_rotations
 
 # Absolute path to the OCR/VLM script we shell out to. Resolved once at import
 # time so a change of working directory later can never break the call.
@@ -209,6 +216,10 @@ class DedupeResult:
     original_page_count: int
     kept_page_count: int
     duplicates: list = field(default_factory=list)
+    # 0-based page numbers of the original PDF, in the order they were kept.
+    # Position i in the deduped PDF is original page kept_indices[i], which is
+    # how later stages report pages in numbers the user will recognise.
+    kept_indices: list = field(default_factory=list)
 
     @property
     def duplicates_removed(self) -> int:
@@ -263,7 +274,200 @@ def dedupe_pdf(pdf_path: Path, deduped_dir: Path) -> DedupeResult:
         original_page_count=original_page_count,
         kept_page_count=kept_page_count,
         duplicates=duplicates,
+        kept_indices=keep,
     )
+
+
+# --------------------------------------------------------------------------
+# Stage 1b: fix sideways pages
+# --------------------------------------------------------------------------
+
+# The confidence levels fix_rotation.py actually applies. "review" pages are
+# reported but left alone -- the script's own rule, mirrored here only so the
+# counts below agree with what it wrote.
+_APPLIED_CONFIDENCE = ("high", "medium")
+
+
+@dataclass
+class RotationResult:
+    """What one PDF's rotation pass produced."""
+    source_name: str
+    rotated_path: Path
+    # One dict per page the script had something to say about:
+    #   {page_idx, page, rotation, confidence, why, score, contradicted, img_agreed}
+    decisions: list = field(default_factory=list)
+
+    @property
+    def pages_rotated(self) -> int:
+        return sum(1 for d in self.decisions if d["confidence"] in _APPLIED_CONFIDENCE)
+
+    @property
+    def pages_for_review(self) -> int:
+        return sum(1 for d in self.decisions if d["confidence"] == "review")
+
+
+def load_orientation_classifier():
+    """Build the orientation model the script uses, once per batch.
+
+    The script builds this inside scan_directory(), which we do not call (it
+    only prints its results), so the same construction is repeated here.
+    Loading takes about a second, hence doing it once rather than per PDF.
+    """
+    from paddleocr import DocImgOrientationClassification
+
+    return DocImgOrientationClassification(model_name=ORIENTATION_MODEL)
+
+
+def fix_rotation_pdf(
+    pdf_path: Path,
+    rotated_dir: Path,
+    classifier=None,
+    dpi: int = 100,
+    min_score: float = 0.70,
+) -> RotationResult:
+    """Detect sideways pages with the original script and write a copy of the
+    PDF with their /Rotate set, into ``rotated_dir``.
+
+    Driven through ``find_and_fix_rotations(apply=True)``, the script's own
+    "corrected copy into an output folder" mode, so the detection and the
+    lossless write are both exactly as written. The one gap filled here: the
+    script writes nothing for a PDF with no sideways pages, but the next stage
+    reads the whole folder, so clean PDFs are copied across unchanged.
+    """
+    rotated_dir.mkdir(parents=True, exist_ok=True)
+
+    # The script refuses this same case in scan_directory(), which we bypass:
+    # apply=True into the source's own folder would overwrite the original.
+    if pdf_path.parent.resolve() == rotated_dir.resolve():
+        raise ValueError("rotated_dir must differ from the folder holding %s" % pdf_path.name)
+
+    if classifier is None:
+        classifier = load_orientation_classifier()
+
+    decisions = find_and_fix_rotations(
+        pdf_path,
+        classifier,
+        output_dir=rotated_dir,
+        apply=True,
+        dpi=dpi,
+        min_score=min_score,
+    )
+
+    result = RotationResult(
+        source_name=pdf_path.name,
+        rotated_path=rotated_dir / pdf_path.name,
+        decisions=decisions,
+    )
+
+    # Copied rather than skipped, and copied even if a file of that name is
+    # already there, so a stale copy from an earlier run can never be picked up.
+    if not result.pages_rotated:
+        shutil.copy2(pdf_path, result.rotated_path)
+
+    return result
+
+
+def rotation_records(rotation: Optional[RotationResult], dedupe: Optional[DedupeResult]) -> list:
+    """The script's per-page decisions, with each page also numbered as it
+    was in the uploaded PDF.
+
+    The rotation pass runs on the deduped copy, so its ``page`` numbers shift
+    past every removed duplicate. The UI shows both: ``page_idx`` is what
+    locates the page in the deduped/rotated files, ``original_page`` is what
+    the user sees when they open their own PDF.
+    """
+    if rotation is None:
+        return []
+    kept = dedupe.kept_indices if dedupe else []
+    records = []
+    for d in rotation.decisions:
+        idx = d["page_idx"]
+        original_idx = kept[idx] if idx < len(kept) else idx
+        records.append(dict(
+            d,
+            applied=d["confidence"] in _APPLIED_CONFIDENCE,
+            original_idx=original_idx,
+            original_page=original_idx + 1,
+        ))
+    return records
+
+
+def page_fix_fields(dedupe: Optional[DedupeResult], rotation: Optional[RotationResult]) -> dict:
+    """The dedupe + rotation part of a document record.
+
+    Shared by the full pipeline and the page-fixes-only run, so the review
+    screen reads the same fields whichever produced the document.
+    """
+    return {
+        "page_count": dedupe.kept_page_count if dedupe else None,
+        "original_page_count": dedupe.original_page_count if dedupe else None,
+        "duplicates_removed": dedupe.duplicates_removed if dedupe else 0,
+        "duplicates": dedupe.duplicates if dedupe else [],
+        "pages_rotated": rotation.pages_rotated if rotation else 0,
+        "pages_for_review": rotation.pages_for_review if rotation else 0,
+        "rotations": rotation_records(rotation, dedupe),
+    }
+
+
+# --------------------------------------------------------------------------
+# Abstract page overrides
+# --------------------------------------------------------------------------
+# The OCR script accepts ``--override-csv`` naming each PDF's abstract pages
+# by hand, for theses whose heading it cannot find or finds in the wrong
+# place. People read those page numbers off their own PDF, but the script
+# reads the deduped copy, where every removed repeat shifts later pages down
+# by one. So the numbers are translated before they are handed over.
+
+_RE_PAGE_RANGE_INPUT = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
+
+
+def parse_page_range(value: str) -> Optional[tuple]:
+    """``"5-8"`` -> ``(5, 8)``, ``"5"`` -> ``(5, 5)``; blank -> None.
+
+    Raises ValueError on anything else, so a typo is refused up front rather
+    than silently ignored and the abstract auto-detected after all.
+    """
+    if value is None or not str(value).strip():
+        return None
+    m = _RE_PAGE_RANGE_INPUT.match(str(value))
+    if not m:
+        raise ValueError("'%s' is not a page range - use a form like 5-8 or 5." % value)
+    start = int(m.group(1))
+    end = int(m.group(2) or start)
+    if start < 1 or end < start:
+        raise ValueError("'%s' is not a valid page range." % value)
+    return start, end
+
+
+def map_pages_to_deduped(start: int, end: int, dedupe: Optional[DedupeResult]) -> Optional[tuple]:
+    """Translate 1-based original page numbers to the deduped copy's.
+
+    The range covers every kept page between ``start`` and ``end``, so a
+    removed repeat inside it is simply skipped. Returns None when no page in
+    the range survived (all repeats, or past the end of the document).
+    """
+    if dedupe is None:
+        return start, end
+    positions = [
+        position
+        for position, original in enumerate(dedupe.kept_indices)
+        if start - 1 <= original <= end - 1
+    ]
+    if not positions:
+        return None
+    return positions[0] + 1, positions[-1] + 1
+
+
+def write_override_csv(path: Path, ranges: dict) -> Path:
+    """Write ``{filename: (start, end)}`` in the script's own CSV format."""
+    import csv
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["filename", "pages"])
+        for filename, (start, end) in sorted(ranges.items()):
+            writer.writerow([filename, "%d-%d" % (start, end)])
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -303,6 +507,7 @@ def build_abstract_command(
     mode: str,
     ollama_url: str,
     confidence_threshold: float = 0.60,
+    override_csv: Optional[Path] = None,
 ) -> list:
     """Assemble the exact argv used to invoke the original OCR script.
 
@@ -318,6 +523,8 @@ def build_abstract_command(
         "--vlm-model", model,
         "--ollama-url", ollama_url,
     ]
+    if override_csv is not None:
+        cmd += ["--override-csv", str(override_csv)]
     cmd += VLM_MODES.get(mode, VLM_MODES[DEFAULT_VLM_MODE])["flags"]
     return cmd
 
@@ -329,6 +536,7 @@ def run_abstract_pass(
     mode: str = DEFAULT_VLM_MODE,
     ollama_url: str = DEFAULT_OLLAMA_URL,
     on_progress: Optional[Callable[[dict], None]] = None,
+    override_csv: Optional[Path] = None,
 ) -> int:
     """Run the original script over every PDF in ``input_dir``.
 
@@ -349,7 +557,8 @@ def run_abstract_pass(
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
 
-    cmd = build_abstract_command(input_dir, out_dir, model, mode, ollama_url)
+    cmd = build_abstract_command(input_dir, out_dir, model, mode, ollama_url,
+                                 override_csv=override_csv)
 
     def emit(**kwargs) -> None:
         if on_progress is not None:
@@ -894,6 +1103,8 @@ def collect_outputs(
     dedupe_results: dict,
     model_used: str,
     mode_used: str,
+    rotation_results: Optional[dict] = None,
+    abstract_pages: Optional[dict] = None,
 ) -> list:
     """Turn the script's "<stem> draft.txt" files into the app's own outputs.
 
@@ -930,24 +1141,55 @@ def collect_outputs(
         elif pages_path.exists():
             pages_path.unlink()
 
-        dedupe = dedupe_results.get(stem + ".pdf")
-        documents.append({
-            "name": stem,
-            "md_file": md_path.name,
-            "filename": stem + ".pdf",
-            "page_count": dedupe.kept_page_count if dedupe else None,
-            "original_page_count": dedupe.original_page_count if dedupe else None,
-            "duplicates_removed": dedupe.duplicates_removed if dedupe else 0,
-            "duplicates": dedupe.duplicates if dedupe else [],
-            "model_used": model_used,
-            "mode_used": mode_used,
-            "processed_at": datetime.now().isoformat(timespec="seconds"),
-            "flags": parsed["flags"],
-            "diffs": parsed["diffs"],
-            "recovery": parsed["recovery"],
-        })
+        filename = stem + ".pdf"
+        documents.append(dict(
+            {
+                "name": stem,
+                "md_file": md_path.name,
+                "filename": filename,
+                "fixes_only": False,
+                "abstract_pages": (abstract_pages or {}).get(filename),
+                "model_used": model_used,
+                "mode_used": mode_used,
+                "processed_at": datetime.now().isoformat(timespec="seconds"),
+                "flags": parsed["flags"],
+                "diffs": parsed["diffs"],
+                "recovery": parsed["recovery"],
+            },
+            **page_fix_fields(dedupe_results.get(filename),
+                              (rotation_results or {}).get(filename)),
+        ))
 
     return documents
+
+
+def collect_fix_outputs(pdfs: list, dedupe_results: dict, rotation_results: dict) -> list:
+    """Document records for a page-fixes-only run: no OCR, so no text.
+
+    ``md_file`` is None and the text fields are empty, which is how the
+    routes and the review screen tell these apart. The product of such a run
+    is the corrected PDF in ``rotated/`` itself.
+    """
+    processed_at = datetime.now().isoformat(timespec="seconds")
+    return [
+        dict(
+            {
+                "name": pdf.stem,
+                "md_file": None,
+                "filename": pdf.name,
+                "fixes_only": True,
+                "abstract_pages": None,
+                "model_used": None,
+                "mode_used": None,
+                "processed_at": processed_at,
+                "flags": [],
+                "diffs": [],
+                "recovery": [],
+            },
+            **page_fix_fields(dedupe_results.get(pdf.name), rotation_results.get(pdf.name)),
+        )
+        for pdf in pdfs
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -958,6 +1200,7 @@ def collect_outputs(
 # this module and the export route need to agree on them.
 UPLOADS_DIRNAME = "uploads"
 DEDUPED_DIRNAME = "deduped"
+ROTATED_DIRNAME = "rotated"
 DRAFTS_DIRNAME = "drafts"
 OUTPUT_DIRNAME = "output"
 
@@ -968,9 +1211,16 @@ def run_pipeline(
     mode: str,
     ollama_url: str = DEFAULT_OLLAMA_URL,
     report: Optional[Callable[..., None]] = None,
+    overrides: Optional[dict] = None,
+    fixes_only: bool = False,
 ) -> dict:
-    """Run dedupe on every uploaded PDF, then one batch OCR/VLM pass, then
-    collect the results.
+    """Run dedupe and then the rotation fix on every uploaded PDF, then one
+    batch OCR/VLM pass, then collect the results.
+
+    ``overrides`` maps an uploaded filename to its abstract pages as
+    ``(start, end)``, numbered as in the uploaded PDF. ``fixes_only`` stops
+    after the rotation fix -- for theses that have no abstract to read, where
+    the corrected PDF is the whole point.
 
     ``report`` is a plain callback taking keyword arguments. Passing a
     callback -- rather than having this module import the job store -- keeps
@@ -978,7 +1228,7 @@ def run_pipeline(
     ``pipeline``, never the reverse. That is also what makes this function
     runnable from a plain script or a test with no Flask involved at all.
 
-    Note the shape of the run: *all* dedupe work happens first, and then the
+    Note the shape of the run: *all* per-file work happens first, and then the
     OCR script is invoked exactly once for the whole batch. That ordering is
     not incidental -- see run_abstract_pass() for why the batch must stay
     whole.
@@ -989,6 +1239,7 @@ def run_pipeline(
 
     uploads_dir = workdir / UPLOADS_DIRNAME
     deduped_dir = workdir / DEDUPED_DIRNAME
+    rotated_dir = workdir / ROTATED_DIRNAME
     drafts_dir = workdir / DRAFTS_DIRNAME
     output_dir = workdir / OUTPUT_DIRNAME
 
@@ -1008,17 +1259,62 @@ def run_pipeline(
              kept=result.kept_page_count,
              original=result.original_page_count)
 
-    # --- Pass 2: the OCR + VLM abstract pass over the whole batch ---------
+    # --- Pass 2: turn sideways pages upright, before OCR reads them -------
+    emit(event="stage", stage="rotate", detail="Fixing sideways pages")
+    classifier = load_orientation_classifier()
+    rotation_results = {}
+    for index, pdf in enumerate(pdfs, 1):
+        emit(event="rotate_start", index=index, total=len(pdfs), filename=pdf.name)
+        rotation = fix_rotation_pdf(dedupe_results[pdf.name].deduped_path, rotated_dir,
+                                    classifier=classifier)
+        rotation_results[pdf.name] = rotation
+        emit(event="rotate_done", filename=pdf.name,
+             rotated=rotation.pages_rotated,
+             review=rotation.pages_for_review)
+
+    if fixes_only:
+        emit(event="stage", stage="collecting", detail="Collecting results")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        documents = collect_fix_outputs(pdfs, dedupe_results, rotation_results)
+        write_manifest(output_dir, documents)
+        return {"documents": documents, "exit_code": 0}
+
+    # --- Abstract page overrides, translated to the deduped copy ----------
+    override_csv = None
+    abstract_pages = {}
+    csv_ranges = {}
+    for pdf in pdfs:
+        requested = (overrides or {}).get(pdf.name)
+        if not requested:
+            continue
+        start, end = requested
+        mapped = map_pages_to_deduped(start, end, dedupe_results[pdf.name])
+        if mapped is None:
+            emit(event="log", detail="[override] %s: pages %d-%d were all removed or "
+                 "past the end - finding the abstract automatically instead"
+                 % (pdf.name, start, end))
+            continue
+        csv_ranges[pdf.name] = mapped
+        abstract_pages[pdf.name] = {"requested": "%d-%d" % (start, end),
+                                    "used": "%d-%d" % mapped}
+        emit(event="log", detail="[override] %s: abstract pages %d-%d (%d-%d after dedupe)"
+             % (pdf.name, start, end, mapped[0], mapped[1]))
+    if csv_ranges:
+        override_csv = write_override_csv(workdir / "overrides.csv", csv_ranges)
+
+    # --- Pass 3: the OCR + VLM abstract pass over the whole batch ---------
     emit(event="stage", stage="ocr", detail="Reading abstracts")
     exit_code = run_abstract_pass(
-        deduped_dir, drafts_dir,
+        rotated_dir, drafts_dir,
         model=model, mode=mode, ollama_url=ollama_url,
         on_progress=lambda payload: emit(**payload),
+        override_csv=override_csv,
     )
 
-    # --- Pass 3: turn the script's drafts into this app's outputs ---------
+    # --- Pass 4: turn the script's drafts into this app's outputs ---------
     emit(event="stage", stage="collecting", detail="Collecting results")
-    documents = collect_outputs(drafts_dir, output_dir, dedupe_results, model, mode)
+    documents = collect_outputs(drafts_dir, output_dir, dedupe_results, model, mode,
+                                rotation_results, abstract_pages)
     write_manifest(output_dir, documents)
 
     return {"documents": documents, "exit_code": exit_code}

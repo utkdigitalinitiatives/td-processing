@@ -27,6 +27,7 @@ from typing import Optional
 STATUS_QUEUED = "queued"
 STATUS_PREFLIGHT = "preflight"
 STATUS_DEDUPE = "dedupe"
+STATUS_ROTATE = "rotate"
 STATUS_OCR = "ocr"
 STATUS_COLLECTING = "collecting"
 STATUS_DONE = "done"
@@ -51,6 +52,11 @@ class Job:
     files: list = field(default_factory=list)          # original uploaded names
     model: str = ""
     mode: str = ""
+    # A page-fixes-only job stops after dedupe + rotation: no OCR, no text.
+    fixes_only: bool = False
+    # Abstract pages set by hand, as {filename: (start, end)} in the uploaded
+    # PDF's own page numbers.
+    overrides: dict = field(default_factory=dict)
 
     status: str = STATUS_QUEUED
     message: str = "Waiting to start."
@@ -179,6 +185,7 @@ class JobStore:
                 "error": job.error,
                 "model": job.model,
                 "mode": job.mode,
+                "fixes_only": job.fixes_only,
                 "files": job.files,
                 "file_index": job.file_index,
                 "file_total": job.file_total,
@@ -192,8 +199,11 @@ class JobStore:
                     {
                         "name": d["name"],
                         "filename": d["filename"],
+                        "fixes_only": d["fixes_only"],
                         "page_count": d["page_count"],
                         "duplicates_removed": d["duplicates_removed"],
+                        "pages_rotated": d["pages_rotated"],
+                        "pages_for_review": d["pages_for_review"],
                         "model_used": d["model_used"],
                         "flags": d["flags"],
                         "diff_pages": len(d["diffs"]),

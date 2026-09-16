@@ -109,9 +109,24 @@ button.ghost:disabled { opacity: .5; cursor: default; }
   font-size: 13px;
 }
 .file-list .state { font-size: 12px; color: var(--muted); }
+.file-list .file-name { flex: 1; min-width: 0; word-break: break-word; }
+.queue li { flex-wrap: wrap; }
+
+/* Abstract pages typed by hand, beside a staged file or a finished one. */
+.pages-input {
+  font: inherit; font-size: 12px; width: 150px;
+  padding: 4px 7px; border: 1px solid var(--line); border-radius: 6px; background: #fff;
+}
+.pages-input.is-invalid { border-color: var(--danger); background: #fdeceb; }
+
+/* Rerun controls under a finished queue row. */
+.rerun { flex-basis: 100%; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.rerun button.ghost { padding: 3px 10px; font-size: 12px; }
+select:disabled { background: #f1f3f6; color: var(--muted); }
 .queue .state.done { color: var(--ok); }
 .queue .state.skipped { color: var(--warn); }
-.queue .state.ocr, .queue .state.dedupe { color: var(--accent); }
+.queue .state.ocr, .queue .state.dedupe, .queue .state.rotate { color: var(--accent); }
+.queue .state.done, .queue .state.skipped { flex: 1; text-align: right; }
 
 /* ---------- Progress ---------- */
 .progress-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
@@ -152,6 +167,9 @@ button.ghost:disabled { opacity: .5; cursor: default; }
 .chip.equation { background: var(--flag-eq); border-color: #d3d8f7; color: #3b41a8; }
 .chip.diff { background: var(--flag-diff); border-color: #c9e6d5; color: var(--ok); }
 .chip.dirty { background: #fdeceb; border-color: #f6cfcc; color: var(--danger); }
+.chip.dedupe { background: #f1f3f6; border-color: #d9dee5; color: var(--muted); }
+.chip.rotate { background: #e7eefc; border-color: #cfe0fb; color: var(--accent); }
+.chip.rotate-review { background: var(--flag-low); border-color: #f0dcb4; color: var(--warn); }
 
 /* ---------- Workspace ---------- */
 .workspace { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
@@ -227,4 +245,24 @@ textarea#editor {
   margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line);
 }
 .recovery-body { padding: 10px 12px; }
+
+/* ---------- Page fixes view ---------- */
+.fix-section { margin-bottom: 18px; }
+.fix-section h3 { font-size: 13px; margin: 0; }
+.fix-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+.fix-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fafbfc; }
+.fix-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.page-thumb { margin: 0; min-width: 0; }
+.thumb-frame {
+  aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+  background: #fff; border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+}
+/* Capped at 72% so a page previewed with a CSS turn still fits the square:
+   the transform does not change the image's layout box. */
+.thumb-frame img { max-width: 72%; max-height: 100%; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+.page-thumb figcaption { font-size: 11.5px; color: var(--muted); margin-top: 4px; text-align: center; }
+.fix-caption { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
 .empty { color: var(--muted); font-size: 13px; padding: 18px; text-align: center; }

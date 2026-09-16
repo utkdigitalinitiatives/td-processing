@@ -111,6 +111,26 @@ python app.py
 
 3. Drop your PDFs and press **Run pipeline**.
 
+Every run first removes repeated pages and turns sideways pages upright, then
+reads the abstracts.
+
+**What to run** has a second option, **Page fixes only**. It removes repeats
+and turns sideways pages, and stops there: no OCR, no vision model, and Ollama
+does not need to be running. Use it for theses that have no abstract. The
+Review screen then shows the fixes, and **Download fixed PDFs** gives you the
+corrected files.
+
+**Abstract in the wrong place?** Each dropped file has a box for its abstract
+pages. Type them as numbered in your PDF (`5-8`, or `5` for one page) and the
+app uses those instead of searching for the heading. Leave it blank to search
+as usual. The app adjusts the numbers itself if repeated pages were removed
+before them.
+
+When a run finishes, every file in the queue gets a **Rerun abstract** button
+(with its own pages box) and a **Page fixes only** button. Either one starts a
+new run on just that file, without dropping it in again. The previous run's
+results are left alone.
+
 The progress bar shows which file is being processed and which page within it.
 The vision-model pass runs at the very end, after all OCR is finished, across
 the whole batch at once -- that is deliberate, see "How this is put together"
@@ -124,9 +144,18 @@ stacked equation it could not read, left as a placeholder), and `diff` (the
 vision model disagreed with the OCR somewhere on the page).
 
 The main pane has the raw text on the left and a live preview on the right.
-Type in the left, the right updates as you go. Two more tabs sit above it:
-**OCR vs VLM** shows the differences side by side, and **VLM recovery** shows
-the model's own transcription of flagged pages.
+Type in the left, the right updates as you go. More tabs sit above it:
+**OCR vs VLM** shows the differences side by side, **VLM recovery** shows
+the model's own transcription of flagged pages, and **Page fixes** shows
+what was changed in the PDF before OCR:
+
+- each repeated page that was removed, beside the page it matched;
+- each sideways page that was turned, as scanned and as corrected;
+- pages that *may* be sideways but were left alone because the evidence was
+  weak, with a preview of the suggested turn. Check these yourself.
+
+Page numbers on that tab are your PDF's own. The sidebar chips
+`repeat(s) removed`, `rotated` and `rotation check` show the counts.
 
 ### Applying differences in one click
 
@@ -165,9 +194,15 @@ Each run gets its own folder under `workdir/`, named by job id:
 workdir/<job_id>/
 ├── uploads/    the PDFs exactly as you dropped them
 ├── deduped/    the same PDFs with repeated pages removed
+├── rotated/    deduped, then sideways pages turned -- what OCR reads,
+│               and what "Download fixed PDFs" gives you
 ├── drafts/     the OCR script's own raw output
-└── output/     <doc>.md, <doc>.pages.json, manifest.json
+├── output/     <doc>.md, <doc>.pages.json, manifest.json
+└── overrides.csv   abstract pages you typed, if any, as the OCR script reads them
 ```
+
+Turning a page only changes its rotation setting inside the PDF. The scanned
+image is never re-saved, so nothing is lost.
 
 `workdir/` is git-ignored, so nothing you process is ever committed.
 
@@ -213,14 +248,15 @@ For anyone reading the code (the comments in each file go into more detail):
   this machine can reach it.
 - **`server/jobs.py`** tracks jobs in memory with a lock, because the worker
   thread writes progress while Flask reads it to answer `/status`.
-- **`pipeline/runner.py`** is the adapter layer. `dedupe.py` is imported and
-  called normally. `vlm_abstract.py` is driven through its command line
+- **`pipeline/runner.py`** is the adapter layer. `dedupe.py` and
+  `fix_rotation.py` are imported and called normally. `vlm_abstract.py` is driven through its command line
   instead, for three reasons: its deferred vision-model phase lives in
   `main()` and must run after all OCR is done (a loaded Ollama model breaks
   PaddleOCR's startup); it already re-launches itself as a subprocess; and it
   reports progress by printing, which a pipe can read without editing it.
-- **`pipeline/dedupe.py` and `pipeline/vlm_abstract.py`** are the two original
-  scripts, unmodified. The originals are also still in `source_scripts/`.
+- **`pipeline/dedupe.py`, `pipeline/fix_rotation.py` and
+  `pipeline/vlm_abstract.py`** are the original scripts, unmodified. The
+  originals are also still in `source_scripts/`.
 
 One thing worth knowing about the dedupe step: the original script *detects*
 duplicate pages but has no function that removes them. The removal is done in

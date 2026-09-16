@@ -32,6 +32,13 @@
     </p>
     <div class="controls">
       <label>
+        <span>What to run</span>
+        <select id="run-kind">
+          <option value="full" selected>Full pipeline - page fixes + abstract</option>
+          <option value="fixes">Page fixes only - remove repeats, turn sideways pages</option>
+        </select>
+      </label>
+      <label>
         <span>Vision model</span>
         <select id="model-select"></select>
       </label>
@@ -41,6 +48,11 @@
       </label>
     </div>
     <p class="hint" id="mode-help"></p>
+    <p class="hint" id="kind-help" hidden>
+      No OCR and no vision model: each PDF has its repeated pages removed and
+      its sideways pages turned, and you download the corrected PDFs. For
+      theses with no abstract to extract.
+    </p>
   </section>
 
   <section class="panel">
@@ -54,6 +66,11 @@
       </div>
       <input type="file" id="file-input" accept="application/pdf" multiple hidden>
     </div>
+    <p class="hint" id="pages-help">
+      Abstract found in the wrong place, or not at all? Type its pages next to
+      the file (e.g. <code>5-8</code>), numbered as in your PDF. Leave blank to
+      find it automatically.
+    </p>
     <ul id="pending-list" class="file-list"></ul>
     <div class="actions">
       <button id="run-btn" class="primary" disabled>Run pipeline</button>
@@ -104,9 +121,10 @@
           <p id="doc-meta" class="muted small"></p>
         </div>
         <div class="view-toggle">
-          <button class="tab is-active" data-view="edit">Edit</button>
+          <button class="tab is-active" data-view="edit" id="tab-edit">Edit</button>
           <button class="tab" data-view="diff" id="tab-diff">OCR vs VLM</button>
           <button class="tab" data-view="recovery" id="tab-recovery">VLM recovery</button>
+          <button class="tab" data-view="fixes" id="tab-fixes">Page fixes</button>
         </div>
       </div>
 
@@ -132,6 +150,12 @@
       <div id="view-recovery" class="view" hidden>
         <p class="hint" id="recovery-intro"></p>
         <div id="recovery-body"></div>
+      </div>
+
+      <!-- Page fixes view: repeated pages removed and sideways pages turned,
+           each shown as page images so the fix can be checked at a glance. -->
+      <div id="view-fixes" class="view" hidden>
+        <div id="fixes-body"></div>
       </div>
     </section>
   </div>
