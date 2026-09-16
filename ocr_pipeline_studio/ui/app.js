@@ -345,9 +345,12 @@
       }
       state.documents = status.documents || [];
       state.fixesOnly = !!status.fixes_only;
-      // A fixes-only job has no text to save; what it exports is the PDFs.
+      // A fixes-only job has no text to save; its product is the PDFs, which
+      // are already on disk.
       show($("save-btn"), !state.fixesOnly);
-      $("export-btn").textContent = state.fixesOnly ? "Download fixed PDFs" : "Export";
+      $("save-status").textContent = state.fixesOnly
+        ? "Corrected PDFs are in the fixed folder - use Open folder."
+        : "";
       if (state.documents.length) {
         $("tab-review").disabled = false;
         renderDocList();
@@ -988,7 +991,7 @@
     });
   }
 
-  // ---------- editing, saving, exporting ----------
+  // ---------- editing and saving ----------
 
   function onEditorInput() {
     renderPreview();
@@ -1016,37 +1019,8 @@
       state.dirty = {};
       renderDocList();
       $("save-status").textContent = result.written.length
-        ? "Saved " + result.written.length + " file(s) to workdir."
+        ? "Saved " + result.written.length + " file(s) - use Open folder to find them in output."
         : "Nothing to save.";
-    });
-  }
-
-  function exportDocs() {
-    // Fetched into a blob and handed to a synthetic <a download> rather than
-    // navigating to the route: /export takes a JSON body, which a plain link
-    // or form submission cannot send.
-    fetch("/export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: state.jobId })
-    }).then(function (resp) {
-      if (!resp.ok) { return resp.json().then(function (b) { throw new Error(b.error); }); }
-      var disposition = resp.headers.get("Content-Disposition") || "";
-      var match = /filename="?([^"]+)"?/.exec(disposition);
-      var filename = match ? match[1] : "export.md";
-      return resp.blob().then(function (blob) {
-        var url = URL.createObjectURL(blob);
-        var link = document.createElement("a");
-        link.href = url;
-        link.download = filename;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
-        $("save-status").textContent = "Exported " + filename + ".";
-      });
-    }).catch(function (err) {
-      $("save-status").textContent = "Export failed: " + err.message;
     });
   }
 
@@ -1062,7 +1036,6 @@
     updateRunKind();
     on($("editor"), "input", onEditorInput);
     on($("save-btn"), "click", saveEdits);
-    on($("export-btn"), "click", exportDocs);
     on($("open-folder-btn"), "click", openFolder);
 
     document.querySelectorAll(".topbar .tab").forEach(function (tab) {

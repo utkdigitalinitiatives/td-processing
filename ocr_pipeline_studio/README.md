@@ -5,7 +5,7 @@ A local desktop app for pulling abstracts out of scanned PDF theses.
 Drop PDFs on the window. The app removes repeated/duplicate pages, runs the
 pages through PaddleOCR, optionally has a local vision model re-read them, and
 then gives you an editor with a live preview so you can fix up the result
-before exporting it.
+before saving it.
 
 **Everything runs on this machine.** The only network traffic is to Ollama on
 `localhost:11434`. Nothing is ever sent to the internet.
@@ -117,8 +117,8 @@ reads the abstracts.
 **What to run** has a second option, **Page fixes only**. It removes repeats
 and turns sideways pages, and stops there: no OCR, no vision model, and Ollama
 does not need to be running. Use it for theses that have no abstract. The
-Review screen then shows the fixes, and **Download fixed PDFs** gives you the
-corrected files.
+Review screen then shows the fixes, and the corrected PDFs are in the run's
+`fixed/` folder -- **Open folder** takes you there.
 
 **Abstract in the wrong place?** Each dropped file has a box for its abstract
 pages. Type them as numbered in your PDF (`5-8`, or `5` for one page) and the
@@ -178,11 +178,8 @@ than pretending otherwise:
   entirely, so there is no existing text to swap out.
 
 Nothing here touches the files on disk. Applying, reverting and typing all
-stay in memory until you press **Save edits** or **Export**.
-
-Edits live in memory until you press something. **Save edits** writes them
-back to the `.md` files in `workdir/`; **Export** downloads them (one document
-as a single `.md`, several as a `.zip`).
+stay in memory until you press **Save edits**, which writes them back to the
+`.md` files in the run's `output/` folder. **Open folder** takes you there.
 
 ---
 
@@ -201,8 +198,7 @@ The **Open folder** button in the top bar opens the current run's folder (or
 workdir/<date>_<time>_<first file>/
 ├── uploads/    the PDFs exactly as you dropped them
 ├── fixed/      the PDFs with repeated pages removed and sideways pages
-│               turned -- what OCR reads, and what "Download fixed PDFs"
-│               gives you
+│               turned -- what OCR reads, and the corrected PDFs to keep
 ├── drafts/     the OCR script's own raw output
 ├── output/     <doc>.md, <doc>.pages.json, manifest.json
 └── overrides.csv   abstract pages you typed, if any, as the OCR script reads them
