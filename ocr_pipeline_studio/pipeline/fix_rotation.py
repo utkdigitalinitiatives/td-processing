@@ -69,7 +69,7 @@ def textlayer_rotation(page) -> tuple[int | None, int, int]:
     """
     votes: dict[int, int] = {}
 
-    for block in page.get_text("dict")["blocks"]:
+    for block in page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]:
         for line in block.get("lines", []):
             dx, dy = line["dir"]
             if abs(dx) >= HORIZONTAL_DIR_CUTOFF:
