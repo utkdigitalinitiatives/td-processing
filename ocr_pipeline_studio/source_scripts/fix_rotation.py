@@ -92,16 +92,10 @@ def textlayer_rotation(page) -> tuple[int | None, int, int]:
         return None, total, 0
 
     if winner == 0:
-        # Horizontal text is not evidence of anything, because OCR that was
-        # blind to rotation reads a sideways table as horizontal garbage. It
-        # especially must not reach the subtraction below, which would turn a
-        # page this script had already corrected into a confident demand to
-        # rotate it straight back.
+        # The text layer is already upright, so the page is either already rotated or
+        # it is a mixed page that cannot be fixed. Either way, do not report it
         return None, total, 0
 
-    # These vectors are in unrotated page space and ignore any /Rotate the page
-    # already carries, so discount it -- otherwise an already-corrected file
-    # reports itself as still needing the same rotation.
     return (winner - page.rotation) % 360, total, winner
 
 
@@ -175,23 +169,13 @@ def decide_rotation(
     # layer outranks the image classifier, and a horizontal one does not.
     if tl_rotation:
         if tl_rotation == img_rotation:
-            # Corroboration beats either detector's own score; in testing this
-            # held up on classifier scores as low as 0.48.
+            # Corroboration beats either detector's own score
             return tl_rotation, "high", "text layer + image agree"
-        # An uncorroborated 180 is refused here for the same reason it is
-        # refused further down when the image is the one proposing it: a bound
-        # thesis is scanned one way round, so a genuinely upside-down page is
-        # rare, while a wrong 180 is what a patch of bad direction vectors
-        # looks like. Checked by eye across two documents, every one of these
-        # was a page that was already the right way up.
         if tl_rotation == 180:
             return 180, "review", "only the text layer says 180"
         return tl_rotation, "high", "text layer majority"
 
-    # Nothing left to do, but the raw text ran vertically -- so the page already
-    # carries a /Rotate that cancels it. It is upright whatever the image says,
-    # and the image often does disagree here, because a wide table displayed
-    # landscape is exactly what the classifier is weakest on.
+
     if tl_rotation == 0 and tl_raw:
         return 0, "clean", "already rotated, text layer agrees"
 
@@ -204,16 +188,10 @@ def decide_rotation(
         return img_rotation, "review", f"image only, near-blank page, score {score:.2f}"
 
     # The page did not read as upright once turned this far, so the model has
-    # spotted that it is sideways without settling which way round. Applying a
-    # guess here is how a table ends up upside down instead of merely rotated.
+    # spotted that it is sideways without settling which way round
     if not img_verified:
         return img_rotation, "review", f"image unsure which way round, score {score:.2f}"
-
-    # An uncorroborated 180 never gets applied, whatever it scores. A bound
-    # thesis is scanned one way round, so a genuinely upside-down page is rare,
-    # while a wide table turned 90 degrees is routine -- and in testing every
-    # image-only 180 on a page with real content was a page already upright.
-    # A 180 the text layer agrees with is handled above and still applies.
+ 
     if img_rotation == 180:
         return 180, "review", f"image only, 180 needs a human, score {score:.2f}"
 
@@ -341,17 +319,6 @@ def find_and_fix_rotations(
             min_score=min_score,
         )
 
-        # Whatever settled it, a page about to be turned has to read as upright
-        # once turned. The image check above already established exactly that
-        # for its own answer, so only a rotation it did not verify is re-read
-        # here -- which is how the text layer gets checked. Being measured
-        # geometry does not make it right: where the OCR wrote garbled
-        # direction vectors it is confidently and consistently wrong, and
-        # nothing else was looking.
-        # Two independent signals already pointing the same way is the strongest
-        # evidence available, so a rotation resting on both is left alone. Only
-        # one resting on a single signal gets re-read -- which is the text layer
-        # on its own, or the image on its own where its check confirmed nothing.
         independently_backed = bool(rotation) and rotation == img_rotation and (
             img_verified or tl_rotation == rotation
         )
@@ -439,9 +406,7 @@ def scan_directory(
         print("--apply needs an output directory (-o). Refusing to guess one.")
         return
 
-    # --apply promises the originals are left alone, so an -o that resolves to a
-    # folder the PDFs are already in is a contradiction rather than a shortcut.
-    # Caught here so it fails immediately instead of part-way through a batch.
+    # Check for conflicting output directory
     if apply and out_path is not None:
         clashing = [p for p in pdf_files if p.parent.resolve() == out_path.resolve()]
         if clashing:
