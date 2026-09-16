@@ -128,7 +128,7 @@ button.ghost:disabled { opacity: .5; cursor: default; }
 select:disabled { background: #f1f3f6; color: var(--muted); }
 .queue .state.done { color: var(--ok); }
 .queue .state.skipped { color: var(--warn); }
-.queue .state.ocr, .queue .state.dedupe, .queue .state.rotate { color: var(--accent); }
+.queue .state.ocr, .queue .state.fixing { color: var(--accent); }
 .queue .state.done, .queue .state.skipped { flex: 1; text-align: right; }
 
 /* ---------- Progress ---------- */

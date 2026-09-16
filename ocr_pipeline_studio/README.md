@@ -200,16 +200,18 @@ The **Open folder** button in the top bar opens the current run's folder (or
 ```
 workdir/<date>_<time>_<first file>/
 ├── uploads/    the PDFs exactly as you dropped them
-├── deduped/    the same PDFs with repeated pages removed
-├── rotated/    deduped, then sideways pages turned -- what OCR reads,
-│               and what "Download fixed PDFs" gives you
+├── fixed/      the PDFs with repeated pages removed and sideways pages
+│               turned -- what OCR reads, and what "Download fixed PDFs"
+│               gives you
 ├── drafts/     the OCR script's own raw output
 ├── output/     <doc>.md, <doc>.pages.json, manifest.json
 └── overrides.csv   abstract pages you typed, if any, as the OCR script reads them
 ```
 
-Turning a page only changes its rotation setting inside the PDF. The scanned
-image is never re-saved, so nothing is lost.
+Both fixes are found on the PDF you dropped and written out together, in a
+single save per file. Turning a page only changes its rotation setting inside
+the PDF; the scanned images themselves are never re-encoded, so nothing is
+lost.
 
 `workdir/` is git-ignored, so nothing you process is ever committed.
 

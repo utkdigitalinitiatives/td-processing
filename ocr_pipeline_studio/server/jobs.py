@@ -26,8 +26,7 @@ from typing import Optional
 # and read there directly; an enum would only have to be converted back.
 STATUS_QUEUED = "queued"
 STATUS_PREFLIGHT = "preflight"
-STATUS_DEDUPE = "dedupe"
-STATUS_ROTATE = "rotate"
+STATUS_FIXING = "fixing"
 STATUS_OCR = "ocr"
 STATUS_COLLECTING = "collecting"
 STATUS_DONE = "done"
@@ -52,7 +51,7 @@ class Job:
     files: list = field(default_factory=list)          # original uploaded names
     model: str = ""
     mode: str = ""
-    # A page-fixes-only job stops after dedupe + rotation: no OCR, no text.
+    # A page-fixes-only job stops after the page fixes: no OCR, no text.
     fixes_only: bool = False
     # Abstract pages set by hand, as {filename: (start, end)} in the uploaded
     # PDF's own page numbers.

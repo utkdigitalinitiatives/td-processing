@@ -251,11 +251,11 @@ def _launch_job(job, files: list, options: dict):
                     "mode": options["mode"], "fixes_only": options["fixes_only"]})
 
 
-def _rotation_detail(rotated: int, review: int) -> str:
-    """One queue-row phrase for a file's rotation pass."""
-    if not rotated and not review:
-        return "no sideways pages"
+def _fixes_detail(removed: int, rotated: int, review: int) -> str:
+    """One queue-row phrase for a file's page fixes; empty when there were none."""
     parts = []
+    if removed:
+        parts.append("%d repeated page(s) removed" % removed)
     if rotated:
         parts.append("%d page(s) rotated" % rotated)
     if review:
@@ -298,35 +298,23 @@ def _run_job(app, job_id: str) -> None:
             if kind == "stage":
                 stage = event.get("stage")
                 status = {
-                    "dedupe": jobstate.STATUS_DEDUPE,
-                    "rotate": jobstate.STATUS_ROTATE,
+                    "fixes": jobstate.STATUS_FIXING,
                     "ocr": jobstate.STATUS_OCR,
                     "collecting": jobstate.STATUS_COLLECTING,
                 }.get(stage, jobstate.STATUS_OCR)
                 store.update(job_id, status=status, message=event.get("detail", stage))
 
-            elif kind == "dedupe_start":
+            elif kind == "fix_start":
                 store.update(job_id, current_file=event.get("filename"),
                              file_index=event.get("index", 0),
-                             message="Checking for repeated pages")
-                store.set_file_state(job_id, event["filename"], "dedupe")
+                             message="Checking for repeated and sideways pages")
+                store.set_file_state(job_id, event["filename"], "fixing")
 
-            elif kind == "dedupe_done":
-                removed = event.get("removed", 0)
-                detail = ("%d repeated page(s) removed" % removed) if removed else "no repeats"
-                store.set_file_state(job_id, event["filename"], "deduped", detail)
-                store.append_log(job_id, "[dedupe] %s: %s" % (event["filename"], detail))
-
-            elif kind == "rotate_start":
-                store.update(job_id, current_file=event.get("filename"),
-                             file_index=event.get("index", 0),
-                             message="Checking for sideways pages")
-                store.set_file_state(job_id, event["filename"], "rotate")
-
-            elif kind == "rotate_done":
-                detail = _rotation_detail(event.get("rotated", 0), event.get("review", 0))
-                store.set_file_state(job_id, event["filename"], "rotated", detail)
-                store.append_log(job_id, "[rotate] %s: %s" % (event["filename"], detail))
+            elif kind == "fix_done":
+                detail = _fixes_detail(event.get("removed", 0), event.get("rotated", 0),
+                                       event.get("review", 0)) or "no page fixes needed"
+                store.set_file_state(job_id, event["filename"], "fixed", detail)
+                store.append_log(job_id, "[fixes] %s: %s" % (event["filename"], detail))
 
             elif kind == "file_index":
                 store.update(job_id, file_index=event.get("index", 0),
@@ -387,10 +375,10 @@ def _run_job(app, job_id: str) -> None:
                 parts = [] if doc["fixes_only"] else ["%d flag(s)" % len(doc["flags"])]
                 if doc["abstract_pages"]:
                     parts.append("abstract pages %s" % doc["abstract_pages"]["requested"])
-                if doc["duplicates_removed"]:
-                    parts.append("%d repeated page(s) removed" % doc["duplicates_removed"])
-                if doc["pages_rotated"] or doc["pages_for_review"]:
-                    parts.append(_rotation_detail(doc["pages_rotated"], doc["pages_for_review"]))
+                fixes = _fixes_detail(doc["duplicates_removed"], doc["pages_rotated"],
+                                      doc["pages_for_review"])
+                if fixes:
+                    parts.append(fixes)
                 if doc["fixes_only"] and not parts:
                     parts.append("no page fixes needed")
                 store.set_file_state(job_id, doc["filename"], "done", ", ".join(parts))
@@ -597,8 +585,7 @@ def document(job_id: str, name: str):
 # folders, so the route cannot be pointed anywhere else on disk.
 _PAGE_IMAGE_SOURCES = {
     "original": runner.UPLOADS_DIRNAME,
-    "deduped": runner.DEDUPED_DIRNAME,
-    "rotated": runner.ROTATED_DIRNAME,
+    "fixed": runner.FIXED_DIRNAME,
 }
 
 # PyMuPDF is not thread-safe, and Flask answers each thumbnail request on its
@@ -612,7 +599,7 @@ def page_image(job_id: str, source: str, page_idx: int, name: str):
 
     ``page_idx`` is 0-based within the chosen copy. Rendering respects the
     page's /Rotate, which is exactly what makes a rotation fix visible: the
-    deduped copy shows the page as scanned, the rotated copy as corrected.
+    original shows the page as scanned, the fixed copy as corrected.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -844,13 +831,13 @@ def export():
 def _export_fixed_pdfs(job, selected: list):
     """Download a page-fixes-only job's corrected PDFs.
 
-    The file in ``rotated/`` is the finished product: repeats removed, then
+    The file in ``fixed/`` is the finished product: repeats removed and
     sideways pages turned. Unlike abstracts these can run to tens of MB, so a
     batch is zipped to a file in the job folder rather than in memory, and
     stored uncompressed -- PDF scans are already compressed.
     """
-    rotated_dir = job.workdir / runner.ROTATED_DIRNAME
-    pdfs = [rotated_dir / d["filename"] for d in selected]
+    fixed_dir = job.workdir / runner.FIXED_DIRNAME
+    pdfs = [fixed_dir / d["filename"] for d in selected]
     missing = [p.name for p in pdfs if not p.exists()]
     if missing:
         return jsonify({"error": "Fixed PDF missing for: %s" % ", ".join(missing)}), 404

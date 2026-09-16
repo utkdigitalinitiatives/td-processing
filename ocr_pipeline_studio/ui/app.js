@@ -563,7 +563,7 @@
         if (doc.abstract_pages) {
           meta.push("abstract pages " + doc.abstract_pages.requested + " set by hand");
         }
-        if (doc.page_count != null) { meta.push(doc.page_count + " pages after dedupe"); }
+        if (doc.page_count != null) { meta.push(doc.page_count + " pages after fixes"); }
         if (doc.duplicates_removed) { meta.push(doc.duplicates_removed + " repeated page(s) removed"); }
         if (doc.pages_rotated) { meta.push(doc.pages_rotated + " sideways page(s) rotated"); }
         if (doc.model_used) { meta.push("model: " + doc.model_used); }
@@ -884,8 +884,8 @@
         applied.map(function (r) {
           return fixCard(
             [
-              pageFigure(doc, "deduped", r.page_idx, "Page " + r.original_page + " - as scanned", 0),
-              pageFigure(doc, "rotated", r.page_idx, "Turned " + r.rotation + "°", 0)
+              pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
+              pageFigure(doc, "fixed", r.fixed_idx, "Turned " + r.rotation + "°", 0)
             ],
             r.confidence + " confidence: " + r.why
           );
@@ -901,8 +901,8 @@
         review.map(function (r) {
           return fixCard(
             [
-              pageFigure(doc, "deduped", r.page_idx, "Page " + r.original_page + " - as scanned", 0),
-              pageFigure(doc, "deduped", r.page_idx, "If turned " + r.rotation + "°", r.rotation)
+              pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
+              pageFigure(doc, "original", r.original_idx, "If turned " + r.rotation + "°", r.rotation)
             ],
             r.why
           );

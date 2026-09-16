@@ -45,7 +45,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-import fitz  # PyMuPDF -- used only to *write* the deduped PDF, see dedupe_pdf()
+import fitz  # PyMuPDF -- used only to *write* the fixed PDF, see fix_pdf()
 
 # The original detector, imported and used exactly as written.
 from pipeline.dedupe import find_and_export_duplicates
@@ -200,114 +200,61 @@ def preflight(model: str, ollama_url: str = DEFAULT_OLLAMA_URL, mode: str = DEFA
 
 
 # --------------------------------------------------------------------------
-# Stage 1: dedupe
+# Stage 1: page fixes -- remove repeated pages, turn sideways ones upright
 # --------------------------------------------------------------------------
+# Both original scripts detect on the uploaded PDF, and their findings are
+# then written out together in a single save into fixed/. Each script still
+# reads the file in its own way -- their per-page logic is theirs, and is not
+# merged or copied here -- but no intermediate copy is ever written: one read
+# per script, one write per PDF.
+
+# The confidence levels fix_rotation.py actually applies. "review" pages are
+# reported but left alone -- the script's own rule, mirrored here only so the
+# pages turned below are exactly the ones it would have turned.
+_APPLIED_CONFIDENCE = ("high", "medium")
+
 
 @dataclass
-class DedupeResult:
-    """What one PDF's dedupe pass produced.
+class PageFixResult:
+    """What one PDF's page fixes found and did.
 
     A dataclass rather than a bare dict because these fields flow straight
     into manifest.json, and a typo in a dict key would only surface much
     later, in the UI, as a missing number.
     """
     source_name: str
-    deduped_path: Path
+    fixed_path: Path
     original_page_count: int
-    kept_page_count: int
-    duplicates: list = field(default_factory=list)
     # 0-based page numbers of the original PDF, in the order they were kept.
-    # Position i in the deduped PDF is original page kept_indices[i], which is
-    # how later stages report pages in numbers the user will recognise.
+    # Position i in the fixed PDF is original page kept_indices[i].
     kept_indices: list = field(default_factory=list)
+    # dedupe.py's findings, one dict per repeated page:
+    #   {dupe_idx, orig_idx, duplicate_page, original_page, score, folio}
+    duplicates: list = field(default_factory=list)
+    # fix_rotation.py's decisions for pages that were kept, numbered as in
+    # the original PDF:
+    #   {page_idx, page, rotation, confidence, why, score, contradicted, img_agreed}
+    rotations: list = field(default_factory=list)
+
+    @property
+    def kept_page_count(self) -> int:
+        return len(self.kept_indices)
 
     @property
     def duplicates_removed(self) -> int:
         return self.original_page_count - self.kept_page_count
 
-
-def dedupe_pdf(pdf_path: Path, deduped_dir: Path) -> DedupeResult:
-    """Detect repeated pages with the original script, then write a copy of
-    the PDF with those pages dropped.
-
-    Note on the split of responsibilities: ``dedupe.py`` *detects* duplicates
-    and can export a side-by-side comparison PDF, but it has no function that
-    removes pages. Rather than edit it, the removal is done here, driven
-    entirely by the ``dupe_idx`` values the original returned. All of the
-    actual matching logic -- the length guard, the folio gate, the fuzzy
-    ratio threshold -- stays in the original file, untouched.
-    """
-    deduped_dir.mkdir(parents=True, exist_ok=True)
-
-    # The original returns a list of dicts, one per duplicate page found:
-    #   {dupe_idx, orig_idx, duplicate_page, original_page, score, folio}
-    # We pass no output_dir, so it does not write its comparison PDF -- only
-    # the detection result is wanted here.
-    duplicates = find_and_export_duplicates(pdf_path)
-
-    # 0-based indices of pages to drop. A set because several later pages can
-    # each match the same earlier original, and a page must only be dropped
-    # once.
-    dupe_indices = {int(d["dupe_idx"]) for d in duplicates}
-
-    out_path = deduped_dir / pdf_path.name
-    doc = fitz.open(pdf_path)
-    try:
-        original_page_count = doc.page_count
-        keep = [i for i in range(original_page_count) if i not in dupe_indices]
-
-        # Defensive: if detection somehow flagged everything, keep the file
-        # intact rather than writing a zero-page PDF that would break OCR.
-        if not keep:
-            keep = list(range(original_page_count))
-
-        # select() rewrites the document to exactly this page list, in order.
-        doc.select(keep)
-        doc.save(out_path, garbage=4, deflate=True)
-        kept_page_count = len(keep)
-    finally:
-        doc.close()
-
-    return DedupeResult(
-        source_name=pdf_path.name,
-        deduped_path=out_path,
-        original_page_count=original_page_count,
-        kept_page_count=kept_page_count,
-        duplicates=duplicates,
-        kept_indices=keep,
-    )
-
-
-# --------------------------------------------------------------------------
-# Stage 1b: fix sideways pages
-# --------------------------------------------------------------------------
-
-# The confidence levels fix_rotation.py actually applies. "review" pages are
-# reported but left alone -- the script's own rule, mirrored here only so the
-# counts below agree with what it wrote.
-_APPLIED_CONFIDENCE = ("high", "medium")
-
-
-@dataclass
-class RotationResult:
-    """What one PDF's rotation pass produced."""
-    source_name: str
-    rotated_path: Path
-    # One dict per page the script had something to say about:
-    #   {page_idx, page, rotation, confidence, why, score, contradicted, img_agreed}
-    decisions: list = field(default_factory=list)
-
     @property
     def pages_rotated(self) -> int:
-        return sum(1 for d in self.decisions if d["confidence"] in _APPLIED_CONFIDENCE)
+        return sum(1 for d in self.rotations if d["confidence"] in _APPLIED_CONFIDENCE)
 
     @property
     def pages_for_review(self) -> int:
-        return sum(1 for d in self.decisions if d["confidence"] == "review")
+        return sum(1 for d in self.rotations if d["confidence"] == "review")
 
 
 def load_orientation_classifier():
-    """Build the orientation model the script uses, once per batch.
+    """Build the orientation model the rotation script uses, once per batch.
 
     The script builds this inside scan_directory(), which we do not call (it
     only prints its results), so the same construction is repeated here.
@@ -318,94 +265,139 @@ def load_orientation_classifier():
     return DocImgOrientationClassification(model_name=ORIENTATION_MODEL)
 
 
-def fix_rotation_pdf(
+def fix_pdf(
     pdf_path: Path,
-    rotated_dir: Path,
+    fixed_dir: Path,
     classifier=None,
     dpi: int = 100,
     min_score: float = 0.70,
-) -> RotationResult:
-    """Detect sideways pages with the original script and write a copy of the
-    PDF with their /Rotate set, into ``rotated_dir``.
+) -> PageFixResult:
+    """Find repeated and sideways pages with the original scripts, then write
+    one corrected copy of the PDF into ``fixed_dir``.
 
-    Driven through ``find_and_fix_rotations(apply=True)``, the script's own
-    "corrected copy into an output folder" mode, so the detection and the
-    lossless write are both exactly as written. The one gap filled here: the
-    script writes nothing for a PDF with no sideways pages, but the next stage
-    reads the whole folder, so clean PDFs are copied across unchanged.
+    Split of responsibilities: ``dedupe.py`` *detects* duplicates but has no
+    function that removes pages, and ``fix_rotation.py`` is called in its
+    detect-only mode. So both writes happen here, driven entirely by what the
+    scripts returned: pages are dropped by ``dupe_idx``, and each applied
+    rotation is added to the page's /Rotate exactly as the rotation script's
+    own apply step does. All of the matching and deciding stays in the
+    original files, untouched.
+
+    Rotation is detected on the original page order, repeats included, so no
+    deduped copy has to be written first. Decisions about pages that are then
+    removed as repeats are dropped.
     """
-    rotated_dir.mkdir(parents=True, exist_ok=True)
+    fixed_dir.mkdir(parents=True, exist_ok=True)
 
-    # The script refuses this same case in scan_directory(), which we bypass:
-    # apply=True into the source's own folder would overwrite the original.
-    if pdf_path.parent.resolve() == rotated_dir.resolve():
-        raise ValueError("rotated_dir must differ from the folder holding %s" % pdf_path.name)
+    # Writing into the source's own folder would overwrite the original.
+    if pdf_path.parent.resolve() == fixed_dir.resolve():
+        raise ValueError("fixed_dir must differ from the folder holding %s" % pdf_path.name)
 
     if classifier is None:
         classifier = load_orientation_classifier()
 
-    decisions = find_and_fix_rotations(
-        pdf_path,
-        classifier,
-        output_dir=rotated_dir,
-        apply=True,
-        dpi=dpi,
-        min_score=min_score,
-    )
+    # We pass no output_dir, so it does not write its comparison PDF -- only
+    # the detection result is wanted here.
+    duplicates = find_and_export_duplicates(pdf_path)
 
-    result = RotationResult(
+    # No output_dir and apply=False: the script only reports, it writes nothing.
+    decisions = find_and_fix_rotations(pdf_path, classifier, dpi=dpi, min_score=min_score)
+
+    doc = fitz.open(pdf_path)
+    try:
+        original_page_count = doc.page_count
+
+        # 0-based indices of pages to drop. A set because several later pages
+        # can each match the same earlier original, and a page must only be
+        # dropped once.
+        dupe_indices = {int(d["dupe_idx"]) for d in duplicates}
+        keep = [i for i in range(original_page_count) if i not in dupe_indices]
+
+        # Defensive: if detection somehow flagged everything, keep the file
+        # intact rather than writing a zero-page PDF that would break OCR.
+        if not keep:
+            keep = list(range(original_page_count))
+
+        kept = set(keep)
+        rotations = [d for d in decisions if d["page_idx"] in kept]
+        to_rotate = [d for d in rotations if d["confidence"] in _APPLIED_CONFIDENCE]
+        removing = len(keep) < original_page_count
+
+        out_path = fixed_dir / pdf_path.name
+        if not removing and not to_rotate:
+            doc.close()
+            # Copied, and copied even over a file of that name, so a stale
+            # copy from an earlier run can never be picked up.
+            shutil.copy2(pdf_path, out_path)
+        else:
+            if removing:
+                # select() rewrites the document to exactly this page list.
+                doc.select(keep)
+            position = {original: new for new, original in enumerate(keep)}
+            for d in to_rotate:
+                page = doc[position[d["page_idx"]]]
+                # Added, not assigned: some PDFs already carry a /Rotate.
+                page.set_rotation((page.rotation + d["rotation"]) % 360)
+
+            if removing:
+                # Removed pages leave unreferenced objects behind; garbage
+                # collection is what actually takes them out of the file.
+                doc.save(out_path, garbage=4, deflate=True)
+            else:
+                # Rotation only: no garbage/deflate, so only the page
+                # dictionaries differ from the original -- the rotation
+                # script's own rule for a lossless fix.
+                doc.save(out_path)
+    finally:
+        if not doc.is_closed:
+            doc.close()
+
+    return PageFixResult(
         source_name=pdf_path.name,
-        rotated_path=rotated_dir / pdf_path.name,
-        decisions=decisions,
+        fixed_path=out_path,
+        original_page_count=original_page_count,
+        kept_indices=keep,
+        duplicates=duplicates,
+        rotations=rotations,
     )
 
-    # Copied rather than skipped, and copied even if a file of that name is
-    # already there, so a stale copy from an earlier run can never be picked up.
-    if not result.pages_rotated:
-        shutil.copy2(pdf_path, result.rotated_path)
 
-    return result
+def rotation_records(result: Optional[PageFixResult]) -> list:
+    """The rotation script's decisions, located in both copies of the PDF.
 
-
-def rotation_records(rotation: Optional[RotationResult], dedupe: Optional[DedupeResult]) -> list:
-    """The script's per-page decisions, with each page also numbered as it
-    was in the uploaded PDF.
-
-    The rotation pass runs on the deduped copy, so its ``page`` numbers shift
-    past every removed duplicate. The UI shows both: ``page_idx`` is what
-    locates the page in the deduped/rotated files, ``original_page`` is what
-    the user sees when they open their own PDF.
+    ``original_idx`` / ``original_page`` place the page in the uploaded PDF
+    (the numbers the user sees when opening their own file); ``fixed_idx``
+    places it in the fixed copy, which is shorter by every removed repeat.
     """
-    if rotation is None:
+    if result is None:
         return []
-    kept = dedupe.kept_indices if dedupe else []
-    records = []
-    for d in rotation.decisions:
-        idx = d["page_idx"]
-        original_idx = kept[idx] if idx < len(kept) else idx
-        records.append(dict(
+    position = {original: new for new, original in enumerate(result.kept_indices)}
+    return [
+        dict(
             d,
             applied=d["confidence"] in _APPLIED_CONFIDENCE,
-            original_idx=original_idx,
-            original_page=original_idx + 1,
-        ))
-    return records
+            original_idx=d["page_idx"],
+            original_page=d["page_idx"] + 1,
+            fixed_idx=position[d["page_idx"]],
+        )
+        for d in result.rotations
+    ]
 
 
-def page_fix_fields(dedupe: Optional[DedupeResult], rotation: Optional[RotationResult]) -> dict:
-    """The dedupe + rotation part of a document record.
+def page_fix_fields(result: Optional[PageFixResult]) -> dict:
+    """The page-fixes part of a document record.
 
     Shared by the full pipeline and the page-fixes-only run, so the review
     screen reads the same fields whichever produced the document.
     """
     return {
-        "page_count": dedupe.kept_page_count if dedupe else None,
-        "original_page_count": dedupe.original_page_count if dedupe else None,
-        "duplicates_removed": dedupe.duplicates_removed if dedupe else 0,
-        "duplicates": dedupe.duplicates if dedupe else [],
-        "pages_rotated": rotation.pages_rotated if rotation else 0,
-        "pages_for_review": rotation.pages_for_review if rotation else 0,
-        "rotations": rotation_records(rotation, dedupe),
+        "page_count": result.kept_page_count if result else None,
+        "original_page_count": result.original_page_count if result else None,
+        "duplicates_removed": result.duplicates_removed if result else 0,
+        "duplicates": result.duplicates if result else [],
+        "pages_rotated": result.pages_rotated if result else 0,
+        "pages_for_review": result.pages_for_review if result else 0,
+        "rotations": rotation_records(result),
     }
 
 
@@ -415,7 +407,7 @@ def page_fix_fields(dedupe: Optional[DedupeResult], rotation: Optional[RotationR
 # The OCR script accepts ``--override-csv`` naming each PDF's abstract pages
 # by hand, for theses whose heading it cannot find or finds in the wrong
 # place. People read those page numbers off their own PDF, but the script
-# reads the deduped copy, where every removed repeat shifts later pages down
+# reads the fixed copy, where every removed repeat shifts later pages down
 # by one. So the numbers are translated before they are handed over.
 
 _RE_PAGE_RANGE_INPUT = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
@@ -439,18 +431,18 @@ def parse_page_range(value: str) -> Optional[tuple]:
     return start, end
 
 
-def map_pages_to_deduped(start: int, end: int, dedupe: Optional[DedupeResult]) -> Optional[tuple]:
-    """Translate 1-based original page numbers to the deduped copy's.
+def map_pages_to_fixed(start: int, end: int, kept_indices: Optional[list]) -> Optional[tuple]:
+    """Translate 1-based original page numbers to the fixed copy's.
 
     The range covers every kept page between ``start`` and ``end``, so a
     removed repeat inside it is simply skipped. Returns None when no page in
     the range survived (all repeats, or past the end of the document).
     """
-    if dedupe is None:
+    if kept_indices is None:
         return start, end
     positions = [
         position
-        for position, original in enumerate(dedupe.kept_indices)
+        for position, original in enumerate(kept_indices)
         if start - 1 <= original <= end - 1
     ]
     if not positions:
@@ -1100,10 +1092,9 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
 def collect_outputs(
     draft_dir: Path,
     output_dir: Path,
-    dedupe_results: dict,
+    fix_results: dict,
     model_used: str,
     mode_used: str,
-    rotation_results: Optional[dict] = None,
     abstract_pages: Optional[dict] = None,
 ) -> list:
     """Turn the script's "<stem> draft.txt" files into the app's own outputs.
@@ -1156,19 +1147,18 @@ def collect_outputs(
                 "diffs": parsed["diffs"],
                 "recovery": parsed["recovery"],
             },
-            **page_fix_fields(dedupe_results.get(filename),
-                              (rotation_results or {}).get(filename)),
+            **page_fix_fields(fix_results.get(filename)),
         ))
 
     return documents
 
 
-def collect_fix_outputs(pdfs: list, dedupe_results: dict, rotation_results: dict) -> list:
+def collect_fix_outputs(pdfs: list, fix_results: dict) -> list:
     """Document records for a page-fixes-only run: no OCR, so no text.
 
     ``md_file`` is None and the text fields are empty, which is how the
     routes and the review screen tell these apart. The product of such a run
-    is the corrected PDF in ``rotated/`` itself.
+    is the corrected PDF in ``fixed/`` itself.
     """
     processed_at = datetime.now().isoformat(timespec="seconds")
     return [
@@ -1186,7 +1176,7 @@ def collect_fix_outputs(pdfs: list, dedupe_results: dict, rotation_results: dict
                 "diffs": [],
                 "recovery": [],
             },
-            **page_fix_fields(dedupe_results.get(pdf.name), rotation_results.get(pdf.name)),
+            **page_fix_fields(fix_results.get(pdf.name)),
         )
         for pdf in pdfs
     ]
@@ -1199,8 +1189,7 @@ def collect_fix_outputs(pdfs: list, dedupe_results: dict, rotation_results: dict
 # Subdirectory names inside workdir/<job_id>/. Named constants because both
 # this module and the export route need to agree on them.
 UPLOADS_DIRNAME = "uploads"
-DEDUPED_DIRNAME = "deduped"
-ROTATED_DIRNAME = "rotated"
+FIXED_DIRNAME = "fixed"
 DRAFTS_DIRNAME = "drafts"
 OUTPUT_DIRNAME = "output"
 
@@ -1214,12 +1203,12 @@ def run_pipeline(
     overrides: Optional[dict] = None,
     fixes_only: bool = False,
 ) -> dict:
-    """Run dedupe and then the rotation fix on every uploaded PDF, then one
-    batch OCR/VLM pass, then collect the results.
+    """Fix the pages of every uploaded PDF (repeats removed, sideways pages
+    turned), then one batch OCR/VLM pass, then collect the results.
 
     ``overrides`` maps an uploaded filename to its abstract pages as
     ``(start, end)``, numbered as in the uploaded PDF. ``fixes_only`` stops
-    after the rotation fix -- for theses that have no abstract to read, where
+    after the page fixes -- for theses that have no abstract to read, where
     the corrected PDF is the whole point.
 
     ``report`` is a plain callback taking keyword arguments. Passing a
@@ -1238,8 +1227,7 @@ def run_pipeline(
             report(**kwargs)
 
     uploads_dir = workdir / UPLOADS_DIRNAME
-    deduped_dir = workdir / DEDUPED_DIRNAME
-    rotated_dir = workdir / ROTATED_DIRNAME
+    fixed_dir = workdir / FIXED_DIRNAME
     drafts_dir = workdir / DRAFTS_DIRNAME
     output_dir = workdir / OUTPUT_DIRNAME
 
@@ -1247,39 +1235,27 @@ def run_pipeline(
     if not pdfs:
         raise ValueError("No PDFs were uploaded for this job.")
 
-    # --- Pass 1: dedupe, one file at a time -------------------------------
-    emit(event="stage", stage="dedupe", detail="Removing repeated pages")
-    dedupe_results = {}
-    for index, pdf in enumerate(pdfs, 1):
-        emit(event="dedupe_start", index=index, total=len(pdfs), filename=pdf.name)
-        result = dedupe_pdf(pdf, deduped_dir)
-        dedupe_results[pdf.name] = result
-        emit(event="dedupe_done", filename=pdf.name,
-             removed=result.duplicates_removed,
-             kept=result.kept_page_count,
-             original=result.original_page_count)
-
-    # --- Pass 2: turn sideways pages upright, before OCR reads them -------
-    emit(event="stage", stage="rotate", detail="Fixing sideways pages")
+    # --- Pass 1: page fixes, one file at a time, one write each -----------
+    emit(event="stage", stage="fixes", detail="Fixing pages")
     classifier = load_orientation_classifier()
-    rotation_results = {}
+    fix_results = {}
     for index, pdf in enumerate(pdfs, 1):
-        emit(event="rotate_start", index=index, total=len(pdfs), filename=pdf.name)
-        rotation = fix_rotation_pdf(dedupe_results[pdf.name].deduped_path, rotated_dir,
-                                    classifier=classifier)
-        rotation_results[pdf.name] = rotation
-        emit(event="rotate_done", filename=pdf.name,
-             rotated=rotation.pages_rotated,
-             review=rotation.pages_for_review)
+        emit(event="fix_start", index=index, total=len(pdfs), filename=pdf.name)
+        result = fix_pdf(pdf, fixed_dir, classifier=classifier)
+        fix_results[pdf.name] = result
+        emit(event="fix_done", filename=pdf.name,
+             removed=result.duplicates_removed,
+             rotated=result.pages_rotated,
+             review=result.pages_for_review)
 
     if fixes_only:
         emit(event="stage", stage="collecting", detail="Collecting results")
         output_dir.mkdir(parents=True, exist_ok=True)
-        documents = collect_fix_outputs(pdfs, dedupe_results, rotation_results)
+        documents = collect_fix_outputs(pdfs, fix_results)
         write_manifest(output_dir, documents)
         return {"documents": documents, "exit_code": 0}
 
-    # --- Abstract page overrides, translated to the deduped copy ----------
+    # --- Abstract page overrides, translated to the fixed copy ------------
     override_csv = None
     abstract_pages = {}
     csv_ranges = {}
@@ -1288,7 +1264,7 @@ def run_pipeline(
         if not requested:
             continue
         start, end = requested
-        mapped = map_pages_to_deduped(start, end, dedupe_results[pdf.name])
+        mapped = map_pages_to_fixed(start, end, fix_results[pdf.name].kept_indices)
         if mapped is None:
             emit(event="log", detail="[override] %s: pages %d-%d were all removed or "
                  "past the end - finding the abstract automatically instead"
@@ -1297,24 +1273,24 @@ def run_pipeline(
         csv_ranges[pdf.name] = mapped
         abstract_pages[pdf.name] = {"requested": "%d-%d" % (start, end),
                                     "used": "%d-%d" % mapped}
-        emit(event="log", detail="[override] %s: abstract pages %d-%d (%d-%d after dedupe)"
+        emit(event="log", detail="[override] %s: abstract pages %d-%d (%d-%d in the fixed copy)"
              % (pdf.name, start, end, mapped[0], mapped[1]))
     if csv_ranges:
         override_csv = write_override_csv(workdir / "overrides.csv", csv_ranges)
 
-    # --- Pass 3: the OCR + VLM abstract pass over the whole batch ---------
+    # --- Pass 2: the OCR + VLM abstract pass over the whole batch ---------
     emit(event="stage", stage="ocr", detail="Reading abstracts")
     exit_code = run_abstract_pass(
-        rotated_dir, drafts_dir,
+        fixed_dir, drafts_dir,
         model=model, mode=mode, ollama_url=ollama_url,
         on_progress=lambda payload: emit(**payload),
         override_csv=override_csv,
     )
 
-    # --- Pass 4: turn the script's drafts into this app's outputs ---------
+    # --- Pass 3: turn the script's drafts into this app's outputs ---------
     emit(event="stage", stage="collecting", detail="Collecting results")
-    documents = collect_outputs(drafts_dir, output_dir, dedupe_results, model, mode,
-                                rotation_results, abstract_pages)
+    documents = collect_outputs(drafts_dir, output_dir, fix_results, model, mode,
+                                abstract_pages)
     write_manifest(output_dir, documents)
 
     return {"documents": documents, "exit_code": exit_code}
