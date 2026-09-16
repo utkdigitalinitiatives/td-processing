@@ -305,6 +305,9 @@
 
   function renderProgress(status) {
     $("progress-label").textContent = status.label;
+    // The full path, so the folder can be found even without the button.
+    $("job-folder").textContent = "Working folder: " + (status.folder || "");
+    show($("job-folder"), !!status.folder);
 
     var count = "";
     if (status.file_total) {
@@ -970,6 +973,21 @@
     return figure;
   }
 
+  // ---------- working folder ----------
+
+  function openFolder() {
+    // The job on screen, or all of workdir/ before there is one.
+    var path = state.jobId ? "/open-folder/" + encodeURIComponent(state.jobId) : "/open-folder";
+    api(path, { method: "POST" }).catch(function (err) {
+      // Said wherever the user is looking; the message includes the path.
+      if ($("screen-run").hidden) {
+        $("save-status").textContent = err.message;
+      } else {
+        showRunError(err.message);
+      }
+    });
+  }
+
   // ---------- editing, saving, exporting ----------
 
   function onEditorInput() {
@@ -1045,6 +1063,7 @@
     on($("editor"), "input", onEditorInput);
     on($("save-btn"), "click", saveEdits);
     on($("export-btn"), "click", exportDocs);
+    on($("open-folder-btn"), "click", openFolder);
 
     document.querySelectorAll(".topbar .tab").forEach(function (tab) {
       on(tab, "click", function () {

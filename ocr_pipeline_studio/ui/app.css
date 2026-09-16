@@ -46,6 +46,9 @@ code { font-family: var(--mono); font-size: 12px; }
   position: sticky; top: 0; z-index: 5;
 }
 .tabs { display: flex; gap: 4px; }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+button.ghost.folder-btn { padding: 5px 12px; }
+.folder-line { margin: 8px 0 0; word-break: break-all; }
 .tab {
   border: 1px solid transparent; background: none; cursor: pointer;
   padding: 5px 12px; border-radius: 6px; font: inherit; color: var(--muted);

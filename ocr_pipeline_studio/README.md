@@ -188,10 +188,17 @@ as a single `.md`, several as a `.zip`).
 
 ## Where the files go
 
-Each run gets its own folder under `workdir/`, named by job id:
+Each run gets its own folder under `workdir/`, named for when it started and
+what was in it -- `2026-09-16_143205_Thesis80.W5465`, or
+`2026-09-16_143205_Thesis80.W5465_and_2_more` for a batch -- so sorting the
+folder by name sorts it by time. Two runs started in the same second get
+`-2`, `-3` on the end.
+
+The **Open folder** button in the top bar opens the current run's folder (or
+`workdir/` itself before any run), and the Progress panel shows its full path.
 
 ```
-workdir/<job_id>/
+workdir/<date>_<time>_<first file>/
 ├── uploads/    the PDFs exactly as you dropped them
 ├── deduped/    the same PDFs with repeated pages removed
 ├── rotated/    deduped, then sideways pages turned -- what OCR reads,

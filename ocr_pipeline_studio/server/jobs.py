@@ -14,8 +14,8 @@ halfway through an update.
 
 from __future__ import annotations
 
+import re
 import threading
-import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -103,6 +103,28 @@ class Job:
         return self.message
 
 
+# Long enough to recognise a thesis call number, short enough to keep Windows
+# paths well under their limit once a job's own subfolders are added.
+_LABEL_MAX = 40
+
+
+def _folder_label(filenames: list) -> str:
+    """The "what is in it" part of a job folder name.
+
+    The first file's name without its extension, plus how many others came
+    with it. Anything other than letters, digits, dot, dash and underscore is
+    dropped, so the result is safe as a folder name and in a URL.
+    """
+    if not filenames:
+        return ""
+    stem = Path(filenames[0]).stem
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "", stem).strip(".")[:_LABEL_MAX]
+    if not stem:
+        return ""
+    others = len(filenames) - 1
+    return stem + ("_and_%d_more" % others if others else "")
+
+
 class JobStore:
     """Thread-safe registry of Jobs, keyed by job id.
 
@@ -115,18 +137,41 @@ class JobStore:
         self._jobs: dict = {}
         self._lock = threading.Lock()
 
-    def create(self, workdir_root: Path) -> Job:
+    def create(self, workdir_root: Path, filenames: Optional[list] = None) -> Job:
         """Make a new job with a server-generated id and its own scratch dir.
 
-        The id is generated here, on the server, and never taken from the
-        client: it becomes a directory name, so letting the browser choose it
-        would be a path-traversal hole in a tool that reads and writes files.
+        The id doubles as the folder name, so it is built to be found by a
+        person browsing ``workdir/``: when the job started, then what is in
+        it -- ``2026-09-16_143205_Thesis80.W5465_and_2_more``. Sorting by name
+        is sorting by time.
+
+        The id is still generated here, on the server, and never taken from
+        the client: it becomes a directory name, so letting the browser choose
+        it would be a path-traversal hole in a tool that reads and writes
+        files. The filename part is reduced to plain characters for the same
+        reason.
         """
-        job_id = uuid.uuid4().hex[:12]
-        workdir = workdir_root / job_id
-        workdir.mkdir(parents=True, exist_ok=True)
-        job = Job(id=job_id, workdir=workdir)
+        base = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        label = _folder_label(filenames or [])
+        if label:
+            base += "_" + label
+
+        workdir_root.mkdir(parents=True, exist_ok=True)
         with self._lock:
+            # Two jobs started in the same second over the same file would
+            # otherwise share a folder. mkdir without exist_ok is the check:
+            # it fails if the folder is already there, whoever made it.
+            job_id = base
+            suffix = 1
+            while True:
+                try:
+                    (workdir_root / job_id).mkdir()
+                    break
+                except FileExistsError:
+                    suffix += 1
+                    job_id = "%s-%d" % (base, suffix)
+
+            job = Job(id=job_id, workdir=workdir_root / job_id)
             self._jobs[job_id] = job
         return job
 
@@ -178,6 +223,7 @@ class JobStore:
                 return None
             return {
                 "job_id": job.id,
+                "folder": str(job.workdir),
                 "status": job.status,
                 "finished": job.status in FINISHED,
                 "message": job.message,

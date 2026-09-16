@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
+import subprocess
+import sys
 import threading
 import traceback
 import zipfile
@@ -103,24 +106,26 @@ def upload():
     except _Refused as exc:
         return jsonify({"error": exc.message}), exc.status
 
+    # secure_filename strips directory components and unsafe characters.
+    # The browser supplies these names, so they are never trusted as paths.
+    pdfs = []
+    for storage in uploaded:
+        name = secure_filename(storage.filename or "")
+        if name.lower().endswith(".pdf"):
+            pdfs.append((name, storage))
+
+    if not pdfs:
+        return jsonify({"error": "None of the dropped files were PDFs."}), 400
+
+    # Named before anything is saved, since the folder is named after them.
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
-    job = store.create(current_app.config["WORKDIR"])
+    saved = [name for name, _ in pdfs]
+    job = store.create(current_app.config["WORKDIR"], saved)
 
     uploads_dir = job.workdir / runner.UPLOADS_DIRNAME
     uploads_dir.mkdir(parents=True, exist_ok=True)
-
-    saved = []
-    for storage in uploaded:
-        # secure_filename strips directory components and unsafe characters.
-        # The browser supplies this name, so it is never trusted as a path.
-        name = secure_filename(storage.filename or "")
-        if not name.lower().endswith(".pdf"):
-            continue
+    for name, storage in pdfs:
         storage.save(uploads_dir / name)
-        saved.append(name)
-
-    if not saved:
-        return jsonify({"error": "None of the dropped files were PDFs."}), 400
 
     return _launch_job(job, saved, options)
 
@@ -154,7 +159,7 @@ def rerun(job_id: str):
     except _Refused as exc:
         return jsonify({"error": exc.message}), exc.status
 
-    job = store.create(current_app.config["WORKDIR"])
+    job = store.create(current_app.config["WORKDIR"], files)
     uploads_dir = job.workdir / runner.UPLOADS_DIRNAME
     uploads_dir.mkdir(parents=True, exist_ok=True)
     for name in files:
@@ -434,6 +439,47 @@ def status(job_id: str):
     if snapshot is None:
         return jsonify({"error": "No such job."}), 404
     return jsonify(snapshot)
+
+
+@bp.post("/open-folder")
+@bp.post("/open-folder/<job_id>")
+def open_folder(job_id: str = None):
+    """Open a job's folder -- or all of ``workdir/`` -- in the file manager.
+
+    The folder comes from the job store or the app's config, never from the
+    request, so this can only ever open the app's own folders. That is also
+    what makes it safe to hand to the OS: ``os.startfile`` on a folder opens
+    it, it does not run anything.
+    """
+    if job_id is None:
+        folder = current_app.config["WORKDIR"]
+    else:
+        store: jobstate.JobStore = current_app.config["JOB_STORE"]
+        job = store.get(job_id)
+        if job is None:
+            return jsonify({"error": "No such job."}), 404
+        folder = job.workdir
+
+    if not folder.is_dir():
+        return jsonify({"error": "That folder no longer exists: %s" % folder}), 404
+
+    try:
+        _reveal(folder)
+    except Exception as exc:
+        # Still hand back the path, so the user can find it by hand.
+        return jsonify({"error": "Could not open the folder (%s). It is at: %s"
+                                 % (exc, folder)}), 500
+    return jsonify({"ok": True, "folder": str(folder)})
+
+
+def _reveal(folder: Path) -> None:
+    """Open ``folder`` in the platform's file manager."""
+    if sys.platform.startswith("win"):
+        os.startfile(str(folder))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(folder)])
+    else:
+        subprocess.Popen(["xdg-open", str(folder)])
 
 
 @bp.get("/jobs")

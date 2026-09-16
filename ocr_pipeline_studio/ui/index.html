@@ -14,10 +14,15 @@
 
 <header class="topbar">
   <h1>OCR Pipeline Studio</h1>
-  <nav class="tabs">
-    <button class="tab is-active" data-screen="run">Run</button>
-    <button class="tab" data-screen="review" id="tab-review" disabled>Review</button>
-  </nav>
+  <div class="topbar-right">
+    <nav class="tabs">
+      <button class="tab is-active" data-screen="run">Run</button>
+      <button class="tab" data-screen="review" id="tab-review" disabled>Review</button>
+    </nav>
+    <!-- Opens the current job's folder, or all of workdir before any job. -->
+    <button id="open-folder-btn" class="ghost folder-btn"
+            title="Open the working folder in File Explorer">Open folder</button>
+  </div>
 </header>
 
 <!-- ==================== RUN SCREEN ==================== -->
@@ -86,6 +91,7 @@
       <span id="progress-count" class="muted"></span>
     </div>
     <div class="progressbar"><div id="progress-fill"></div></div>
+    <p class="muted small folder-line" id="job-folder" hidden></p>
 
     <!-- Batch queue: one row per file, with its own state. -->
     <ul id="queue-list" class="file-list queue"></ul>
