@@ -425,10 +425,31 @@
         overrides: overrides
       })
     }).then(function (data) {
+      syncRunControls(data);
       beginJob(data.job_id);
     }).catch(function (err) {
       showRunError(err.message);
     });
+  }
+
+  // Make the Run screen's dropdowns show what a rerun actually started with,
+  // so they never describe a different kind of run from the one in progress.
+  // Only done once the server has accepted the rerun: a refused one changes
+  // nothing.
+  function syncRunControls(run) {
+    $("run-kind").value = run.fixes_only ? "fixes" : "full";
+    selectIfPresent($("model-select"), run.model);
+    selectIfPresent($("mode-select"), run.mode);
+    updateModeHelp();
+    updateRunKind();
+  }
+
+  function selectIfPresent(select, value) {
+    // Setting a value the list does not have would blank the dropdown.
+    var has = Array.prototype.some.call(select.options, function (option) {
+      return option.value === value;
+    });
+    if (has) { select.value = value; }
   }
 
   // =====================================================================
