@@ -208,6 +208,9 @@ stay in memory until you press **Save changes**, which writes them back to the
 `.md` files in the run's `output/` folder, along with any Keep/Remove choices
 on the Page fixes tab. **Open folder** takes you there.
 
+If you close the window with anything unsaved, the app lists the documents
+and asks first -- **Cancel** keeps the window open so you can save.
+
 ---
 
 ## Where the files go

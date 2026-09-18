@@ -806,6 +806,37 @@ def _save_page_fixes(job, doc) -> bool:
     return True
 
 
+def unsaved_changes(store: jobstate.JobStore) -> list:
+    """Every document, across this session's jobs, with changes not on disk.
+
+    Text counts when the in-memory edit differs from its .md file, and page
+    fixes when Keep/Remove choices differ from the fixed PDF. Used to ask
+    before the window closes, since all of it lives in memory and closing
+    loses it. Returns ``[{"job_id", "name", "text", "page_fixes"}, ...]``.
+    """
+    found = []
+    for job in store.all():
+        for doc in job.documents:
+            name = doc["name"]
+            text = False
+            if doc["md_file"] and name in job.edits:
+                md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
+                on_disk = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+                text = job.edits[name] != on_disk
+            page_fixes = _removals_differ_from_file(doc)
+            if text or page_fixes:
+                found.append({"job_id": job.id, "name": name,
+                              "text": text, "page_fixes": page_fixes})
+    return found
+
+
+@bp.get("/unsaved")
+def unsaved():
+    """What would be lost if the window closed now."""
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    return jsonify({"unsaved": unsaved_changes(store)})
+
+
 @bp.post("/edit/<job_id>/<path:name>")
 def edit(job_id: str, name: str):
     """Hold an edited document in memory. Nothing is written to disk here.

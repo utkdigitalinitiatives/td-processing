@@ -88,6 +88,37 @@ def wait_until_serving(port: int, timeout: float = 15.0) -> bool:
     return False
 
 
+def confirm_close(app, window) -> bool:
+    """Ask before closing if anything is unsaved; False keeps the window open.
+
+    Edits, applied differences and Keep/Remove choices all live in memory
+    until Save changes, and closing the window ends the process that holds
+    them. The server is asked directly rather than the page, because this
+    runs on the window's own thread, where waiting on the page's JavaScript
+    could hang. Closes without asking when nothing is unsaved, and never
+    blocks closing if the check itself fails.
+    """
+    from server.routes import unsaved_changes
+
+    try:
+        pending = unsaved_changes(app.config["JOB_STORE"])
+    except Exception:
+        return True
+    if not pending:
+        return True
+
+    # Named, so the user knows what they would lose, but kept short: a batch
+    # can hold dozens of documents.
+    names = sorted({item["name"] for item in pending})
+    listed = "\n".join("  - " + name for name in names[:8])
+    if len(names) > 8:
+        listed += "\n  - and %d more" % (len(names) - 8)
+    message = ("These documents have changes that have not been saved:\n\n%s\n\n"
+               "Close anyway and lose them? Choose Cancel to go back and press "
+               "Save changes." % listed)
+    return window.create_confirmation_dialog("Unsaved changes", message)
+
+
 def main() -> int:
     app = create_app(PROJECT_ROOT)
     port = find_free_port()
@@ -102,8 +133,9 @@ def main() -> int:
     print("ocr-pipeline-studio is running at %s" % url)
     print("Close the window to quit.")
 
-    webview.create_window(WINDOW_TITLE, url, width=1400, height=900,
-                          min_size=(1000, 640))
+    window = webview.create_window(WINDOW_TITLE, url, width=1400, height=900,
+                                   min_size=(1000, 640))
+    window.events.closing += lambda: confirm_close(app, window)
 
     # Blocks on the main thread until the window is closed.
     webview.start()
