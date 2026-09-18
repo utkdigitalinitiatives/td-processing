@@ -247,6 +247,7 @@ class JobStore:
                         "fixes_only": d["fixes_only"],
                         "page_count": d["page_count"],
                         "duplicates_removed": d["duplicates_removed"],
+                        "duplicates_flagged": d["duplicates_flagged"],
                         "pages_rotated": d["pages_rotated"],
                         "pages_for_review": d["pages_for_review"],
                         "model_used": d["model_used"],

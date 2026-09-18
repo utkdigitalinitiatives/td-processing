@@ -27,6 +27,7 @@
     documents: [],      // summaries from /status
     current: null,      // full payload for the open document
     dirty: {},          // name -> true when edited but unsaved
+    fixesDirty: {},     // name -> true when Keep/Remove choices are unsaved
     editTimer: null,
     lastSkip: null,     // a single-span click that could not be carried out
     choiceOpen: {}      // "page:index" -> open/closed, for copy pickers the user toggled
@@ -283,6 +284,7 @@
     state.documents = [];
     state.current = null;
     state.dirty = {};
+    state.fixesDirty = {};
     $("tab-review").disabled = true;
     show($("progress-panel"), true);
     switchScreen("run");
@@ -346,9 +348,8 @@
       }
       state.documents = status.documents || [];
       state.fixesOnly = !!status.fixes_only;
-      // A fixes-only job has no text to save; its product is the PDFs, which
-      // are already on disk.
-      show($("save-btn"), !state.fixesOnly);
+      // Save writes text edits and Keep/Remove choices, so it shows for
+      // fixes-only jobs too; their product is the PDFs in the fixed folder.
       $("save-status").textContent = state.fixesOnly
         ? "Corrected PDFs are in the fixed folder - use Open folder."
         : "";
@@ -415,7 +416,8 @@
   }
 
   function rerunFiles(jobId, files, fixesOnly, overrides) {
-    var unsaved = Object.keys(state.dirty).length;
+    var unsaved = Object.keys(state.dirty).concat(Object.keys(state.fixesDirty))
+      .filter(function (name, i, all) { return all.indexOf(name) === i; }).length;
     if (unsaved && !window.confirm("You have unsaved edits in " + unsaved
         + " document(s). Rerunning moves on to a new run - continue?")) {
       return;
@@ -497,9 +499,14 @@
         (pagesByKind[flag.kind] = pagesByKind[flag.kind] || []).push(flag);
       });
       // Page fixes come first: they happened before OCR, to the whole PDF.
+      if (doc.duplicates_flagged) {
+        chips.appendChild(fixChip("rotate-review", doc.duplicates_flagged + " possible repeat(s)",
+          "Pages that may repeat an earlier page. Nothing is removed unless you "
+            + "choose to - see the Page fixes tab."));
+      }
       if (doc.duplicates_removed) {
-        chips.appendChild(fixChip("dedupe", doc.duplicates_removed + " repeat(s) removed",
-          "Repeated pages taken out before OCR - see the Page fixes tab."));
+        chips.appendChild(fixChip("dedupe", doc.duplicates_removed + " removed",
+          "Repeated pages you removed from the fixed PDF."));
       }
       if (doc.pages_rotated) {
         chips.appendChild(fixChip("rotate", doc.pages_rotated + " rotated",
@@ -525,7 +532,7 @@
         }).join("\n");
         chips.appendChild(chip);
       });
-      if (state.dirty[doc.name]) {
+      if (state.dirty[doc.name] || state.fixesDirty[doc.name]) {
         var dirty = document.createElement("span");
         dirty.className = "chip dirty";
         dirty.textContent = "unsaved";
@@ -569,7 +576,7 @@
           meta.push("abstract pages " + doc.abstract_pages.requested + " set by hand");
         }
         if (doc.page_count != null) { meta.push(doc.page_count + " pages after fixes"); }
-        if (doc.duplicates_removed) { meta.push(doc.duplicates_removed + " repeated page(s) removed"); }
+        if (doc.duplicates_removed) { meta.push(doc.duplicates_removed + " repeated page(s) removed by you"); }
         if (doc.pages_rotated) { meta.push(doc.pages_rotated + " sideways page(s) rotated"); }
         if (doc.model_used) { meta.push("model: " + doc.model_used); }
         $("doc-meta").textContent = meta.join(" - ");
@@ -969,18 +976,19 @@
     // what the user sees when they open their file.
     if (duplicates.length) {
       body.appendChild(fixSection(
-        "Repeated pages removed (" + duplicates.length + ")",
-        "Each of these pages matched an earlier page and was taken out before OCR.",
-        duplicates.map(function (d) {
-          return fixCard(
-            [
-              pageFigure(doc, "original", d.dupe_idx, "Page " + d.duplicate_page + " - removed", 0),
-              pageFigure(doc, "original", d.orig_idx, "Page " + d.original_page + " - kept", 0)
-            ],
-            d.score + "% text match, printed page number: " + d.folio
-          );
-        })
+        "Possible repeated pages (" + duplicates.length + ")",
+        "Each of these pages looked like an earlier page. Nothing has been removed - "
+          + "compare the two and remove the page only if it really is a repeat.",
+        duplicates.map(function (d) { return duplicateCard(doc, d); })
       ));
+    }
+
+    if (doc.fixes_pending) {
+      var pending = document.createElement("p");
+      pending.className = "pending-note";
+      pending.textContent = doc.pending_removals + " Keep/Remove change(s) not saved yet - "
+        + "press Save changes to update the fixed PDF.";
+      body.appendChild(pending);
     }
 
     // Changing a turn rewrites the fixed PDF, but OCR has already read it.
@@ -1015,17 +1023,92 @@
   }
 
   function rotationCard(doc, r) {
+    if (r.fixed_idx == null) {
+      return fixCard(
+        [pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0)],
+        "Not in the fixed PDF - removed as a repeated page. Keep it and save "
+          + "to turn it again."
+      );
+    }
     var card = fixCard(
       [
         pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
         pageFigure(doc, "fixed", r.fixed_idx, turnLabel(r.current) + " in the fixed PDF", 0,
-                   r.current)
+                   r.current + "-" + (state.fixesVersion || 0))
       ],
       (r.applied ? r.confidence + " confidence: " : "") + r.why
         + (r.decided ? " - set by you" : "")
     );
     card.appendChild(turnSwitch(doc, r));
     return card;
+  }
+
+  function duplicateCard(doc, d) {
+    var card = fixCard(
+      [
+        pageFigure(doc, "original", d.dupe_idx, "Page " + d.duplicate_page
+          + duplicateState(d), 0),
+        pageFigure(doc, "original", d.orig_idx, "Page " + d.original_page + " - the earlier page", 0)
+      ],
+      d.score + "% text match, printed page number: " + d.folio
+        + (d.decided ? " - set by you" : "")
+    );
+    if (d.removed) { card.classList.add("is-removed"); }
+    card.appendChild(keepSwitch(doc, d));
+    return card;
+  }
+
+  function duplicateState(d) {
+    var saved = !!d.saved_removed;
+    if (d.removed && !saved) { return " - removed when you save"; }
+    if (!d.removed && saved) { return " - put back when you save"; }
+    return d.removed ? " - removed" : " - possible repeat";
+  }
+
+  // Keep / Remove: whether this flagged page is in the fixed PDF.
+  function keepSwitch(doc, d) {
+    var row = document.createElement("div");
+    row.className = "turn-switch";
+    [[false, "Keep"], [true, "Remove"]].forEach(function (option) {
+      var remove = option[0];
+      var button = document.createElement("button");
+      button.className = "turn" + (remove === d.removed ? " is-current" : "");
+      button.textContent = option[1];
+      button.title = remove === d.removed
+        ? (remove ? "This page is removed from the fixed PDF." : "This page is in the fixed PDF.")
+        : (remove ? "Take this page out of the fixed PDF." : "Put this page back in the fixed PDF.");
+      button.disabled = remove === d.removed;
+      on(button, "click", function () { setRemoved(doc, d, remove, row); });
+      row.appendChild(button);
+    });
+    return row;
+  }
+
+  function setRemoved(doc, d, remove, row) {
+    Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) { b.disabled = true; });
+    api("/duplicate/" + state.jobId + "/" + encodeURIComponent(doc.name), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dupe_idx: d.dupe_idx, remove: remove })
+    }).then(function (result) {
+      // Only the choice is recorded; the fixed PDF is rebuilt on Save.
+      doc.duplicates = result.duplicates;
+      doc.fixes_pending = result.fixes_pending;
+      doc.pending_removals = result.pending_removals;
+      if (result.fixes_pending) {
+        state.fixesDirty[doc.name] = true;
+      } else {
+        delete state.fixesDirty[doc.name];
+      }
+      renderFixes(doc);
+      renderDocList();
+    }).catch(function (err) {
+      renderFixes(doc);
+      var note = document.createElement("p");
+      note.className = "error";
+      note.textContent = "Could not change page " + d.duplicate_page + ": " + err.message;
+      $("fixes-body").insertBefore(note, $("fixes-body").firstChild);
+    });
   }
 
   function turnLabel(turn) {
@@ -1186,16 +1269,58 @@
   }
 
   function saveEdits() {
+    // One save at a time: a second press mid-save would race the first.
+    $("save-btn").disabled = true;
+    $("save-status").textContent = "Saving...";
     api("/save/" + state.jobId, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({})
     }).then(function (result) {
-      state.dirty = {};
+      // Only what the save actually wrote stops being unsaved. A Keep/Remove
+      // click or a keystroke that landed while it ran stays marked.
+      var pending = result.still_pending || {};
+      Object.keys(pending).forEach(function (name) {
+        if (pending[name].fixes) { state.fixesDirty[name] = true; }
+        else { delete state.fixesDirty[name]; }
+      });
+      Object.keys(result.saved_text || {}).forEach(function (name) {
+        var typedSince = state.current && state.current.name === name
+          && $("editor").value !== result.saved_text[name];
+        if (!typedSince) { delete state.dirty[name]; }
+      });
+
+      // Page fixes that were saved rebuilt the fixed PDF and moved its pages.
+      var fixes = result.page_fixes || {};
+      if (state.current && fixes[state.current.name]) {
+        var saved = fixes[state.current.name];
+        state.current.rotations = saved.rotations;
+        state.current.duplicates = saved.duplicates;
+        state.current.page_count = saved.page_count;
+        state.current.duplicates_removed = saved.duplicates_removed;
+        state.fixesVersion = (state.fixesVersion || 0) + 1;
+      }
+      if (state.current && pending[state.current.name]) {
+        state.current.fixes_pending = pending[state.current.name].fixes;
+        state.current.pending_removals = pending[state.current.name].pending_removals;
+        renderFixes(state.current);
+      }
+      state.documents.forEach(function (summary) {
+        if (fixes[summary.name]) {
+          summary.duplicates_removed = fixes[summary.name].duplicates_removed;
+          summary.page_count = fixes[summary.name].page_count;
+        }
+      });
       renderDocList();
-      $("save-status").textContent = result.written.length
-        ? "Saved " + result.written.length + " file(s) - use Open folder to find them in output."
-        : "Nothing to save.";
+      var leftOver = Object.keys(state.fixesDirty).length;
+      $("save-status").textContent = (result.written.length
+        ? "Saved " + result.written.length + " file(s) - use Open folder to find them."
+        : "Nothing to save.")
+        + (leftOver ? " Some changes were made while saving - press Save changes again." : "");
+    }).catch(function (err) {
+      $("save-status").textContent = "Save failed: " + err.message;
+    }).then(function () {
+      $("save-btn").disabled = false;
     });
   }
 

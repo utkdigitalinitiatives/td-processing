@@ -251,11 +251,11 @@ def _launch_job(job, files: list, options: dict):
                     "mode": options["mode"], "fixes_only": options["fixes_only"]})
 
 
-def _fixes_detail(removed: int, rotated: int, review: int) -> str:
+def _fixes_detail(repeats: int, rotated: int, review: int) -> str:
     """One queue-row phrase for a file's page fixes; empty when there were none."""
     parts = []
-    if removed:
-        parts.append("%d repeated page(s) removed" % removed)
+    if repeats:
+        parts.append("%d possible repeated page(s) to check" % repeats)
     if rotated:
         parts.append("%d page(s) rotated" % rotated)
     if review:
@@ -311,7 +311,7 @@ def _run_job(app, job_id: str) -> None:
                 store.set_file_state(job_id, event["filename"], "fixing")
 
             elif kind == "fix_done":
-                detail = _fixes_detail(event.get("removed", 0), event.get("rotated", 0),
+                detail = _fixes_detail(event.get("repeats", 0), event.get("rotated", 0),
                                        event.get("review", 0)) or "no page fixes needed"
                 store.set_file_state(job_id, event["filename"], "fixed", detail)
                 store.append_log(job_id, "[fixes] %s: %s" % (event["filename"], detail))
@@ -375,7 +375,7 @@ def _run_job(app, job_id: str) -> None:
                 parts = [] if doc["fixes_only"] else ["%d flag(s)" % len(doc["flags"])]
                 if doc["abstract_pages"]:
                     parts.append("abstract pages %s" % doc["abstract_pages"]["requested"])
-                fixes = _fixes_detail(doc["duplicates_removed"], doc["pages_rotated"],
+                fixes = _fixes_detail(doc["duplicates_flagged"], doc["pages_rotated"],
                                       doc["pages_for_review"])
                 if fixes:
                     parts.append(fixes)
@@ -587,8 +587,12 @@ def document(job_id: str, name: str):
                                    job.span_offsets.get(name, {})),
         "recovery": doc["recovery"],
         "page_count": doc["page_count"],
+        "original_page_count": doc["original_page_count"],
         "duplicates_removed": doc["duplicates_removed"],
+        "duplicates_flagged": doc["duplicates_flagged"],
         "duplicates": doc["duplicates"],
+        "fixes_pending": doc.get("fixes_pending", False),
+        "pending_removals": _pending_removal_count(doc),
         "pages_rotated": doc["pages_rotated"],
         "pages_for_review": doc["pages_for_review"],
         "rotations": doc["rotations"],
@@ -682,6 +686,8 @@ def set_rotation(job_id: str, name: str):
                    if r["original_idx"] == payload.get("original_idx")), None)
     if record is None:
         return jsonify({"error": "That page was not part of the rotation step."}), 404
+    if record["fixed_idx"] is None:
+        return jsonify({"error": "That page has been removed as a repeat - keep it to turn it."}), 409
 
     fixed_pdf = job.workdir / runner.FIXED_DIRNAME / doc["filename"]
     original_pdf = job.workdir / runner.UPLOADS_DIRNAME / doc["filename"]
@@ -705,6 +711,99 @@ def set_rotation(job_id: str, name: str):
         "pages_rotated": doc["pages_rotated"],
         "pages_for_review": doc["pages_for_review"],
     })
+
+
+@bp.post("/duplicate/<job_id>/<path:name>")
+def set_duplicate(job_id: str, name: str):
+    """Remove a suspected repeated page from the fixed PDF, or put it back.
+
+    The dedupe step only flags repeats -- it has been wrong too often to act
+    on its own -- so this is where a person decides, the same way the
+    rotation switch works. Body: ``{dupe_idx, remove}``. Only pages dedupe
+    flagged can be removed, looked up in the document's record.
+
+    Only the choice is recorded here, so switching back and forth is
+    instant. The fixed PDF is rebuilt once, when the user saves (see
+    _save_page_fixes) -- removing a page shifts every page after it, so the
+    rebuild is a full rewrite, too slow to run on every click.
+    """
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    job = store.get(job_id)
+    if job is None:
+        return jsonify({"error": "No such job."}), 404
+    doc = _find_document(job, name)
+    if doc is None:
+        return jsonify({"error": "No such document."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    remove = payload.get("remove")
+    if not isinstance(remove, bool):
+        return jsonify({"error": "remove must be true or false."}), 400
+    record = next((d for d in doc["duplicates"]
+                   if d["dupe_idx"] == payload.get("dupe_idx")), None)
+    if record is None:
+        return jsonify({"error": "That page was not flagged as a repeat."}), 404
+
+    record["removed"] = remove
+    record["decided"] = True
+    doc["fixes_pending"] = _removals_differ_from_file(doc)
+
+    return jsonify({
+        "duplicates": doc["duplicates"],
+        "fixes_pending": doc["fixes_pending"],
+        "pending_removals": _pending_removal_count(doc),
+    })
+
+
+def _removals_differ_from_file(doc) -> bool:
+    """Whether the Keep/Remove choices differ from what the fixed PDF holds.
+
+    Pages the fixed PDF no longer holds are exactly the rotation records with
+    no ``fixed_idx`` plus flagged repeats removed at the last save, which is
+    what ``saved_removed`` remembers.
+    """
+    return any(d["removed"] != d.get("saved_removed", False) for d in doc["duplicates"])
+
+
+def _pending_removal_count(doc) -> int:
+    return sum(1 for d in doc["duplicates"] if d["removed"] != d.get("saved_removed", False))
+
+
+def _save_page_fixes(job, doc) -> bool:
+    """Rebuild one document's fixed PDF with its Keep/Remove choices.
+
+    Returns True if the file was rewritten. Rotations already in the file are
+    carried over, since the rebuild reapplies every current turn.
+
+    The choices are copied when the rebuild starts, and only that copy is
+    recorded as saved. Keep/Remove stays clickable during a save, so a click
+    that lands mid-rebuild must not be mistaken for part of it: it is left
+    pending, to go into the next save.
+    """
+    fixed_pdf = job.workdir / runner.FIXED_DIRNAME / doc["filename"]
+    original_pdf = job.workdir / runner.UPLOADS_DIRNAME / doc["filename"]
+
+    # Shares the page-image lock: a thumbnail must not render mid-save, and
+    # two saves must not rebuild the same file at once.
+    with _render_lock:
+        if not _removals_differ_from_file(doc):
+            return False
+        if not original_pdf.exists():
+            raise FileNotFoundError("The uploaded PDF for %s is no longer in this job's folder."
+                                    % doc["filename"])
+        snapshot = {d["dupe_idx"]: d["removed"] for d in doc["duplicates"]}
+        keep = runner.rebuild_fixed_pdf(
+            original_pdf, fixed_pdf,
+            [dict(d, removed=snapshot[d["dupe_idx"]]) for d in doc["duplicates"]],
+            doc["rotations"])
+        for d in doc["duplicates"]:
+            d["saved_removed"] = snapshot[d["dupe_idx"]]
+
+    # Anything clicked while the file was being written is still pending.
+    doc["fixes_pending"] = _removals_differ_from_file(doc)
+    doc["page_count"] = len(keep)
+    doc["duplicates_removed"] = doc["original_page_count"] - len(keep)
+    return True
 
 
 @bp.post("/edit/<job_id>/<path:name>")
@@ -839,7 +938,8 @@ def apply_spans(job_id: str, name: str):
 
 @bp.post("/save/<job_id>")
 def save(job_id: str):
-    """Write in-memory edits out to the .md files on disk.
+    """Write everything pending to disk: text edits to the .md files, and
+    Keep/Remove choices to the fixed PDFs.
 
     This is the only route that overwrites the pipeline's output, and it only
     ever runs when the user presses Save.
@@ -850,18 +950,46 @@ def save(job_id: str):
         return jsonify({"error": "No such job."}), 404
 
     payload = request.get_json(silent=True) or {}
-    names = payload.get("names") or list(job.edits.keys())
+    names = payload.get("names") or [d["name"] for d in job.documents]
 
     written = []
+    page_fixes = {}
+    # What each document still has unsaved once this save is done -- the
+    # review screen sets its "unsaved" marks from this rather than assuming
+    # everything was saved, since edits and clicks can land mid-save.
+    saved_text = {}
+    still_pending = {}
     for name in names:
         doc = _find_document(job, name)
-        if doc is None or not doc["md_file"] or name not in job.edits:
+        if doc is None:
             continue
-        path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
-        path.write_text(job.edits[name], encoding="utf-8")
-        written.append(doc["md_file"])
+        if doc["md_file"] and name in job.edits:
+            text = job.edits[name]
+            path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
+            path.write_text(text, encoding="utf-8")
+            written.append(doc["md_file"])
+            saved_text[name] = text
+        try:
+            rebuilt = _save_page_fixes(job, doc)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc), "written": written}), 404
+        if rebuilt:
+            written.append("%s/%s" % (runner.FIXED_DIRNAME, doc["filename"]))
+            # The rebuild moved pages, so the review screen needs the new
+            # positions and counts for this document.
+            page_fixes[name] = {
+                "rotations": doc["rotations"],
+                "duplicates": doc["duplicates"],
+                "page_count": doc["page_count"],
+                "duplicates_removed": doc["duplicates_removed"],
+            }
+        still_pending[name] = {
+            "fixes": doc.get("fixes_pending", False),
+            "pending_removals": _pending_removal_count(doc),
+        }
 
-    return jsonify({"ok": True, "written": written})
+    return jsonify({"ok": True, "written": written, "page_fixes": page_fixes,
+                    "saved_text": saved_text, "still_pending": still_pending})
 
 
 @bp.post("/export")

@@ -227,13 +227,13 @@ class PageFixResult:
     fixed_path: Path
     original_page_count: int
     # 0-based page numbers of the original PDF, in the order they were kept.
-    # Position i in the fixed PDF is original page kept_indices[i].
+    # Position i in the fixed PDF is original page kept_indices[i]. Every page
+    # is kept: suspected repeats are only flagged, and removed by a person.
     kept_indices: list = field(default_factory=list)
-    # dedupe.py's findings, one dict per repeated page:
+    # dedupe.py's findings, one dict per suspected repeat:
     #   {dupe_idx, orig_idx, duplicate_page, original_page, score, folio}
     duplicates: list = field(default_factory=list)
-    # fix_rotation.py's decisions for pages that were kept, numbered as in
-    # the original PDF:
+    # fix_rotation.py's decisions, numbered as in the original PDF:
     #   {page_idx, page, rotation, confidence, why, score, contradicted, img_agreed}
     rotations: list = field(default_factory=list)
 
@@ -244,6 +244,10 @@ class PageFixResult:
     @property
     def duplicates_removed(self) -> int:
         return self.original_page_count - self.kept_page_count
+
+    @property
+    def duplicates_flagged(self) -> int:
+        return len(self.duplicates)
 
     @property
     def pages_rotated(self) -> int:
@@ -276,17 +280,16 @@ def fix_pdf(
     """Find repeated and sideways pages with the original scripts, then write
     one corrected copy of the PDF into ``fixed_dir``.
 
-    Split of responsibilities: ``dedupe.py`` *detects* duplicates but has no
-    function that removes pages, and ``fix_rotation.py`` is called in its
-    detect-only mode. So both writes happen here, driven entirely by what the
-    scripts returned: pages are dropped by ``dupe_idx``, and each applied
-    rotation is added to the page's /Rotate exactly as the rotation script's
-    own apply step does. All of the matching and deciding stays in the
-    original files, untouched.
+    Repeated pages are **flagged, never removed**: dedupe.py's matches have
+    proved wrong often enough that every one goes to a person, who removes it
+    from the Page fixes tab if it really is a repeat (see
+    rebuild_fixed_pdf()). Sideways pages the rotation script is confident
+    about are turned, as before; its uncertain ones are left for review.
 
-    Rotation is detected on the original page order, repeats included, so no
-    deduped copy has to be written first. Decisions about pages that are then
-    removed as repeats are dropped.
+    Both scripts only detect here -- ``dedupe.py`` has no function that
+    removes pages, and ``fix_rotation.py`` runs in its detect-only mode -- so
+    the write happens in write_fixed_pdf(), driven entirely by what they
+    returned. All of the matching and deciding stays in the original files.
     """
     fixed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -302,56 +305,16 @@ def fix_pdf(
     duplicates = find_and_export_duplicates(pdf_path)
 
     # No output_dir and apply=False: the script only reports, it writes nothing.
-    decisions = find_and_fix_rotations(pdf_path, classifier, dpi=dpi, min_score=min_score)
+    rotations = find_and_fix_rotations(pdf_path, classifier, dpi=dpi, min_score=min_score)
 
-    doc = fitz.open(pdf_path)
-    try:
+    with fitz.open(pdf_path) as doc:
         original_page_count = doc.page_count
+    keep = list(range(original_page_count))
 
-        # 0-based indices of pages to drop. A set because several later pages
-        # can each match the same earlier original, and a page must only be
-        # dropped once.
-        dupe_indices = {int(d["dupe_idx"]) for d in duplicates}
-        keep = [i for i in range(original_page_count) if i not in dupe_indices]
-
-        # Defensive: if detection somehow flagged everything, keep the file
-        # intact rather than writing a zero-page PDF that would break OCR.
-        if not keep:
-            keep = list(range(original_page_count))
-
-        kept = set(keep)
-        rotations = [d for d in decisions if d["page_idx"] in kept]
-        to_rotate = [d for d in rotations if d["confidence"] in _APPLIED_CONFIDENCE]
-        removing = len(keep) < original_page_count
-
-        out_path = fixed_dir / pdf_path.name
-        if not removing and not to_rotate:
-            doc.close()
-            # Copied, and copied even over a file of that name, so a stale
-            # copy from an earlier run can never be picked up.
-            shutil.copy2(pdf_path, out_path)
-        else:
-            if removing:
-                # select() rewrites the document to exactly this page list.
-                doc.select(keep)
-            position = {original: new for new, original in enumerate(keep)}
-            for d in to_rotate:
-                page = doc[position[d["page_idx"]]]
-                # Added, not assigned: some PDFs already carry a /Rotate.
-                page.set_rotation((page.rotation + d["rotation"]) % 360)
-
-            if removing:
-                # Removed pages leave unreferenced objects behind; garbage
-                # collection is what actually takes them out of the file.
-                doc.save(out_path, garbage=4, deflate=True)
-            else:
-                # Rotation only: no garbage/deflate, so only the page
-                # dictionaries differ from the original -- the rotation
-                # script's own rule for a lossless fix.
-                doc.save(out_path)
-    finally:
-        if not doc.is_closed:
-            doc.close()
+    out_path = fixed_dir / pdf_path.name
+    turns = {d["page_idx"]: d["rotation"] for d in rotations
+             if d["confidence"] in _APPLIED_CONFIDENCE}
+    write_fixed_pdf(pdf_path, out_path, keep, turns)
 
     return PageFixResult(
         source_name=pdf_path.name,
@@ -361,6 +324,74 @@ def fix_pdf(
         duplicates=duplicates,
         rotations=rotations,
     )
+
+
+def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict) -> None:
+    """Write the fixed PDF: the pages in ``keep``, each turned by ``turns``.
+
+    ``keep`` is 0-based original page numbers in order; ``turns`` maps an
+    original page number to degrees added to that page's own /Rotate (the
+    same addition the rotation script's apply step makes). Always built from
+    the untouched upload, so earlier choices never compound.
+
+    Written beside the target and swapped in, so the fixed PDF is never left
+    half-written if something goes wrong mid-save.
+    """
+    temp = fixed_pdf.with_name(fixed_pdf.stem + ".tmp.pdf")
+    with fitz.open(original_pdf) as doc:
+        removing = len(keep) < doc.page_count
+        turning = {i: t for i, t in turns.items() if t % 360}
+
+        if not removing and not turning:
+            # Nothing to change: an exact copy, over any stale one.
+            shutil.copy2(original_pdf, temp)
+        else:
+            if removing:
+                # select() rewrites the document to exactly this page list.
+                doc.select(keep)
+            position = {original: new for new, original in enumerate(keep)}
+            for original, turn in turning.items():
+                if original in position:
+                    page = doc[position[original]]
+                    # Added, not assigned: some PDFs already carry a /Rotate.
+                    page.set_rotation((page.rotation + turn) % 360)
+            if removing:
+                # Removed pages leave unreferenced objects behind; garbage
+                # collection is what actually takes them out of the file.
+                doc.save(temp, garbage=4, deflate=True)
+            else:
+                # Turns only: no garbage/deflate, so only the page
+                # dictionaries differ from the original.
+                doc.save(temp)
+    os.replace(temp, fixed_pdf)
+
+
+def rebuild_fixed_pdf(original_pdf: Path, fixed_pdf: Path, duplicates: list,
+                      rotations: list) -> list:
+    """Rewrite the fixed PDF from a document's records, after a person
+    removes or restores a repeated page.
+
+    Removing a page shifts every page after it, so the whole file is rebuilt
+    from the upload with the current removals (``duplicates`` records marked
+    ``removed``) and turns (each rotation record's ``current``), and each
+    rotation record's ``fixed_idx`` is updated in place -- None for a page
+    that is now removed. Returns the kept original page numbers.
+    """
+    with fitz.open(original_pdf) as doc:
+        page_count = doc.page_count
+    removed = {d["dupe_idx"] for d in duplicates if d.get("removed")}
+    keep = [i for i in range(page_count) if i not in removed]
+    # The same guard fix_pdf always had: never a zero-page PDF.
+    if not keep:
+        keep = list(range(page_count))
+
+    turns = {r["original_idx"]: r["current"] for r in rotations}
+    write_fixed_pdf(original_pdf, fixed_pdf, keep, turns)
+
+    position = {original: new for new, original in enumerate(keep)}
+    for r in rotations:
+        r["fixed_idx"] = position.get(r["original_idx"])
+    return keep
 
 
 def rotation_records(result: Optional[PageFixResult]) -> list:
@@ -438,7 +469,10 @@ def page_fix_fields(result: Optional[PageFixResult]) -> dict:
         "page_count": result.kept_page_count if result else None,
         "original_page_count": result.original_page_count if result else None,
         "duplicates_removed": result.duplicates_removed if result else 0,
-        "duplicates": result.duplicates if result else [],
+        "duplicates_flagged": result.duplicates_flagged if result else 0,
+        # Every suspected repeat starts kept; a person decides.
+        "duplicates": [dict(d, removed=False, decided=False)
+                       for d in (result.duplicates if result else [])],
         "pages_rotated": result.pages_rotated if result else 0,
         "pages_for_review": result.pages_for_review if result else 0,
         "rotations": rotation_records(result),
@@ -1501,7 +1535,7 @@ def run_pipeline(
         result = fix_pdf(pdf, fixed_dir, classifier=classifier)
         fix_results[pdf.name] = result
         emit(event="fix_done", filename=pdf.name,
-             removed=result.duplicates_removed,
+             repeats=result.duplicates_flagged,
              rotated=result.pages_rotated,
              review=result.pages_for_review)
 

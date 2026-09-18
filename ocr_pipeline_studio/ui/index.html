@@ -40,7 +40,7 @@
         <span>What to run</span>
         <select id="run-kind">
           <option value="full" selected>Full pipeline - page fixes + abstract</option>
-          <option value="fixes">Page fixes only - remove repeats, turn sideways pages</option>
+          <option value="fixes">Page fixes only - flag repeats, turn sideways pages</option>
         </select>
       </label>
       <label>
@@ -54,9 +54,9 @@
     </div>
     <p class="hint" id="mode-help"></p>
     <p class="hint" id="kind-help" hidden>
-      No OCR and no vision model: each PDF has its repeated pages removed and
-      its sideways pages turned, and you download the corrected PDFs. For
-      theses with no abstract to extract.
+      No OCR and no vision model: each PDF has its sideways pages turned and
+      its possible repeats flagged for you to check. The corrected PDFs are in
+      the run's fixed folder. For theses with no abstract to extract.
     </p>
   </section>
 
@@ -114,7 +114,7 @@
       </div>
       <ul id="doc-list" class="doc-list"></ul>
       <div class="sidebar-actions">
-        <button id="save-btn" class="primary">Save edits</button>
+        <button id="save-btn" class="primary">Save changes</button>
       </div>
       <p id="save-status" class="muted small"></p>
     </aside>

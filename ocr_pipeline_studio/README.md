@@ -2,10 +2,10 @@
 
 A local desktop app for pulling abstracts out of scanned PDF theses.
 
-Drop PDFs on the window. The app removes repeated/duplicate pages, runs the
-pages through PaddleOCR, optionally has a local vision model re-read them, and
-then gives you an editor with a live preview so you can fix up the result
-before saving it.
+Drop PDFs on the window. The app flags pages that look repeated, turns
+sideways pages upright, runs the pages through PaddleOCR, optionally has a
+local vision model re-read them, and then gives you an editor with a live
+preview so you can fix up the result before saving it.
 
 **Everything runs on this machine.** The only network traffic is to Ollama on
 `localhost:11434`. Nothing is ever sent to the internet.
@@ -111,10 +111,12 @@ python app.py
 
 3. Drop your PDFs and press **Run pipeline**.
 
-Every run first removes repeated pages and turns sideways pages upright, then
-reads the abstracts.
+Every run first turns sideways pages upright and flags pages that look like
+repeats of earlier ones, then reads the abstracts. Repeats are **never removed
+automatically** -- the matching gets it wrong too often -- so you decide on the
+Page fixes tab.
 
-**What to run** has a second option, **Page fixes only**. It removes repeats
+**What to run** has a second option, **Page fixes only**. It flags repeats
 and turns sideways pages, and stops there: no OCR, no vision model, and Ollama
 does not need to be running. Use it for theses that have no abstract. The
 Review screen then shows the fixes, and the corrected PDFs are in the run's
@@ -123,8 +125,7 @@ Review screen then shows the fixes, and the corrected PDFs are in the run's
 **Abstract in the wrong place?** Each dropped file has a box for its abstract
 pages. Type them as numbered in your PDF (`5-8`, or `5` for one page) and the
 app uses those instead of searching for the heading. Leave it blank to search
-as usual. The app adjusts the numbers itself if repeated pages were removed
-before them.
+as usual.
 
 When a run finishes, every file in the queue gets a **Rerun abstract** button
 (with its own pages box) and a **Page fixes only** button. Either one starts a
@@ -149,7 +150,11 @@ Type in the left, the right updates as you go. More tabs sit above it:
 the model's own transcription of flagged pages, and **Page fixes** shows
 what was changed in the PDF before OCR:
 
-- each repeated page that was removed, beside the page it matched;
+- each page that looks like a repeat, beside the earlier page it matched.
+  Nothing has been removed: compare the two and use **Keep / Remove** under
+  the pair. Switching is instant and you can change your mind as often as you
+  like; the fixed PDF is only rewritten when you press **Save changes**, which
+  takes out every page marked Remove and puts back any you kept again;
 - each sideways page that was turned, as scanned and as corrected;
 - pages that *may* be sideways but were left alone because the evidence was
   weak. Check these yourself.
@@ -164,7 +169,9 @@ the abstract has already been read by then, so if you change a page inside
 it, **Rerun abstract** reads it again.
 
 Page numbers on that tab are your PDF's own. The sidebar chips
-`repeat(s) removed`, `rotated` and `rotation check` show the counts.
+`possible repeat(s)`, `removed`, `rotated` and `rotation check` show the
+counts. Removing or keeping a page only changes the fixed PDF; like a turn, it
+does not re-read an abstract that was already read.
 
 ### Applying differences in one click
 
@@ -197,8 +204,9 @@ says so rather than pretending otherwise:
   entirely, so there is no existing text to swap out.
 
 Nothing here touches the files on disk. Applying, reverting and typing all
-stay in memory until you press **Save edits**, which writes them back to the
-`.md` files in the run's `output/` folder. **Open folder** takes you there.
+stay in memory until you press **Save changes**, which writes them back to the
+`.md` files in the run's `output/` folder, along with any Keep/Remove choices
+on the Page fixes tab. **Open folder** takes you there.
 
 ---
 
@@ -216,8 +224,8 @@ The **Open folder** button in the top bar opens the current run's folder (or
 ```
 workdir/<date>_<time>_<first file>/
 ├── uploads/    the PDFs exactly as you dropped them
-├── fixed/      the PDFs with repeated pages removed and sideways pages
-│               turned -- what OCR reads, and the corrected PDFs to keep
+├── fixed/      the PDFs with sideways pages turned, and any repeats you
+│               removed taken out -- what OCR reads, and the PDFs to keep
 ├── drafts/     the OCR script's own raw output
 ├── output/     <doc>.md, <doc>.pages.json, manifest.json
 └── overrides.csv   abstract pages you typed, if any, as the OCR script reads them
@@ -231,7 +239,8 @@ lost.
 `workdir/` is git-ignored, so nothing you process is ever committed.
 
 `manifest.json` records, per document: `filename`, `page_count`,
-`duplicates_removed`, `model_used` and `processed_at`.
+`duplicates_removed` (at the end of the run, always 0 -- removals are
+yours to make), `model_used` and `processed_at`.
 
 `<doc>.pages.json` is only written when a document actually has flagged pages.
 It lists the page numbers and the reason each was flagged. **It does not
