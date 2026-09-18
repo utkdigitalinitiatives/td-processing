@@ -142,6 +142,19 @@
         <div class="pane">
           <div class="pane-head">Preview</div>
           <div id="preview" class="preview"></div>
+          <!-- Copies the abstract as HTML source for plain fields (the
+               catalog), and as formatted text for Word or email. -->
+          <div class="pane-foot">
+            <span id="copy-status" class="muted small"></span>
+            <button id="copy-btn" class="ghost copy-btn"
+                    title="Copy this abstract: HTML source when pasted into a plain text field, formatted text in Word or email">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="5.5" y="2.5" width="8" height="10" rx="1.5"/>
+                <path d="M3.5 5.5v7a1.5 1.5 0 0 0 1.5 1.5h5.5"/>
+              </svg>
+              Copy
+            </button>
+          </div>
         </div>
       </div>
 

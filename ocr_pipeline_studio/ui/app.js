@@ -1249,6 +1249,49 @@
     });
   }
 
+  // ---------- copying the abstract ----------
+
+  // Puts the abstract on the clipboard in two forms at once, and the pasting
+  // program picks: a plain text field (the catalog) gets the HTML source --
+  // the <sup>/<sub> tags and entities are the point -- while Word or email
+  // gets the formatted text, as the preview shows it.
+  function copyAbstract() {
+    var source = $("editor").value || "";
+    if (!source.trim()) { flashCopyStatus("Nothing to copy."); return; }
+    var rendered = md.render(source);
+
+    var copied;
+    if (navigator.clipboard && window.ClipboardItem) {
+      copied = navigator.clipboard.write([new ClipboardItem({
+        "text/plain": new Blob([source], { type: "text/plain" }),
+        "text/html": new Blob([rendered], { type: "text/html" })
+      })]);
+    } else if (navigator.clipboard) {
+      copied = navigator.clipboard.writeText(source);
+    } else {
+      copied = Promise.reject(new Error("clipboard unavailable"));
+    }
+
+    copied.then(function () {
+      flashCopyStatus("Copied.");
+    }).catch(function () {
+      // Older fallback: select the source text and copy it.
+      var editor = $("editor");
+      editor.focus();
+      editor.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      flashCopyStatus(ok ? "Copied." : "Could not copy - select the source text and press Ctrl+C.");
+    });
+  }
+
+  function flashCopyStatus(message) {
+    var status = $("copy-status");
+    status.textContent = message;
+    clearTimeout(state.copyTimer);
+    state.copyTimer = setTimeout(function () { status.textContent = ""; }, 2500);
+  }
+
   // ---------- editing and saving ----------
 
   function onEditorInput() {
@@ -1337,6 +1380,7 @@
     on($("editor"), "input", onEditorInput);
     on($("save-btn"), "click", saveEdits);
     on($("open-folder-btn"), "click", openFolder);
+    on($("copy-btn"), "click", copyAbstract);
 
     document.querySelectorAll(".topbar .tab").forEach(function (tab) {
       on(tab, "click", function () {
