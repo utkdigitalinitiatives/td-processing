@@ -34,6 +34,7 @@ deliberate and is the single most important design decision in this file:
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -799,6 +800,42 @@ def _offsets_of(text: str, needle: str) -> list:
     return positions
 
 
+# Tokens this short are found inside ordinary text everywhere, so a plain
+# substring search says nothing about whether *this* span is still there.
+_SHORT_TOKEN = 2
+_WORD_CHAR = r"A-Za-z0-9"
+
+
+def _span_offsets(text: str, needle: str) -> list:
+    """Where a diff span's text sits in the document, as the span means it.
+
+    The diff report splits on whitespace, so a span is a whole token. For
+    most spans a substring search finds it well enough, but two kinds match
+    all over the text and would make a resolved span look unresolved:
+
+    * Punctuation alone (a stray "." the OCR read twice): only a mark not
+      attached to a word counts -- "Knoxville..", "word ." -- never the
+      ordinary full stop at the end of every sentence.
+    * One or two letters (a stray "y"): only as a word on its own, not
+      inside other words.
+    """
+    if not needle:
+        return []
+    if not re.search("[%s]" % _WORD_CHAR, needle):
+        # Not after a word, a closing bracket or quote, or a closing tag --
+        # "10<sup>3</sup>." ends a sentence like any other.
+        pattern = r"(?<![%s)\]\"'%%>])%s" % (_WORD_CHAR, re.escape(needle))
+    elif len(needle) <= _SHORT_TOKEN:
+        pattern = r"(?<![%s])%s(?![%s])" % (_WORD_CHAR, re.escape(needle), _WORD_CHAR)
+    else:
+        return _offsets_of(text, needle)
+    return [m.start() for m in re.finditer(pattern, text)]
+
+
+def _span_present(text: str, needle: str) -> bool:
+    return bool(_span_offsets(text, needle))
+
+
 def make_hint(text: str, offset: int, length: int) -> dict:
     """Record where a span sits, and what sits either side of it.
 
@@ -824,7 +861,7 @@ def _resolve_offset(text: str, needle: str, hint):
 
     Returns ``(offset, status)`` with status "ok", "not_found" or "ambiguous".
     """
-    positions = _offsets_of(text, needle)
+    positions = _span_offsets(text, needle)
     if not positions:
         return -1, "not_found"
     if len(positions) == 1:
@@ -893,7 +930,7 @@ def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
             if raw == NOTHING_SPAN:
                 continue
             needle = normalize(raw)
-            for position in _offsets_of(text, needle):
+            for position in _span_offsets(text, needle):
                 score = (
                     _common_suffix_len(text[:position], before)
                     + _common_prefix_len(text[position + len(needle):], after)
@@ -916,14 +953,14 @@ def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
 
     # No usable position -- fall back to plain presence.
     if vlm_span == NOTHING_SPAN:
-        return "ocr" if normalize(ocr_span) in text else "vlm"
+        return "ocr" if _span_present(text, normalize(ocr_span)) else "vlm"
     if ocr_span == NOTHING_SPAN:
-        return "vlm" if normalize(vlm_span) in text else "ocr"
+        return "vlm" if _span_present(text, normalize(vlm_span)) else "ocr"
 
     ocr_needle = normalize(ocr_span)
     vlm_needle = normalize(vlm_span)
-    ocr_present = ocr_needle in text
-    vlm_present = vlm_needle in text
+    ocr_present = _span_present(text, ocr_needle)
+    vlm_present = _span_present(text, vlm_needle)
     if vlm_present and not ocr_present:
         return "vlm"
     if ocr_present and not vlm_present:
@@ -976,13 +1013,16 @@ def _restore_point(text: str, hint):
     return None
 
 
-def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=None):
+def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=None,
+               at_offset=None):
     """Rewrite one diff span in ``text`` to the chosen side.
 
     ``direction`` is "vlm" to take the model's reading or "ocr" to put the
     OCR's reading back. ``hint`` is the record of where this span was last
     written, which is what makes the swap reliably reversible -- see
-    _resolve_offset().
+    _resolve_offset(). ``at_offset`` is a place the user picked from
+    span_occurrences() for text that appears more than once; it settles the
+    ambiguity in their words rather than ours.
 
     Returns ``(new_text, status, hint)``. The returned hint describes where
     the span's text now sits and should be passed back in next time; on a
@@ -995,6 +1035,8 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
                        which one is this span's, so replacing would be a guess
       "unplaceable" -- there is nothing to match against and no remembered
                        position, so there is nowhere to put the text
+      "moved"       -- ``at_offset`` no longer points at the text, because the
+                       document changed after the places were listed
 
     Refusing an ambiguous match is the safety property that matters here:
     rewriting the wrong occurrence would corrupt the document somewhere the
@@ -1039,11 +1081,19 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
         return new_text, "applied", make_hint(new_text, words_at, len(replacement))
 
     needle = normalize(find_raw)
-    offset, status = _resolve_offset(text, needle, hint)
+    if at_offset is not None:
+        # Only honoured while the text is still exactly where it was listed.
+        # Anywhere else would be replacing something the user did not pick.
+        if needle and 0 <= at_offset and text[at_offset:at_offset + len(needle)] == needle:
+            offset, status = at_offset, "ok"
+        else:
+            return text, "moved", hint
+    else:
+        offset, status = _resolve_offset(text, needle, hint)
 
     if status == "not_found":
         # Already showing the other side is the common, harmless case.
-        if replacement and replacement in text:
+        if replacement and _span_present(text, replacement):
             return text, "unchanged", hint
         return text, "not_found", hint
     if status == "ambiguous":
@@ -1087,6 +1137,170 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
             offset = emptied.start()
 
     return new_text, "applied", make_hint(new_text, offset, len(replacement))
+
+
+# --------------------------------------------------------------------------
+# Choosing among repeated text
+# --------------------------------------------------------------------------
+# The diff report names each difference only by its words, never by where it
+# is. When those words appear more than once, apply_span() cannot know which
+# copy is meant, so the user picks -- from each copy shown in its surrounding
+# words, with a best guess marked.
+
+# How much surrounding text to show either side of each copy.
+_CHOICE_CONTEXT_CHARS = 40
+
+_RE_TAG = re.compile(r"<[^>]*>")
+
+
+def _readable(fragment: str) -> str:
+    """HTML fragment -> plain words, for display only."""
+    return re.sub(r"\s+", " ", html.unescape(_RE_TAG.sub(" ", fragment)))
+
+
+def span_choices(text: str, ocr_span: str, vlm_span: str, state: str, hint=None):
+    """The copies a click on this span would have to choose between.
+
+    ``state`` is span_state()'s answer. The click switches to the other side,
+    so the text being replaced is the side the document shows now. Returns
+    ``(direction, occurrences)`` when that text appears more than once and
+    the span's remembered position does not settle which copy is its own;
+    otherwise None. Each occurrence is ``{offset, before, match, after}``,
+    where ``offset`` is the raw position to send back and the rest is
+    readable text.
+    """
+    if state not in ("ocr", "vlm"):
+        return None
+    raw = ocr_span if state == "ocr" else vlm_span
+    if raw == NOTHING_SPAN:
+        return None
+
+    needle = _get_normalizer()(raw)
+    positions = _span_offsets(text, needle)
+    if len(positions) < 2 or _resolve_offset(text, needle, hint)[1] != "ambiguous":
+        return None
+
+    reach = _CHOICE_CONTEXT_CHARS * 2  # raw text includes tags, so read wider
+    occurrences = []
+    for position in positions:
+        end = position + len(needle)
+        before = text[max(0, position - reach):position]
+        after = text[end:end + reach]
+        # Drop a tag cut in half by the window edge.
+        if ">" in before and "<" not in before[:before.index(">")]:
+            before = before[before.index(">") + 1:]
+        if "<" in after and ">" not in after[after.rindex("<"):]:
+            after = after[:after.rindex("<")]
+        before = _readable(before)
+        after = _readable(after)
+        # Trimmed to whole words, so the context never starts or ends mid-word.
+        if len(before) > _CHOICE_CONTEXT_CHARS:
+            before = before[-_CHOICE_CONTEXT_CHARS:]
+            before = before[before.find(" ") + 1:] if " " in before else before
+        if len(after) > _CHOICE_CONTEXT_CHARS:
+            after = after[:_CHOICE_CONTEXT_CHARS]
+            after = after[:after.rfind(" ")] if " " in after else after
+        occurrences.append({
+            "offset": position,
+            "before": before.strip(),
+            "match": _readable(needle).strip(),
+            "after": after.strip(),
+        })
+    direction = "vlm" if state == "ocr" else "ocr"
+    return direction, occurrences
+
+
+def _picked_side(hint) -> Optional[str]:
+    """The side whose repeated text the user picked a copy of, if they did."""
+    return hint.get("picked_side") if hint else None
+
+
+def span_choice_view(text: str, ocr_span: str, vlm_span: str, state: str, hint=None):
+    """What the copy picker for this span should show, or None for no picker.
+
+    Two situations get a picker:
+
+    * Not yet picked: the text appears more than once and nothing says which
+      copy is this span's -- every copy is listed, none selected.
+    * Already picked: the list stays available so a wrong pick can be moved.
+      The copies are listed as the document reads with the pick undone, since
+      that is the text a new pick applies to, and ``selected`` marks the copy
+      currently changed.
+
+    Returns ``{choose_direction, occurrences, selected}``.
+    """
+    picked = _picked_side(hint)
+    if picked and state in ("ocr", "vlm") and state != picked:
+        base, status, base_hint = apply_span(text, ocr_span, vlm_span, picked, hint)
+        if status != "applied":
+            return None
+        found = span_choices(base, ocr_span, vlm_span, picked)
+        if found is None:
+            return None
+        direction, occurrences = found
+        selected = next((i for i, o in enumerate(occurrences)
+                         if o["offset"] == base_hint["offset"]), None)
+        return {"choose_direction": direction, "occurrences": occurrences, "selected": selected}
+
+    # A span picked before and since put back lists its copies afresh; its
+    # remembered position must not hide the picker.
+    found = span_choices(text, ocr_span, vlm_span, state, None if picked else hint)
+    if found is None:
+        return None
+    direction, occurrences = found
+    return {"choose_direction": direction, "occurrences": occurrences, "selected": None}
+
+
+def apply_span_choice(text: str, ocr_span: str, vlm_span: str, direction: str,
+                      hint, at_offset: int):
+    """Apply a span at the copy the user picked, moving an earlier pick.
+
+    ``at_offset`` is a position from span_choice_view(). If this span already
+    has a pick applied, that pick is undone first -- the listed positions
+    describe the text with it undone -- and the new copy changed instead, so
+    correcting a wrong pick is one click. On any refusal the text is handed
+    back exactly as it came in.
+
+    Returns ``(new_text, status, hint)``; the hint records the picked side,
+    which is what keeps the picker available afterwards.
+    """
+    picked = _picked_side(hint)
+    base = text
+    if picked and span_state(text, ocr_span, vlm_span, hint) not in (picked, "unclear"):
+        base, status, _ = apply_span(text, ocr_span, vlm_span, picked, hint)
+        if status != "applied":
+            return text, "moved", hint
+
+    new_text, status, new_hint = apply_span(base, ocr_span, vlm_span, direction, None,
+                                            at_offset=at_offset)
+    if status != "applied":
+        return text, status, hint
+    replaced = "ocr" if direction == "vlm" else "vlm"
+    return new_text, "applied", dict(new_hint, picked_side=replaced)
+
+
+def suggest_occurrences(text: str, spans: list) -> list:
+    """A best guess at where each span sits, for marking one choice "likely".
+
+    ``spans`` is ``[(ocr_span, vlm_span, state), ...]`` in report order. The
+    report lists differences page by page, top to bottom, which is also the
+    order of the text -- so walking both together, each span most likely sits
+    at the first copy of its text after the previous span's. Returns one
+    offset (or None) per span. A guess, never applied on its own.
+    """
+    normalize = _get_normalizer()
+    cursor = 0
+    guesses = []
+    for ocr_span, vlm_span, state in spans:
+        raw = ocr_span if state == "ocr" else vlm_span if state == "vlm" else NOTHING_SPAN
+        needle = normalize(raw) if raw != NOTHING_SPAN else ""
+        at = next((o for o in _span_offsets(text, needle) if o >= cursor), -1)
+        if at == -1:
+            guesses.append(None)
+            continue
+        guesses.append(at)
+        cursor = at + len(needle)
+    return guesses
 
 
 def collect_outputs(

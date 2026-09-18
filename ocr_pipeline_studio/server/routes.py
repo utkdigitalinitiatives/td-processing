@@ -518,6 +518,10 @@ def _diffs_with_state(diffs: list, text: str, offsets: dict) -> list:
     buttons stay honest even after the user has edited the textarea by hand or
     applied a span and changed their mind. ``offsets`` supplies each span's
     last known position, which resolves the cases the text alone cannot.
+
+    A span whose text appears more than once also gets ``occurrences`` to pick
+    from, ``selected`` (the copy currently changed, once one has been picked)
+    and ``suggested`` (the likeliest copy, while none is picked).
     """
     annotated = []
     for page in diffs:
@@ -527,8 +531,22 @@ def _diffs_with_state(diffs: list, text: str, offsets: dict) -> list:
             spans.append(dict(
                 span,
                 state=runner.span_state(text, span["ocr"], span["vlm"], hint),
+                hint=hint,
             ))
         annotated.append({"page": page["page"], "spans": spans})
+
+    flat = [span for page in annotated for span in page["spans"]]
+    guesses = runner.suggest_occurrences(
+        text, [(s["ocr"], s["vlm"], s["state"]) for s in flat])
+    for span, guess in zip(flat, guesses):
+        view = runner.span_choice_view(text, span["ocr"], span["vlm"],
+                                       span["state"], span.pop("hint"))
+        if view is None:
+            continue
+        span.update(view)
+        offsets_listed = [o["offset"] for o in view["occurrences"]]
+        span["suggested"] = (offsets_listed.index(guess)
+                             if view["selected"] is None and guess in offsets_listed else None)
     return annotated
 
 
@@ -667,7 +685,8 @@ def apply_spans(job_id: str, name: str):
 
     The request body takes either a single ``{page, index, direction}`` or
     ``{direction, all: true}`` to sweep every span that is not already on the
-    requested side.
+    requested side. A single span may also carry ``at_offset``: the copy the
+    user picked when its text appears more than once.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -711,21 +730,35 @@ def apply_spans(job_id: str, name: str):
 
     offsets = job.span_offsets.setdefault(name, {})
 
+    # Only meaningful for one span: it is a position in the text as it stands.
+    at_offset = None if payload.get("all") else payload.get("at_offset")
+    if at_offset is not None and (isinstance(at_offset, bool) or not isinstance(at_offset, int)):
+        return jsonify({"error": "at_offset must be a whole number."}), 400
+
     counts = {"applied": 0, "unchanged": 0, "not_found": 0,
-              "ambiguous": 0, "unplaceable": 0}
+              "ambiguous": 0, "unplaceable": 0, "moved": 0}
     skipped = []
     for page_no, index, span in targets:
         key = _span_key(page_no, index)
         hint = offsets.get(key)
 
         # Skip spans already showing the requested side, so a bulk apply does
-        # not report them as failures.
-        if runner.span_state(text, span["ocr"], span["vlm"], hint) == direction:
+        # not report them as failures. A picked copy is exempt: picking a
+        # different copy of an applied span moves the change, it is not a no-op.
+        if at_offset is None and runner.span_state(text, span["ocr"], span["vlm"], hint) == direction:
             counts["unchanged"] += 1
             continue
 
-        text, status, new_hint = runner.apply_span(
-            text, span["ocr"], span["vlm"], direction, hint)
+        if at_offset is not None:
+            text, status, new_hint = runner.apply_span_choice(
+                text, span["ocr"], span["vlm"], direction, hint, at_offset)
+        else:
+            text, status, new_hint = runner.apply_span(
+                text, span["ocr"], span["vlm"], direction, hint)
+            # A span once picked from repeated text keeps its picker through
+            # an ordinary swap back and forth.
+            if status == "applied" and hint and hint.get("picked_side"):
+                new_hint = dict(new_hint, picked_side=hint["picked_side"])
         counts[status] += 1
 
         if status == "applied":

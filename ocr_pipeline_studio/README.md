@@ -169,11 +169,21 @@ text in the editor yourself. Clicking back reverts it.
 OCR side at once, and **Revert all to OCR** undoes the lot. Both report what
 they did underneath.
 
-Some differences cannot be applied automatically, and the app says so rather
-than pretending otherwise:
+**When the words appear more than once.** The diff report only says *what*
+changed, not *where*, so if the same words occur several times in the abstract
+the app will not guess which copy is meant. Instead the row lists every copy
+in its surrounding words -- with the likeliest one marked, going by the order
+the differences were read in -- and you click the one to change. Only that
+copy changes, and clicking the other side afterwards puts back exactly that
+copy.
 
-- *text appears more than once* -- the same words occur elsewhere in the
-  abstract, so replacing one would be a guess about which. Edit it by hand.
+Once you pick, the list collapses to a single line saying which copy was
+changed. Picked the wrong one? Open it again and click the right copy: the
+change moves there, and the copy you picked first goes back to how it was.
+
+One kind of difference still cannot be applied automatically, and the app
+says so rather than pretending otherwise:
+
 - *nothing to match against* -- the model added words the OCR missed
   entirely, so there is no existing text to swap out.
 

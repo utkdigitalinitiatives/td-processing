@@ -28,7 +28,8 @@
     current: null,      // full payload for the open document
     dirty: {},          // name -> true when edited but unsaved
     editTimer: null,
-    lastSkip: null      // a single-span click that could not be carried out
+    lastSkip: null,     // a single-span click that could not be carried out
+    choiceOpen: {}      // "page:index" -> open/closed, for copy pickers the user toggled
   };
 
   // ---------- tiny DOM helpers ----------
@@ -559,6 +560,7 @@
     api("/document/" + state.jobId + "/" + encodeURIComponent(name))
       .then(function (doc) {
         state.current = doc;
+        state.choiceOpen = {};
         $("doc-title").textContent = doc.name;
 
         var meta = [];
@@ -723,7 +725,92 @@
     row.appendChild(buildSideButton(pageNo, index, span, "ocr"));
     row.appendChild(buildSideButton(pageNo, index, span, "vlm"));
 
+    if (span.occurrences) {
+      row.classList.add("needs-choice");
+      row.appendChild(buildChoices(pageNo, index, span));
+    }
+
     return row;
+  }
+
+  // The words this difference is about appear more than once, and nothing
+  // says which copy is its own. Rather than guess -- and quietly change the
+  // wrong sentence -- each copy is listed in its surrounding words for the
+  // user to pick. The list is a dropdown that stays on the row: open until a
+  // copy is picked, then collapsed to show which one, so a wrong pick can be
+  // reopened and moved to the right copy.
+  function buildChoices(pageNo, index, span) {
+    var picked = span.selected != null;
+
+    // Every apply redraws all the rows, so a picker keeps whatever the user
+    // last did with it -- one they folded away stays folded while they work
+    // on other rows. Untouched, it is open until a copy is picked.
+    var key = pageNo + ":" + index;
+    var box = document.createElement("details");
+    box.className = "choices" + (picked ? " is-picked" : "");
+    box.open = key in state.choiceOpen ? state.choiceOpen[key] : !picked;
+    on(box, "toggle", function () { state.choiceOpen[key] = box.open; });
+
+    var summary = document.createElement("summary");
+    if (picked) {
+      var chosen = span.occurrences[span.selected];
+      summary.appendChild(text("Changed copy " + (span.selected + 1) + " of "
+        + span.occurrences.length + ": "));
+      // Shown with the reading the document now has at that copy.
+      summary.appendChild(copyInContext(chosen, span[span.state]));
+      var change = document.createElement("span");
+      change.className = "choices-change";
+      change.textContent = "change";
+      summary.appendChild(change);
+    } else {
+      summary.textContent = "This appears " + span.occurrences.length
+        + " times - pick which one to change";
+    }
+    box.appendChild(summary);
+
+    var list = document.createElement("div");
+    list.className = "choices-list";
+    span.occurrences.forEach(function (occurrence, i) {
+      var isSelected = i === span.selected;
+      var button = document.createElement("button");
+      button.className = "choice"
+        + (isSelected ? " is-selected" : "")
+        + (i === span.suggested ? " is-suggested" : "");
+      button.title = isSelected ? "This is the copy currently changed."
+        : picked ? "Move the change to this copy instead."
+        : "Change this copy only.";
+      button.appendChild(copyInContext(occurrence, occurrence.match));
+
+      var tagText = isSelected ? "current" : (i === span.suggested ? "likely" : "");
+      if (tagText) {
+        var tag = document.createElement("span");
+        tag.className = "likely";
+        tag.textContent = tagText;
+        button.appendChild(tag);
+      }
+
+      on(button, "click", function () {
+        if (isSelected) { box.open = false; return; }
+        // Picking folds this picker away on the redraw that follows.
+        state.choiceOpen[key] = false;
+        applyDiff({ page: pageNo, index: index, direction: span.choose_direction,
+                    at_offset: occurrence.offset });
+      });
+      list.appendChild(button);
+    });
+    box.appendChild(list);
+    return box;
+  }
+
+  // "...words before [match] words after..." with the match in bold.
+  function copyInContext(occurrence, matchText) {
+    var wrap = document.createElement("span");
+    wrap.appendChild(text(occurrence.before ? "…" + occurrence.before + " " : ""));
+    var match = document.createElement("strong");
+    match.textContent = matchText;
+    wrap.appendChild(match);
+    wrap.appendChild(text(occurrence.after ? " " + occurrence.after + "…" : ""));
+    return wrap;
   }
 
   function buildSideButton(pageNo, index, span, side) {
@@ -736,6 +823,17 @@
       // than as a button that would do nothing.
       button.title = "This is what the document currently says.";
       button.disabled = true;
+    } else if (span.occurrences && span.selected == null && side === span.choose_direction) {
+      button.title = "This text appears more than once - pick which copy below.";
+      on(button, "click", function () {
+        var choices = button.parentNode.querySelector(".choices");
+        if (!choices) { return; }
+        choices.open = true;
+        choices.scrollIntoView({ block: "nearest" });
+        choices.classList.remove("flash");
+        void choices.offsetWidth;  // restart the animation on a repeat click
+        choices.classList.add("flash");
+      });
     } else {
       button.title = "Put this reading into the document.";
       on(button, "click", function () {
@@ -757,6 +855,10 @@
       state.lastSkip = (!request.all && result.skipped.length)
         ? result.skipped[0]
         : null;
+      // A pick that could not be made leaves its picker open to pick again.
+      if (request.at_offset != null && result.skipped.length) {
+        delete state.choiceOpen[request.page + ":" + request.index];
+      }
 
       // The server returns the whole document, so the editor and preview stay
       // in step with what the diff view just did.
@@ -785,7 +887,8 @@
 
     // Anything the server refused to place is reported rather than hidden --
     // a silently skipped span would leave the user believing it was applied.
-    var refused = (counts.not_found || 0) + (counts.ambiguous || 0) + (counts.unplaceable || 0);
+    var refused = (counts.not_found || 0) + (counts.ambiguous || 0)
+      + (counts.unplaceable || 0) + (counts.moved || 0);
     if (refused) {
       parts.push(refused + " left alone (" + describeSkips(result.skipped) + ")");
     }
@@ -794,7 +897,8 @@
 
   function describeSkips(skipped) {
     var reasons = {
-      ambiguous: "text appears more than once",
+      ambiguous: "text appears more than once - pick the copy on its row",
+      moved: "the text changed since the copies were listed - pick again",
       not_found: "text not found in the document",
       unplaceable: "nothing to match against"
     };
