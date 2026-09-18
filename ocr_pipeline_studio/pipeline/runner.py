@@ -373,16 +373,59 @@ def rotation_records(result: Optional[PageFixResult]) -> list:
     if result is None:
         return []
     position = {original: new for new, original in enumerate(result.kept_indices)}
-    return [
-        dict(
+    records = []
+    for d in result.rotations:
+        applied = d["confidence"] in _APPLIED_CONFIDENCE
+        records.append(dict(
             d,
-            applied=d["confidence"] in _APPLIED_CONFIDENCE,
+            applied=applied,
             original_idx=d["page_idx"],
             original_page=d["page_idx"] + 1,
             fixed_idx=position[d["page_idx"]],
-        )
-        for d in result.rotations
-    ]
+            # The turn the fixed PDF has now, on top of the page's own /Rotate.
+            # Starts as the script's decision; the user can change it.
+            current=d["rotation"] if applied else 0,
+            decided=False,
+        ))
+    return records
+
+
+VALID_TURNS = (0, 90, 180, 270)
+
+
+def set_page_rotation(original_pdf: Path, fixed_pdf: Path, original_idx: int,
+                      fixed_idx: int, turn: int) -> None:
+    """Set one page of the fixed PDF to its original orientation plus ``turn``.
+
+    For correcting the rotation step by hand: undoing a wrong turn, turning a
+    page the script was unsure about, or turning one the other way. Measured
+    from the uploaded page rather than added to the fixed one, so choosing the
+    same option twice is harmless and every option is always reachable.
+
+    Saved incrementally where possible -- only the page dictionary changes,
+    exactly as when the rotation script applies a turn itself.
+    """
+    if turn not in VALID_TURNS:
+        raise ValueError("turn must be one of %s" % (VALID_TURNS,))
+
+    with fitz.open(original_pdf) as source:
+        base = source[original_idx].rotation
+
+    doc = fitz.open(fixed_pdf)
+    try:
+        doc[fixed_idx].set_rotation((base + turn) % 360)
+        if doc.can_save_incrementally():
+            doc.save(fixed_pdf, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+        else:
+            # A file PyMuPDF had to repair cannot be appended to; write a
+            # fresh copy beside it and swap it in.
+            temp = fixed_pdf.with_suffix(".tmp.pdf")
+            doc.save(temp)
+            doc.close()
+            os.replace(temp, fixed_pdf)
+    finally:
+        if not doc.is_closed:
+            doc.close()
 
 
 def page_fix_fields(result: Optional[PageFixResult]) -> dict:

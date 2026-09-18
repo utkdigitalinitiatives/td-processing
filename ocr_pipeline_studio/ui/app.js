@@ -983,39 +983,107 @@
       ));
     }
 
+    // Changing a turn rewrites the fixed PDF, but OCR has already read it.
+    if (rotations.length && !doc.fixes_only) {
+      var note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = "Changing a page's turn updates the fixed PDF. The abstract was "
+        + "already read - if you change a page inside the abstract, use Rerun abstract "
+        + "on the Run screen to read it again.";
+      body.appendChild(note);
+    }
+
+    // Grouped by what the rotation step decided; each card can be switched
+    // to any turn, the way an OCR/VLM difference can be flipped either way.
     if (applied.length) {
       body.appendChild(fixSection(
         "Sideways pages rotated (" + applied.length + ")",
-        "Turned upright before OCR. Only the page's rotation setting changed; "
-          + "the scan itself is untouched.",
-        applied.map(function (r) {
-          return fixCard(
-            [
-              pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
-              pageFigure(doc, "fixed", r.fixed_idx, "Turned " + r.rotation + "°", 0)
-            ],
-            r.confidence + " confidence: " + r.why
-          );
-        })
+        "Turned upright before OCR. Only the page's rotation setting changes; "
+          + "the scan itself is untouched. Wrong? Pick another turn below the page.",
+        applied.map(function (r) { return rotationCard(doc, r); })
       ));
     }
 
     if (review.length) {
       body.appendChild(fixSection(
         "Possibly sideways - left alone (" + review.length + ")",
-        "The evidence was too weak to rotate these automatically. The right-hand "
-          + "image is only a preview of the suggested turn; the PDF was not changed.",
-        review.map(function (r) {
-          return fixCard(
-            [
-              pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
-              pageFigure(doc, "original", r.original_idx, "If turned " + r.rotation + "°", r.rotation)
-            ],
-            r.why
-          );
-        })
+        "The evidence was too weak to rotate these automatically. Check each "
+          + "one and pick its turn - the suggested one is marked.",
+        review.map(function (r) { return rotationCard(doc, r); })
       ));
     }
+  }
+
+  function rotationCard(doc, r) {
+    var card = fixCard(
+      [
+        pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
+        pageFigure(doc, "fixed", r.fixed_idx, turnLabel(r.current) + " in the fixed PDF", 0,
+                   r.current)
+      ],
+      (r.applied ? r.confidence + " confidence: " : "") + r.why
+        + (r.decided ? " - set by you" : "")
+    );
+    card.appendChild(turnSwitch(doc, r));
+    return card;
+  }
+
+  function turnLabel(turn) {
+    return turn ? "Turned " + turn + "°" : "Not turned";
+  }
+
+  // None / 90 / 180 / 270: the turn the fixed PDF has, on top of the page
+  // as scanned. The current one is pressed; the script's suggestion is marked.
+  function turnSwitch(doc, r) {
+    var row = document.createElement("div");
+    row.className = "turn-switch";
+    [0, 90, 180, 270].forEach(function (turn) {
+      var button = document.createElement("button");
+      button.className = "turn" + (turn === r.current ? " is-current" : "")
+        + (turn === r.rotation ? " is-suggested" : "");
+      button.textContent = turn ? turn + "°" : "None";
+      if (turn === r.rotation) {
+        var tag = document.createElement("span");
+        tag.className = "suggested-tag";
+        tag.textContent = "suggested";
+        button.appendChild(tag);
+      }
+      button.title = turn === r.current ? "This is how the page is turned now."
+        : turn ? "Turn this page " + turn + "° clockwise from how it was scanned."
+        : "Leave this page as it was scanned.";
+      button.disabled = turn === r.current;
+      on(button, "click", function () { setTurn(doc, r, turn, row); });
+      row.appendChild(button);
+    });
+    return row;
+  }
+
+  function setTurn(doc, r, turn, row) {
+    Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) { b.disabled = true; });
+    api("/rotation/" + state.jobId + "/" + encodeURIComponent(doc.name), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ original_idx: r.original_idx, turn: turn })
+    }).then(function (result) {
+      doc.rotations = result.rotations;
+      doc.pages_rotated = result.pages_rotated;
+      doc.pages_for_review = result.pages_for_review;
+      // The sidebar chips read the summaries from /status; keep them in step.
+      state.documents.forEach(function (summary) {
+        if (summary.name === doc.name) {
+          summary.pages_rotated = result.pages_rotated;
+          summary.pages_for_review = result.pages_for_review;
+        }
+      });
+      renderFixes(doc);
+      renderDocList();
+    }).catch(function (err) {
+      renderFixes(doc);
+      var note = document.createElement("p");
+      note.className = "error";
+      note.textContent = "Could not change page " + r.original_page + ": " + err.message;
+      $("fixes-body").insertBefore(note, $("fixes-body").firstChild);
+    });
   }
 
   function fixSection(title, hint, cards) {
@@ -1054,7 +1122,7 @@
     return card;
   }
 
-  function pageFigure(doc, source, pageIdx, label, previewTurn) {
+  function pageFigure(doc, source, pageIdx, label, previewTurn, version) {
     var figure = document.createElement("figure");
     figure.className = "page-thumb";
 
@@ -1067,7 +1135,10 @@
     img.loading = "lazy";
     img.alt = label;
     img.src = "/page-image/" + state.jobId + "/" + source + "/" + pageIdx + "/"
-      + encodeURIComponent(doc.name);
+      + encodeURIComponent(doc.name)
+      // A fixed-PDF page changes when its rotation does; a new URL per turn
+      // keeps the browser from showing the cached old one.
+      + (version != null ? "?turn=" + version : "");
     // /Rotate turns a page clockwise, and so does a positive CSS rotate, so
     // the preview shows exactly what applying the suggestion would give.
     if (previewTurn) { img.style.transform = "rotate(" + previewTurn + "deg)"; }

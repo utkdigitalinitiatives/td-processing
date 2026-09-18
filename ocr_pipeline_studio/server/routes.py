@@ -647,9 +647,64 @@ def page_image(job_id: str, source: str, page_idx: int, name: str):
             pdf.close()
 
     response = send_file(io.BytesIO(png), mimetype="image/png")
-    # A job's stage folders never change once the job has run.
+    # Uploads never change, and the UI adds a version to a fixed-PDF page's
+    # URL whenever its rotation is changed, so caching stays correct.
     response.headers["Cache-Control"] = "private, max-age=3600"
     return response
+
+
+@bp.post("/rotation/<job_id>/<path:name>")
+def set_rotation(job_id: str, name: str):
+    """Change how one page is turned in the fixed PDF.
+
+    For the rotation step what the OCR/VLM swap is for the text: the script's
+    turn can be undone, a page it was unsure about turned, or a page turned
+    the other way. Body: ``{original_idx, turn}`` with turn 0, 90, 180 or 270
+    degrees on top of the page as scanned.
+
+    Only pages the rotation step reported on can be changed. That is also
+    what keeps the route to this job's own files: the page is looked up in
+    the document's record, never taken as a path.
+    """
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    job = store.get(job_id)
+    if job is None:
+        return jsonify({"error": "No such job."}), 404
+    doc = _find_document(job, name)
+    if doc is None:
+        return jsonify({"error": "No such document."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    turn = payload.get("turn")
+    if turn not in runner.VALID_TURNS or isinstance(turn, bool):
+        return jsonify({"error": "turn must be 0, 90, 180 or 270."}), 400
+    record = next((r for r in doc["rotations"]
+                   if r["original_idx"] == payload.get("original_idx")), None)
+    if record is None:
+        return jsonify({"error": "That page was not part of the rotation step."}), 404
+
+    fixed_pdf = job.workdir / runner.FIXED_DIRNAME / doc["filename"]
+    original_pdf = job.workdir / runner.UPLOADS_DIRNAME / doc["filename"]
+    if not fixed_pdf.exists() or not original_pdf.exists():
+        return jsonify({"error": "The PDFs for this document are no longer in its folder."}), 404
+
+    # Shares the page-image lock: a thumbnail must not render mid-save.
+    with _render_lock:
+        runner.set_page_rotation(original_pdf, fixed_pdf, record["original_idx"],
+                                 record["fixed_idx"], turn)
+
+    record["current"] = turn
+    record["decided"] = True
+    # The counts behind the sidebar chips follow what the PDF now says.
+    doc["pages_rotated"] = sum(1 for r in doc["rotations"] if r["current"])
+    doc["pages_for_review"] = sum(1 for r in doc["rotations"]
+                                  if not r["applied"] and not r["decided"])
+
+    return jsonify({
+        "rotations": doc["rotations"],
+        "pages_rotated": doc["pages_rotated"],
+        "pages_for_review": doc["pages_for_review"],
+    })
 
 
 @bp.post("/edit/<job_id>/<path:name>")

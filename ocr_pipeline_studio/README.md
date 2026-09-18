@@ -152,7 +152,16 @@ what was changed in the PDF before OCR:
 - each repeated page that was removed, beside the page it matched;
 - each sideways page that was turned, as scanned and as corrected;
 - pages that *may* be sideways but were left alone because the evidence was
-  weak, with a preview of the suggested turn. Check these yourself.
+  weak. Check these yourself.
+
+Every page in the last two groups has a switch under it -- **None / 90° /
+180° / 270°** -- like flipping between OCR and VLM text. The turn the fixed
+PDF has now is pressed, the script's suggestion is marked, and clicking
+another changes that page in the fixed PDF straight away. Use it to undo a
+wrong turn, turn a page the script was unsure about, or turn one the other
+way. Only the page's rotation setting changes, never the scan. In a full run
+the abstract has already been read by then, so if you change a page inside
+it, **Rerun abstract** reads it again.
 
 Page numbers on that tab are your PDF's own. The sidebar chips
 `repeat(s) removed`, `rotated` and `rotation check` show the counts.
