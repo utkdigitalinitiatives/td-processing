@@ -334,6 +334,10 @@ def fix_pdf(
     )
 
 
+class FixedPdfBusy(Exception):
+    """The fixed PDF could not be replaced -- usually open in another program."""
+
+
 def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict) -> None:
     """Write the fixed PDF: the pages in ``keep``, each turned by ``turns``.
 
@@ -343,8 +347,13 @@ def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict
     the untouched upload, so earlier choices never compound.
 
     Written beside the target and swapped in, so the fixed PDF is never left
-    half-written if something goes wrong mid-save.
+    half-written if something goes wrong mid-save. Raises FixedPdfBusy when
+    the swap is refused, which on Windows means something else has the file
+    open -- a PDF viewer, usually.
     """
+    # The folder can be missing: a run's folder may have been opened after
+    # someone deleted part of it.
+    fixed_pdf.parent.mkdir(parents=True, exist_ok=True)
     temp = fixed_pdf.with_name(fixed_pdf.stem + ".tmp.pdf")
     with fitz.open(original_pdf) as doc:
         removing = len(keep) < doc.page_count
@@ -371,7 +380,18 @@ def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict
                 # Turns only: no garbage/deflate, so only the page
                 # dictionaries differ from the original.
                 doc.save(temp)
-    os.replace(temp, fixed_pdf)
+    try:
+        os.replace(temp, fixed_pdf)
+    except OSError as exc:
+        # Leaving the half-made copy behind would be litter, and would be
+        # picked up as a stray PDF by anything reading the folder.
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise FixedPdfBusy(
+            "%s could not be updated (%s). If it is open in a PDF viewer, "
+            "close it and try again." % (fixed_pdf.name, exc)) from exc
 
 
 def rebuild_fixed_pdf(original_pdf: Path, fixed_pdf: Path, duplicates: list,

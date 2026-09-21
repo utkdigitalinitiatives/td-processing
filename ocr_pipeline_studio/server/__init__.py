@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask
+from flask import Flask, jsonify
 
 from server.jobs import JobStore
 
@@ -57,6 +57,21 @@ def create_app(project_root: Optional[Path] = None) -> Flask:
     # pulls in the pipeline (and through it PaddleOCR) as a side effect.
     from server.routes import bp
     app.register_blueprint(bp)
+
+    @app.errorhandler(Exception)
+    def unhandled(exc):
+        """Answer every failure as JSON, the way the UI expects.
+
+        Flask's own 500 page is HTML, which the front end cannot read, so a
+        bug would show up in the window as an unintelligible parse error
+        instead of what went wrong. The traceback still goes to the log.
+        """
+        from werkzeug.exceptions import HTTPException
+
+        if isinstance(exc, HTTPException):
+            return jsonify({"error": exc.description}), exc.code
+        app.logger.exception(exc)
+        return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
 
     _warm_normalizer()
 

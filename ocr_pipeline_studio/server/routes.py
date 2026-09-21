@@ -109,10 +109,18 @@ def upload():
     # secure_filename strips directory components and unsafe characters.
     # The browser supplies these names, so they are never trusted as paths.
     pdfs = []
+    seen = set()
     for storage in uploaded:
         name = secure_filename(storage.filename or "")
-        if name.lower().endswith(".pdf"):
-            pdfs.append((name, storage))
+        if not name.lower().endswith(".pdf"):
+            continue
+        # Two files of the same name -- dropped from different folders, or
+        # differing only in characters secure_filename strips -- would save
+        # over each other, leaving a batch that claims more files than it has.
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        pdfs.append((name, storage))
 
     if not pdfs:
         return jsonify({"error": "None of the dropped files were PDFs."}), 400
@@ -247,9 +255,21 @@ def open_run():
         if not given:
             return jsonify({"cancelled": True})
 
-    folder = Path(str(given)).expanduser()
+    folder = Path(str(given)).expanduser().resolve()
     if not folder.is_dir():
         return jsonify({"error": "There is no folder at: %s" % folder}), 404
+
+    # Already open: hand back that job rather than a second copy of the same
+    # run. Two copies would each hold their own choices and overwrite the
+    # other's saved state, last writer winning.
+    for job in store.all():
+        if job.workdir == folder:
+            return jsonify({
+                "job_id": job.id, "files": job.files, "model": job.model,
+                "mode": job.mode, "steps": job.steps, "fixes_only": job.fixes_only,
+                "folder": str(folder), "rebuilt": False,
+                "documents": len(job.documents), "already_open": True,
+            })
 
     try:
         state = jobstate.load_state(folder)
@@ -382,6 +402,14 @@ def _launch_job(job, files: list, options: dict):
     return jsonify({"job_id": job.id, "files": files, "model": options["model"],
                     "mode": options["mode"], "steps": options["steps"],
                     "fixes_only": options["fixes_only"]})
+
+
+def _busy_message(path: Path, exc: Exception) -> str:
+    """Why a PDF could not be rewritten, in words the user can act on."""
+    if isinstance(exc, runner.FixedPdfBusy):
+        return str(exc)
+    return ("%s could not be written (%s). If it is open in a PDF viewer, close it "
+            "and try again." % (path.name, exc))
 
 
 def _fixes_detail(repeats: int, rotated: int, review: int) -> str:
@@ -834,9 +862,17 @@ def set_rotation(job_id: str, name: str):
         return jsonify({"error": "The PDFs for this document are no longer in its folder."}), 404
 
     # Shares the page-image lock: a thumbnail must not render mid-save.
-    with _render_lock:
-        runner.set_page_rotation(original_pdf, fixed_pdf, record["original_idx"],
-                                 record["fixed_idx"], turn)
+    try:
+        with _render_lock:
+            runner.set_page_rotation(original_pdf, fixed_pdf, record["original_idx"],
+                                     record["fixed_idx"], turn)
+    except (runner.FixedPdfBusy, OSError) as exc:
+        return jsonify({"error": _busy_message(fixed_pdf, exc)}), 409
+    except IndexError:
+        # The PDFs in the folder no longer match what this run recorded.
+        return jsonify({"error": "Page %d is not in %s any more - the PDFs in this "
+                                 "folder have changed since the run."
+                                 % (record["original_page"], doc["filename"])}), 409
 
     record["current"] = turn
     record["decided"] = True
@@ -1141,6 +1177,7 @@ def save(job_id: str):
         if doc["md_file"] and name in job.edits:
             text = job.edits[name]
             path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
             written.append(doc["md_file"])
             saved_text[name] = text
@@ -1148,6 +1185,11 @@ def save(job_id: str):
             rebuilt = _save_page_fixes(job, doc)
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc), "written": written}), 404
+        except (runner.FixedPdfBusy, OSError) as exc:
+            # The choices stay pending, so pressing Save again is all it takes.
+            return jsonify({"error": _busy_message(
+                job.workdir / runner.FIXED_DIRNAME / doc["filename"], exc),
+                "written": written}), 409
         if rebuilt:
             written.append("%s/%s" % (runner.FIXED_DIRNAME, doc["filename"]))
             # The rebuild moved pages, so the review screen needs the new
