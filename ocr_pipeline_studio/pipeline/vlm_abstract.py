@@ -2122,6 +2122,10 @@ def main():
     # process for exactly one PDF (see the crash-isolation loop below).
     # Not meant to be passed by hand.
     parser.add_argument("--single-pdf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--isolate-pdfs", action="store_true",
+                         help="Process each PDF in its own child process, as older versions did. "
+                              "Slower (every PDF re-imports PaddleOCR and starts its own OCR "
+                              "worker); only useful if a non-OCR crash is suspected.")
     parser.add_argument("--vlm-review", action="store_true",
                          help="Opt-in: use a local Ollama vision model as a second-pass review for pages "
                               "that look suspicious (or all pages, with --vlm-review-mode always). Gracefully "
@@ -2189,10 +2193,40 @@ def main():
     print(f"Force single paragraph: {'yes' if args.force_single_paragraph else 'no'}")
     print(f"="*70)
 
-    # Process each PDF in isolation, retrying once if a crash occurs.
+    # Process each PDF, retrying once if it fails. By default this happens in
+    # this process, so one OCR worker (see run_ocr_worker_loop) serves every
+    # page of every PDF: a child process per PDF used to cost ~25 s each --
+    # ~10 s re-importing PaddleOCR, ~15 s starting that PDF's own worker --
+    # before any reading. The crash-prone part, PaddleOCR's native code, is
+    # isolated in the worker either way; a Python error in one PDF is caught
+    # below and the batch carries on, as it did with a child per PDF.
     failures = []
     for idx, pdf in enumerate(pdfs, 1):
         print(f"\n[{idx}/{len(pdfs)}] ", end="", flush=True)
+        if not args.isolate_pdfs:
+            success = False
+            for attempt in (1, 2):
+                try:
+                    process_pdf(
+                        pdf,
+                        out_dir,
+                        overrides=overrides,
+                        max_first_pages=15,
+                        confidence_threshold=args.confidence_threshold,
+                        force_single_paragraph=args.force_single_paragraph,
+                        vlm_review_mode=vlm_review_mode,
+                        vlm_trigger_threshold=args.vlm_trigger_threshold,
+                        vlm_diff_review=vlm_diff_review_enabled,
+                    )
+                    success = True
+                    break
+                except Exception as e:
+                    print(f"  ⚠ Failed ({type(e).__name__}: {e}) processing {pdf.name}"
+                          + (", retrying once..." if attempt == 1 else ", giving up after retry."))
+            if not success:
+                failures.append(pdf.name)
+            continue
+
         cmd = [
             sys.executable, str(Path(__file__).resolve()),
             "--input", str(in_dir),
@@ -2226,6 +2260,11 @@ def main():
                   + (", retrying once..." if attempt == 1 else ", giving up after retry."))
         if not success:
             failures.append(pdf.name)
+
+    # All PaddleOCR work is done: end the worker before any VLM call, so
+    # PaddleOCR and an Ollama model are never loaded at the same time (see the
+    # "CRITICAL" note in the "Optional VLM review pass" section).
+    _stop_ocr_worker()
 
     print(f"\n\nProcessed {len(pdfs)} PDFs. Text files saved to {out_dir}")
     if failures:
