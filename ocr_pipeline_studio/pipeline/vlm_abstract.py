@@ -860,7 +860,10 @@ def _visible_len(text: str) -> int:
 # Greek-letter detector for the classify rule below -- reuses GREEK_MAP
 # rather than a second hardcoded list. Matches any valid representation:
 # glyph, HTML entity, bare name, or ASCII convention.
-_GREEK_LETTER_CHARS = set(GREEK_MAP.keys())
+# The micro sign (U+00B5) is the Greek letter mu as units are written ("µg",
+# "µM"); it lives in the math map, not GREEK_MAP, but must count as Greek
+# here or a VLM reading of "2.0µg/mg" for OCR's "2.Oug/mg" is never merged.
+_GREEK_LETTER_CHARS = set(GREEK_MAP.keys()) | {"µ"}
 _GREEK_LETTER_NAMES = {name.strip("&;").lower() for name in GREEK_MAP.values() if name.startswith("&")}
 _GREEK_ASCII_VAR_RE = re.compile(r"^(" + "|".join(_GREEK_LETTER_NAMES) + r")_\w+$", re.IGNORECASE)
 
