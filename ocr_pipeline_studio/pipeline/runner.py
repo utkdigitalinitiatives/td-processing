@@ -1438,6 +1438,7 @@ def collect_outputs(
                 "md_file": md_path.name,
                 "filename": filename,
                 "fixes_only": False,
+                "fixes_recorded": True,
                 "abstract_pages": (abstract_pages or {}).get(filename),
                 "model_used": model_used,
                 "mode_used": mode_used,
@@ -1449,6 +1450,83 @@ def collect_outputs(
             **page_fix_fields(fix_results.get(filename)),
         ))
 
+    return documents
+
+
+def rebuild_documents(job_folder: Path) -> list:
+    """Document records read back from a run folder that has no saved state.
+
+    For a folder written before the app saved ``job.json``, or one assembled
+    by hand. What the files still hold is recovered: the draft gives the
+    flags, the OCR/VLM differences and the VLM recovery blocks (through the
+    same parse_draft() the pipeline uses), and ``output/<stem>.md`` gives the
+    text as last saved.
+
+    Two things cannot come back, because nothing on disk records them: which
+    pages were flagged as repeats, and which were turned. Those lists are
+    empty and ``fixes_recorded`` is False, so the review screen can say the
+    folder has no record of them rather than implying none were found.
+
+    Unlike collect_outputs() this writes nothing -- in particular it must not
+    overwrite an ``.md`` that holds someone's saved edits.
+    """
+    drafts_dir = job_folder / DRAFTS_DIRNAME
+    output_dir = job_folder / OUTPUT_DIRNAME
+    uploads_dir = job_folder / UPLOADS_DIRNAME
+
+    documents = []
+    for draft_path in sorted(drafts_dir.glob("*" + DRAFT_SUFFIX)):
+        stem = draft_path.name[: -len(DRAFT_SUFFIX)]
+        parsed = parse_draft(draft_path.read_text(encoding="utf-8"))
+
+        # The .md is the text as last saved. A folder that was never saved
+        # from the review screen has none, so the draft's own text is written
+        # out once -- that is creating what is missing, never overwriting
+        # someone's saved edits.
+        md_path = output_dir / (stem + ".md")
+        if not md_path.exists():
+            output_dir.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(parsed["primary"], encoding="utf-8")
+
+        documents.append(dict(
+            {
+                "name": stem,
+                "md_file": md_path.name,
+                "filename": stem + ".pdf",
+                "fixes_only": False,
+                "fixes_recorded": False,
+                "steps": None,
+                "abstract_pages": None,
+                "model_used": None,
+                "mode_used": None,
+                "processed_at": None,
+                "flags": parsed["flags"],
+                "diffs": parsed["diffs"],
+                "recovery": parsed["recovery"],
+            },
+            **page_fix_fields(None),
+        ))
+    # A page-fixes-only run has no drafts at all: its documents are the PDFs.
+    if not documents and uploads_dir.is_dir():
+        for pdf in sorted(uploads_dir.glob("*.pdf")):
+            documents.append(dict(
+                {
+                    "name": pdf.stem,
+                    "md_file": None,
+                    "filename": pdf.name,
+                    "fixes_only": True,
+                    "fixes_recorded": False,
+                    "steps": None,
+                    "abstract_pages": None,
+                    "model_used": None,
+                    "mode_used": None,
+                    "processed_at": None,
+                    "flags": [],
+                    "diffs": [],
+                    "recovery": [],
+                },
+                **page_fix_fields(None),
+            ))
     return documents
 
 
@@ -1467,6 +1545,7 @@ def collect_fix_outputs(pdfs: list, fix_results: dict) -> list:
                 "md_file": None,
                 "filename": pdf.name,
                 "fixes_only": True,
+                "fixes_recorded": True,
                 "abstract_pages": None,
                 "model_used": None,
                 "mode_used": None,

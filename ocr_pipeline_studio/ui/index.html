@@ -96,6 +96,23 @@
     <p id="run-error" class="error" hidden></p>
   </section>
 
+  <!-- Past runs: every run saves its state into its own folder, so a batch
+       run by one person can be reviewed by another, later. -->
+  <section class="panel" id="runs-panel">
+    <h2>Or open a past run</h2>
+    <p class="hint">
+      Each run keeps its own folder, so you can come back to it - or review a
+      folder someone else ran, copied from their machine.
+    </p>
+    <ul id="runs-list" class="file-list"></ul>
+    <p class="hint" id="runs-empty" hidden>No past runs in this app's workdir yet.</p>
+    <div class="actions">
+      <button id="open-run-btn" class="ghost">Choose a folder...</button>
+      <button id="refresh-runs-btn" class="ghost">Refresh</button>
+    </div>
+    <p id="runs-error" class="error" hidden></p>
+  </section>
+
   <section class="panel" id="progress-panel" hidden>
     <h2>Progress</h2>
     <div class="progress-head">

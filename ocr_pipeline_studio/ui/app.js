@@ -23,6 +23,7 @@
     pending: [],        // {file, pages} staged in the drop zone
     jobId: null,
     fixesOnly: false,   // whether the job on screen was a page-fixes-only run
+    openedFolder: null, // set when the run on screen was opened from a folder
     poll: null,         // setInterval handle for /status
     documents: [],      // summaries from /status
     current: null,      // full payload for the open document
@@ -284,6 +285,7 @@
     api("/upload", { method: "POST", body: form })
       .then(function (data) {
         state.pending = [];
+        state.openedFolder = null;
         renderPending();
         beginJob(data.job_id);
       })
@@ -329,7 +331,8 @@
   function renderProgress(status) {
     $("progress-label").textContent = status.label;
     // The full path, so the folder can be found even without the button.
-    $("job-folder").textContent = "Working folder: " + (status.folder || "");
+    $("job-folder").textContent = (status.opened_from_folder ? "Opened from: " : "Working folder: ")
+      + (status.folder || "");
     show($("job-folder"), !!status.folder);
 
     var count = "";
@@ -368,6 +371,8 @@
       }
       state.documents = status.documents || [];
       state.fixesOnly = !!status.fixes_only;
+      // A finished run has just saved its folder; keep the list current.
+      loadRuns();
       // Save writes text edits and Keep/Remove choices, so it shows for
       // fixes-only jobs too; their product is the PDFs in the fixed folder.
       $("save-status").textContent = state.fixesOnly
@@ -434,13 +439,15 @@
     return row;
   }
 
-  function rerunFiles(jobId, files, overrides) {
+  function confirmLosingUnsaved(what) {
     var unsaved = Object.keys(state.dirty).concat(Object.keys(state.fixesDirty))
       .filter(function (name, i, all) { return all.indexOf(name) === i; }).length;
-    if (unsaved && !window.confirm("You have unsaved edits in " + unsaved
-        + " document(s). Rerunning moves on to a new run - continue?")) {
-      return;
-    }
+    return !unsaved || window.confirm("You have unsaved changes in " + unsaved
+      + " document(s). " + what + " moves on from this run - continue?");
+  }
+
+  function rerunFiles(jobId, files, overrides) {
+    if (!confirmLosingUnsaved("Rerunning")) { return; }
     show($("run-error"), false);
     api("/rerun/" + jobId, {
       method: "POST",
@@ -482,6 +489,96 @@
       return option.value === value;
     });
     if (has) { select.value = value; }
+  }
+
+  // =====================================================================
+  // Past runs
+  // =====================================================================
+  // Each run's folder holds its own state, so a batch can be run now and
+  // reviewed later, by whoever has the folder.
+
+  function loadRuns() {
+    return api("/saved-runs").then(function (data) {
+      var list = $("runs-list");
+      list.innerHTML = "";
+      var runs = data.runs || [];
+      show($("runs-empty"), runs.length === 0);
+
+      runs.forEach(function (run) {
+        var li = document.createElement("li");
+        li.className = "run-row";
+
+        var name = text(run.name);
+        name.className = "run-name";
+        li.appendChild(name);
+
+        var meta = text(describeRun(run));
+        meta.className = "run-meta";
+        li.appendChild(meta);
+
+        if (!run.reviewable) {
+          var note = text("no saved review");
+          note.className = "run-rebuilt";
+          note.title = "This folder has no saved state; opening it recovers the "
+            + "text and differences from its files.";
+          li.appendChild(note);
+        }
+
+        var open = document.createElement("button");
+        open.className = "ghost";
+        open.textContent = "Open";
+        on(open, "click", function () { openRun(run.folder); });
+        li.appendChild(open);
+
+        list.appendChild(li);
+      });
+      return runs;
+    }).catch(function (err) {
+      showRunsError(err.message);
+    });
+  }
+
+  function describeRun(run) {
+    var parts = [];
+    if (run.saved_at) { parts.push(run.saved_at.replace("T", " ")); }
+    parts.push((run.files || []).length + " file(s)");
+    parts.push(run.documents + " document(s)");
+    var steps = run.steps || {};
+    var ran = [];
+    if (steps.dedupe) { ran.push("repeats"); }
+    if (steps.rotate) { ran.push("rotation"); }
+    if (steps.ocr) { ran.push("OCR"); }
+    if (ran.length) { parts.push(ran.join(" + ")); }
+    return parts.join(" - ");
+  }
+
+  function showRunsError(message) {
+    var box = $("runs-error");
+    box.textContent = message;
+    show(box, true);
+  }
+
+  // folder omitted -> the window asks for one, so a run copied from another
+  // machine can be opened from wherever it was put.
+  function openRun(folder) {
+    if (!confirmLosingUnsaved("Opening another run")) { return; }
+    show($("runs-error"), false);
+    api("/open-run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(folder ? { folder: folder } : {})
+    }).then(function (data) {
+      if (data.cancelled) { return; }
+      syncRunControls(data);
+      state.openedFolder = data.folder;
+      beginJob(data.job_id);
+      if (data.rebuilt) {
+        showRunsError("That folder had no saved review, so the text and differences "
+          + "were rebuilt from its files. Repeated and sideways pages are not recorded.");
+      }
+    }).catch(function (err) {
+      showRunsError(err.message);
+    });
   }
 
   // =====================================================================
@@ -989,6 +1086,15 @@
 
     // A check that was not run is said so, rather than looking like one
     // that found nothing.
+    if (doc.fixes_recorded === false) {
+      var norecord = document.createElement("p");
+      norecord.className = "hint";
+      norecord.textContent = "This run was opened from a folder with no saved review, so "
+        + "there is no record of repeated or sideways pages. The corrected PDF itself is "
+        + "in the folder's fixed subfolder.";
+      body.appendChild(norecord);
+    }
+
     var ran = doc.steps || { dedupe: true, rotate: true };
     var skipped = [];
     if (!ran.dedupe) { skipped.push("The repeated-page check was not run for this document."); }
@@ -1423,6 +1529,8 @@
     on($("save-btn"), "click", saveEdits);
     on($("open-folder-btn"), "click", openFolder);
     on($("copy-btn"), "click", copyAbstract);
+    on($("open-run-btn"), "click", function () { openRun(null); });
+    on($("refresh-runs-btn"), "click", function () { show($("runs-error"), false); loadRuns(); });
 
     document.querySelectorAll(".topbar .tab").forEach(function (tab) {
       on(tab, "click", function () {
@@ -1437,6 +1545,7 @@
 
     refreshOllama();
     loadModels();
+    loadRuns();
     // Re-check Ollama periodically so starting it while the app is open
     // clears the banner without a restart.
     setInterval(refreshOllama, 15000);

@@ -168,6 +168,120 @@ def rerun(job_id: str):
     return _launch_job(job, files, options)
 
 
+# --------------------------------------------------------------------------
+# Saving a run, listing past runs, opening one
+# --------------------------------------------------------------------------
+# A run's folder holds its own state (server/jobs.py), so a batch run by one
+# person can be reviewed by another, later, on another machine. Every route
+# that changes something calls _persist(); typing is coalesced, since a draft
+# edit arrives on every pause and the file can be megabytes.
+
+_PERSIST_EVERY = 3.0  # seconds, for the coalesced writes from /edit
+_persist_timers: dict = {}
+_persist_lock = threading.Lock()
+
+
+def _persist(job_id: str) -> None:
+    """Write this run's state now."""
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    with _persist_lock:
+        timer = _persist_timers.pop(job_id, None)
+    if timer is not None:
+        timer.cancel()
+    jobstate.save_job(store, job_id)
+
+
+def _persist_soon(app, job_id: str) -> None:
+    """Write this run's state within a few seconds, once, however many
+    changes arrive in the meantime."""
+    with _persist_lock:
+        if job_id in _persist_timers:
+            return
+
+        def run_it():
+            with _persist_lock:
+                _persist_timers.pop(job_id, None)
+            with app.app_context():
+                jobstate.save_job(app.config["JOB_STORE"], job_id)
+
+        timer = threading.Timer(_PERSIST_EVERY, run_it)
+        timer.daemon = True
+        _persist_timers[job_id] = timer
+        timer.start()
+
+
+@bp.get("/saved-runs")
+def saved_runs():
+    """Past runs found in workdir/, newest first, for the Run screen's list."""
+    root: Path = current_app.config["WORKDIR"]
+    runs = []
+    if root.is_dir():
+        for folder in root.iterdir():
+            if not folder.is_dir():
+                continue
+            summary = jobstate.read_summary(folder)
+            if summary is not None:
+                runs.append(summary)
+    runs.sort(key=lambda r: r.get("saved_at") or "", reverse=True)
+    return jsonify({"runs": runs})
+
+
+@bp.post("/open-run")
+def open_run():
+    """Open a run folder for review, from its saved state or from its files.
+
+    With no ``folder`` in the body the window's folder picker is used, so a
+    run copied from another machine can be opened from anywhere. A folder is
+    a run if it holds the saved state or an ``uploads`` folder; anything else
+    is refused rather than opened as an empty review.
+    """
+    store: jobstate.JobStore = current_app.config["JOB_STORE"]
+    payload = request.get_json(silent=True) or {}
+    given = payload.get("folder")
+
+    if not given:
+        picker = current_app.config.get("PICK_FOLDER")
+        if picker is None:
+            return jsonify({"error": "No folder picker here - pass a folder path."}), 501
+        given = picker()
+        if not given:
+            return jsonify({"cancelled": True})
+
+    folder = Path(str(given)).expanduser()
+    if not folder.is_dir():
+        return jsonify({"error": "There is no folder at: %s" % folder}), 404
+
+    try:
+        state = jobstate.load_state(folder)
+    except jobstate.StateError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if state is None:
+        # No saved state: recover what the files themselves still hold.
+        if not (folder / runner.UPLOADS_DIRNAME).is_dir():
+            return jsonify({"error": "That folder does not look like a run: it has no "
+                                     "%s and no uploads folder." % jobstate.STATE_FILE}), 400
+        documents = runner.rebuild_documents(folder)
+        job = store.register(folder, documents=documents)
+        store.update(job.id, message="Opened from a folder - rebuilt from its files, "
+                                     "so repeated and sideways pages are not recorded.")
+    else:
+        job = store.register(folder, payload=state)
+
+    store.append_log(job.id, "[open] %s" % folder)
+    return jsonify({
+        "job_id": job.id,
+        "files": job.files,
+        "model": job.model,
+        "mode": job.mode,
+        "steps": job.steps,
+        "fixes_only": job.fixes_only,
+        "folder": str(folder),
+        "rebuilt": state is None,
+        "documents": len(job.documents),
+    })
+
+
 class _Refused(Exception):
     """A run request that cannot start, with the status to answer it with."""
 
@@ -429,6 +543,8 @@ def _run_job(app, job_id: str) -> None:
                          message=message,
                          page_current=0, page_total=0,
                          current_file=None)
+            # The run's folder now holds everything needed to review it later.
+            _persist(job_id)
 
         except Exception as exc:
             store.append_log(job_id, traceback.format_exc())
@@ -436,6 +552,8 @@ def _run_job(app, job_id: str) -> None:
                          status=jobstate.STATUS_ERROR,
                          error=str(exc),
                          message="Failed: %s" % exc)
+            # Saved even so: a failed run's folder is still worth opening.
+            _persist(job_id)
 
 
 @bp.get("/status/<job_id>")
@@ -597,6 +715,7 @@ def document(job_id: str, name: str):
         "name": doc["name"],
         "filename": doc["filename"],
         "fixes_only": doc["fixes_only"],
+        "fixes_recorded": doc.get("fixes_recorded", True),
         "steps": doc.get("steps"),
         "abstract_pages": doc["abstract_pages"],
         "text": current,
@@ -721,6 +840,7 @@ def set_rotation(job_id: str, name: str):
 
     record["current"] = turn
     record["decided"] = True
+    _persist(job_id)
     # The counts behind the sidebar chips follow what the PDF now says.
     doc["pages_rotated"] = sum(1 for r in doc["rotations"] if r["current"])
     doc["pages_for_review"] = sum(1 for r in doc["rotations"]
@@ -767,6 +887,7 @@ def set_duplicate(job_id: str, name: str):
     record["removed"] = remove
     record["decided"] = True
     doc["fixes_pending"] = _removals_differ_from_file(doc)
+    _persist(job_id)
 
     return jsonify({
         "duplicates": doc["duplicates"],
@@ -877,6 +998,8 @@ def edit(job_id: str, name: str):
 
     payload = request.get_json(silent=True) or {}
     job.edits[name] = payload.get("text", "")
+    # Typing arrives on every pause, so these writes are coalesced.
+    _persist_soon(current_app._get_current_object(), job_id)
     return jsonify({"ok": True, "dirty": True})
 
 
@@ -977,6 +1100,7 @@ def apply_spans(job_id: str, name: str):
                             "ocr": span["ocr"], "vlm": span["vlm"]})
 
     job.edits[name] = text
+    _persist(job_id)
 
     return jsonify({
         "ok": True,
@@ -1038,6 +1162,8 @@ def save(job_id: str):
             "fixes": doc.get("fixes_pending", False),
             "pending_removals": _pending_removal_count(doc),
         }
+
+    _persist(job_id)
 
     return jsonify({"ok": True, "written": written, "page_fixes": page_fixes,
                     "saved_text": saved_text, "still_pending": still_pending})

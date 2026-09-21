@@ -1,10 +1,17 @@
-"""In-memory job and progress tracking.
+"""Job and progress tracking, held in memory and saved to each run's folder.
 
-Why in-memory and not a database: this is a single-user desktop tool. Only one
-process ever touches this state, it is worthless once the window closes, and
-the durable results already live on disk as real files in ``workdir/``. A
-database here would add a schema, a migration story, and a file to corrupt, in
-exchange for nothing.
+Why in memory and not a database: this is a single-user desktop tool. Only one
+process ever touches this state, and the results themselves live on disk as
+real files in ``workdir/``. A database here would add a schema, a migration
+story, and a file to corrupt, in exchange for nothing.
+
+Why it is also written to a file: a run is reviewed by a person, possibly a
+different person, possibly days later. Everything the review screen needs that
+is *not* already a file -- the parsed flags and OCR/VLM differences, which copy
+of a repeated span was picked, the Keep/Remove and page-turn choices, unsaved
+edits, and the run's own settings -- is saved as ``job.json`` in the run's own
+folder (see save_job). The folder then holds the whole run and can be copied to
+another machine and opened there (see load_job).
 
 Why a lock: the pipeline runs on a background thread so the UI stays
 responsive, but Flask answers ``/status`` on a *different* thread. Both touch
@@ -14,6 +21,8 @@ halfway through an update.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
 from collections import deque
@@ -34,6 +43,17 @@ STATUS_ERROR = "error"
 
 # Terminal states -- the UI stops polling when it sees one of these.
 FINISHED = (STATUS_DONE, STATUS_ERROR)
+
+# The run's saved state, and a short summary read when listing past runs
+# (job.json can run to megabytes on a large batch, which is too much to read
+# just to show a row per run).
+STATE_FILE = "job.json"
+SUMMARY_FILE = "run.json"
+
+# Bumped only when a change would confuse an older build. A file whose version
+# is higher than this is refused rather than half-read.
+STATE_FORMAT = "ocr-pipeline-studio/job"
+STATE_VERSION = 1
 
 
 @dataclass
@@ -87,6 +107,11 @@ class Job:
     span_offsets: dict = field(default_factory=dict)
 
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    # True for a run opened from a folder rather than run in this window. The
+    # review screen says so, since its progress and log belong to the run that
+    # produced it, not to this session.
+    opened_from_folder: bool = False
 
     # Bounded so a very long batch cannot grow the log without limit. 400 lines
     # is far more than the UI shows but enough to diagnose a failed run.
@@ -212,6 +237,64 @@ class JobStore:
             if job is not None:
                 job.file_states[filename] = {"state": state, "detail": detail}
 
+    def state_payload(self, job_id: str) -> Optional[dict]:
+        """One run's saveable state, assembled under the lock.
+
+        Carries the run's folder as ``_workdir`` for save_job to write into;
+        that key is removed before anything is written, since a saved path
+        would be wrong the moment the folder is copied somewhere else.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            payload = _state_payload(job)
+            payload["_workdir"] = str(job.workdir)
+            return payload
+
+    def register(self, folder: Path, payload: Optional[dict] = None,
+                 documents: Optional[list] = None) -> Job:
+        """Add a job for a run folder that already exists on disk.
+
+        Used when a past run is opened: from its saved state, or -- for a
+        folder with none -- from ``documents`` rebuilt out of the files
+        themselves. The id is the folder's own name, suffixed if a run of that
+        name is already open, so two copies of the same run can be open at
+        once.
+        """
+        saved = (payload or {}).get("job", {})
+        with self._lock:
+            job_id = folder.name
+            suffix = 1
+            while job_id in self._jobs:
+                suffix += 1
+                job_id = "%s-%d" % (folder.name, suffix)
+
+            job = Job(
+                id=job_id,
+                workdir=folder,
+                files=list(saved.get("files") or []),
+                model=saved.get("model", ""),
+                mode=saved.get("mode", ""),
+                steps=dict(saved.get("steps") or {"dedupe": True, "rotate": True, "ocr": True}),
+                fixes_only=bool(saved.get("fixes_only", False)),
+                overrides={name: tuple(pages)
+                           for name, pages in (saved.get("overrides") or {}).items()},
+                # Opened runs are finished by definition: nothing is running.
+                status=STATUS_DONE,
+                message=saved.get("message") or "Opened from a folder.",
+                file_states=dict(saved.get("file_states") or {}),
+                documents=documents if documents is not None else (payload or {}).get("documents") or [],
+                edits=dict((payload or {}).get("edits") or {}),
+                span_offsets=(payload or {}).get("span_offsets") or {},
+                created_at=saved.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+            )
+            job.opened_from_folder = True
+            if not job.files:
+                job.files = sorted(d["filename"] for d in job.documents)
+            self._jobs[job_id] = job
+        return job
+
     def snapshot(self, job_id: str, log_lines: int = 40) -> Optional[dict]:
         """Build the JSON payload for ``/status/<job_id>``.
 
@@ -226,6 +309,7 @@ class JobStore:
             return {
                 "job_id": job.id,
                 "folder": str(job.workdir),
+                "opened_from_folder": job.opened_from_folder,
                 "status": job.status,
                 "finished": job.status in FINISHED,
                 "message": job.message,
@@ -263,3 +347,123 @@ class JobStore:
                 "created_at": job.created_at,
                 "log": list(job.log)[-log_lines:],
             }
+
+
+# --------------------------------------------------------------------------
+# Saving a run to its folder, and reading it back
+# --------------------------------------------------------------------------
+
+def _state_payload(job: Job) -> dict:
+    """Everything about a run that is not already a file in its folder.
+
+    Only names are stored, never paths: ``workdir`` is wherever the folder is
+    found when it is opened, and every route builds its paths from that. That
+    is what lets a run folder be copied to another machine.
+    """
+    return {
+        "format": STATE_FORMAT,
+        "version": STATE_VERSION,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "job": {
+            "id": job.id,
+            "files": list(job.files),
+            "model": job.model,
+            "mode": job.mode,
+            "steps": dict(job.steps),
+            "fixes_only": job.fixes_only,
+            # Tuples would come back from JSON as lists; the pipeline wants
+            # (start, end), so they are restored as tuples in load_job.
+            "overrides": {name: list(pages) for name, pages in job.overrides.items()},
+            "status": job.status,
+            "message": job.message,
+            "error": job.error,
+            "file_states": dict(job.file_states),
+            "created_at": job.created_at,
+        },
+        "documents": job.documents,
+        "edits": dict(job.edits),
+        "span_offsets": job.span_offsets,
+    }
+
+
+def _summary_payload(payload: dict) -> dict:
+    """The few fields the "past runs" list needs."""
+    job = payload["job"]
+    return {
+        "format": STATE_FORMAT,
+        "version": STATE_VERSION,
+        "saved_at": payload["saved_at"],
+        "created_at": job["created_at"],
+        "files": job["files"],
+        "documents": len(payload["documents"]),
+        "status": job["status"],
+        "steps": job["steps"],
+    }
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    """Write JSON through a temp file, so a reader never sees half of it."""
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def save_job(store: "JobStore", job_id: str) -> Optional[Path]:
+    """Write one run's state into its own folder.
+
+    The payload is built under the store's lock, for the same reason
+    snapshot() is -- the worker thread may be mid-update -- and written
+    outside it, since writing megabytes must not hold up a status poll.
+    """
+    payload = store.state_payload(job_id)
+    if payload is None:
+        return None
+    folder = Path(payload.pop("_workdir"))
+    if not folder.is_dir():
+        return None
+    _write_json(folder / STATE_FILE, payload)
+    _write_json(folder / SUMMARY_FILE, _summary_payload(payload))
+    return folder / STATE_FILE
+
+
+def read_summary(folder: Path) -> Optional[dict]:
+    """One past run's summary row, or None if this folder is not a run."""
+    path = folder / SUMMARY_FILE
+    if not path.is_file():
+        return None
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    if not isinstance(summary, dict):
+        return None
+    summary["folder"] = str(folder)
+    summary["name"] = folder.name
+    summary["reviewable"] = (folder / STATE_FILE).is_file()
+    return summary
+
+
+class StateError(Exception):
+    """A run folder that cannot be opened, with a message for the user."""
+
+
+def load_state(folder: Path) -> Optional[dict]:
+    """Read a folder's saved state, or None when it has none.
+
+    Raises StateError for a file that is there but unusable, so "no saved
+    state, rebuild what we can" stays distinct from "this file is wrong".
+    """
+    path = folder / STATE_FILE
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise StateError("%s in this folder could not be read (%s)." % (STATE_FILE, exc))
+    if not isinstance(payload, dict) or payload.get("format") != STATE_FORMAT:
+        raise StateError("%s in this folder was not written by this app." % STATE_FILE)
+    if int(payload.get("version", 0)) > STATE_VERSION:
+        raise StateError("This run was saved by a newer version of the app (format %s, "
+                         "this build reads %s). Update the app to open it."
+                         % (payload.get("version"), STATE_VERSION))
+    return payload

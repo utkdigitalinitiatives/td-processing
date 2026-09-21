@@ -238,6 +238,9 @@ workdir/<date>_<time>_<first file>/
 │               removed taken out -- what OCR reads, and the PDFs to keep
 ├── drafts/     the OCR script's own raw output
 ├── output/     <doc>.md, <doc>.pages.json, manifest.json
+├── job.json    the review itself: differences, flags, your Keep/Remove and
+│               page-turn choices, unsaved edits, the run's settings
+├── run.json    a few lines about the run, for the "past runs" list
 └── overrides.csv   abstract pages you typed, if any, as the OCR script reads them
 ```
 
@@ -247,6 +250,32 @@ the PDF; the scanned images themselves are never re-encoded, so nothing is
 lost.
 
 `workdir/` is git-ignored, so nothing you process is ever committed.
+
+### Handing a run over
+
+A run folder holds the whole run, so one person can run batches and another
+can review them later:
+
+1. Run the batch. The app saves `job.json` after the run and after every
+   change you make while reviewing, so there is nothing to export.
+2. Open the app (on this machine or any other with it installed) and use
+   **Or open a past run** on the Run screen. Runs in this machine's `workdir/`
+   are listed; **Choose a folder...** opens one from anywhere, such as a copy
+   on a shared drive or a USB stick.
+3. The Review screen comes back as it was: the editor with your text, the
+   OCR/VLM differences with which side each is on (including which copy of a
+   repeated difference was picked), and the Page fixes tab with its
+   Keep/Remove and rotation switches still working.
+
+Copy the whole folder, not parts of it. Nothing inside records where it lives,
+so it works wherever it is put.
+
+**A folder with no `job.json`** -- a run from an older version, or one
+assembled by hand -- still opens: the text comes from `output/<doc>.md` (or
+the draft, if that file is missing) and the differences are read back out of
+`drafts/`. What cannot come back is which pages were flagged as repeats and
+which were turned, since nothing on disk records that; the app says so on the
+Page fixes tab, and the corrected PDF in `fixed/` is unaffected.
 
 `manifest.json` records, per document: `filename`, `page_count`,
 `duplicates_removed` (at the end of the run, always 0 -- removals are

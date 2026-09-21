@@ -137,6 +137,13 @@ select:disabled { background: #f1f3f6; color: var(--muted); }
 .queue .state.ocr, .queue .state.fixing { color: var(--accent); }
 .queue .state.done, .queue .state.skipped { flex: 1; text-align: right; }
 
+/* Past runs list. */
+.run-row { flex-wrap: wrap; }
+.run-row .run-name { flex: 1; min-width: 0; word-break: break-all; font-weight: 600; }
+.run-row .run-meta { color: var(--muted); font-size: 12px; }
+.run-row button.ghost { padding: 3px 10px; font-size: 12px; }
+.run-row .run-rebuilt { color: var(--warn); font-size: 12px; }
+
 /* ---------- Progress ---------- */
 .progress-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
 .progressbar { height: 8px; background: #e9edf2; border-radius: 999px; overflow: hidden; }

@@ -119,6 +119,23 @@ def confirm_close(app, window) -> bool:
     return window.create_confirmation_dialog("Unsaved changes", message)
 
 
+def pick_folder(app, window):
+    """Ask for a run folder, starting in this machine's workdir.
+
+    Returns a path, or None when the dialog is cancelled or fails -- the
+    route treats both as "nothing chosen" rather than an error.
+    """
+    try:
+        chosen = window.create_file_dialog(
+            webview.FOLDER_DIALOG, directory=str(app.config["WORKDIR"]))
+    except Exception:
+        return None
+    if not chosen:
+        return None
+    # Platforms return either a path or a sequence of them.
+    return chosen if isinstance(chosen, str) else chosen[0]
+
+
 def main() -> int:
     app = create_app(PROJECT_ROOT)
     port = find_free_port()
@@ -136,6 +153,11 @@ def main() -> int:
     window = webview.create_window(WINDOW_TITLE, url, width=1400, height=900,
                                    min_size=(1000, 640))
     window.events.closing += lambda: confirm_close(app, window)
+
+    # Lets the server ask for a folder when someone opens a past run -- a run
+    # copied from another machine can live anywhere. Injected here so that
+    # server/ never imports pywebview, the same way the close check works.
+    app.config["PICK_FOLDER"] = lambda: pick_folder(app, window)
 
     # Blocks on the main thread until the window is closed.
     webview.start()
