@@ -686,6 +686,74 @@ def _page_is_suspicious(segment_count: int, prior_counts: List[int], threshold: 
             return True
     return False
 
+# Ollama shrinks any page image for this model to about this many pixels
+# (~4,300 image tokens): a 300 dpi and a 200 dpi render both came to ~4,270.
+# So a full letter-size page is effectively seen at ~190 dpi, and anything
+# rendered above that is discarded before the model looks at it.
+_VLM_MAX_PIXELS = 3_350_000
+
+def _vlm_text_block(page) -> Optional["fitz.Rect"]:
+    """The part of a page that holds its text, padded, or None to use it all.
+
+    Found from a quick low-resolution render: rows and columns with a
+    meaningful amount of ink. A thin band at the very edge is ignored, since
+    scanned pages often carry a dark scanner edge there. Rotated pages and
+    anything unclear use the whole page -- a crop that cut off text would be
+    far worse than the time it saves.
+    """
+    if page.rotation:
+        return None
+    probe_dpi = 40
+    pix = page.get_pixmap(matrix=fitz.Matrix(probe_dpi / 72, probe_dpi / 72),
+                          colorspace=fitz.csGRAY, alpha=False)
+    ink = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width) < 160
+    edge_y, edge_x = max(1, int(pix.height * 0.02)), max(1, int(pix.width * 0.02))
+    ink[:edge_y, :] = ink[-edge_y:, :] = False
+    ink[:, :edge_x] = ink[:, -edge_x:] = False
+    # Rows or columns that are almost solid dark are scanner bands or page
+    # edges, not text; they would stretch the crop to the whole page.
+    ink[ink.sum(axis=1) > pix.width * 0.9, :] = False
+    ink[:, ink.sum(axis=0) > pix.height * 0.9] = False
+    row_ink, col_ink = ink.sum(axis=1), ink.sum(axis=0)
+    # A speckled scan puts ink in every row, so text cannot be told from
+    # background reliably -- and a short last line mistaken for noise would
+    # be cut off. Those pages are sent whole, as before.
+    if np.median(row_ink) > pix.width * 0.02:
+        return None
+    rows = np.where(row_ink > max(2, pix.width * 0.002))[0]
+    cols = np.where(col_ink > max(2, pix.height * 0.002))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    scale = 72 / probe_dpi
+    pad_x, pad_y = page.rect.width * 0.03, page.rect.height * 0.03
+    clip = fitz.Rect(cols[0] * scale - pad_x, rows[0] * scale - pad_y,
+                     (cols[-1] + 1) * scale + pad_x, (rows[-1] + 1) * scale + pad_y) & page.rect
+    # Too small to be a text block (a stray mark), or so large that cropping
+    # gains nothing: send the whole page.
+    if clip.width * clip.height < 0.15 * page.rect.width * page.rect.height:
+        return None
+    if clip.width * clip.height > 0.95 * page.rect.width * page.rect.height:
+        return None
+    return clip
+
+def _vlm_page_image(doc, page_index: int, dpi: int):
+    """The page image sent to the VLM: its text block, at the resolution the
+    model would effectively have seen it at on the whole page.
+
+    Blank margins are a large share of a page, and every pixel costs the
+    model time to read (reading the image is most of a VLM call). Cropping
+    them at the same effective resolution keeps the text exactly as detailed
+    as before, with fewer image tokens. ``dpi`` stays the ceiling.
+    """
+    page = doc.load_page(page_index)
+    clip = _vlm_text_block(page)
+    if clip is None:
+        return render_page_image(doc, page_index, dpi=dpi)
+    area_sq_in = (page.rect.width / 72) * (page.rect.height / 72)
+    effective_dpi = min(dpi, math.sqrt(_VLM_MAX_PIXELS / area_sq_in))
+    zoom = effective_dpi / 72
+    return page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+
 def vlm_transcribe_page(pdf_path: Path, page_index: int, model: str = DEFAULT_VLM_MODEL,
                          ollama_url: str = DEFAULT_OLLAMA_URL, dpi: int = 300,
                          max_attempts: int = 2, first_attempt_timeout: int = 180,
@@ -709,7 +777,7 @@ def vlm_transcribe_page(pdf_path: Path, page_index: int, model: str = DEFAULT_VL
     if _requests is None:
         return None
     with fitz.open(pdf_path) as doc:
-        pix = render_page_image(doc, page_index, dpi=dpi)
+        pix = _vlm_page_image(doc, page_index, dpi)
     img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
 
     payload = {
