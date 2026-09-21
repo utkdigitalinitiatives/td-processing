@@ -29,20 +29,37 @@
 <main id="screen-run" class="screen">
 
   <section class="panel">
-    <h2>1. Choose a model</h2>
+    <h2>1. Choose what to run</h2>
+    <!-- Each step on its own, so a batch runs only what it needs. -->
+    <fieldset class="steps">
+      <legend>Steps to run</legend>
+      <label class="step">
+        <input type="checkbox" id="step-dedupe" checked>
+        <span><strong>Check for repeated pages</strong>
+          <small>Flags them for you to keep or remove on the Page fixes tab.</small></span>
+      </label>
+      <label class="step">
+        <input type="checkbox" id="step-rotate" checked>
+        <span><strong>Turn sideways pages</strong>
+          <small>The slowest step - it looks at every page. Skip it for batches you know are upright.</small></span>
+      </label>
+      <label class="step">
+        <input type="checkbox" id="step-ocr" checked>
+        <span><strong>Read the abstract (OCR)</strong>
+          <small>Uses the vision model and VLM pass settings below.</small></span>
+      </label>
+    </fieldset>
+    <p class="hint" id="steps-help" hidden>
+      Without OCR there is no abstract text: the run stops after the page fixes,
+      and the corrected PDFs are in the run's fixed folder.
+    </p>
+    <p class="error" id="steps-none" hidden>Pick at least one step to run.</p>
     <p class="hint">
-      These are the vision models actually pulled on this machine
+      The vision models listed are the ones actually pulled on this machine
       (<code>ollama list</code>). Nothing is downloaded automatically -- if the
       model you want is missing, pull it yourself first.
     </p>
     <div class="controls">
-      <label>
-        <span>What to run</span>
-        <select id="run-kind">
-          <option value="full" selected>Full pipeline - page fixes + abstract</option>
-          <option value="fixes">Page fixes only - flag repeats, turn sideways pages</option>
-        </select>
-      </label>
       <label>
         <span>Vision model</span>
         <select id="model-select"></select>
@@ -53,11 +70,6 @@
       </label>
     </div>
     <p class="hint" id="mode-help"></p>
-    <p class="hint" id="kind-help" hidden>
-      No OCR and no vision model: each PDF has its sideways pages turned and
-      its possible repeats flagged for you to check. The corrected PDFs are in
-      the run's fixed folder. For theses with no abstract to extract.
-    </p>
   </section>
 
   <section class="panel">

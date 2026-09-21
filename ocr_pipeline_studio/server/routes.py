@@ -101,7 +101,7 @@ def upload():
 
     try:
         options = _run_options(request.form.get("model"), request.form.get("mode"),
-                               request.form.get("fixes_only"),
+                               request.form.get("steps"),
                                request.form.get("overrides") or "{}")
     except _Refused as exc:
         return jsonify({"error": exc.message}), exc.status
@@ -155,7 +155,7 @@ def rerun(job_id: str):
 
     try:
         options = _run_options(payload.get("model"), payload.get("mode"),
-                               payload.get("fixes_only"), payload.get("overrides") or {})
+                               payload.get("steps"), payload.get("overrides") or {})
     except _Refused as exc:
         return jsonify({"error": exc.message}), exc.status
 
@@ -177,24 +177,40 @@ class _Refused(Exception):
         self.status = status
 
 
-def _run_options(model, mode, fixes_only, overrides) -> dict:
+def _decode(value, what: str):
+    """A form field arrives as a JSON string, a JSON body already decoded."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            raise _Refused("%s could not be read." % what)
+    return value
+
+
+def _run_options(model, mode, steps, overrides) -> dict:
     """Validate the settings shared by /upload and /rerun.
 
-    ``overrides`` may arrive as a JSON string (a form field) or already
-    decoded (a JSON body). Raises _Refused for anything that should stop the
-    job from starting.
+    ``steps`` chooses what to run -- ``{"dedupe", "rotate", "ocr"}``, any
+    missing one on -- and ``overrides`` the abstract pages set by hand. Both
+    may arrive as a JSON string (a form field) or already decoded (a JSON
+    body). Raises _Refused for anything that should stop the job from
+    starting.
     """
-    fixes_only = str(fixes_only).lower() in ("1", "true", "yes")
+    steps = _decode(steps, "The steps to run") if steps is not None else {}
+    if not isinstance(steps, dict):
+        raise _Refused("The steps to run must be an object.")
+    steps = runner.normalize_steps(steps)
+    if not any(steps.values()):
+        raise _Refused("Pick at least one step to run.")
+    # Everything downstream that only asks "is there text?" keeps working.
+    fixes_only = not steps["ocr"]
+
     model = model or runner.DEFAULT_VLM_MODEL
     mode = mode or runner.DEFAULT_VLM_MODE
     if mode not in runner.VLM_MODES:
         raise _Refused("Unknown VLM mode: %s" % mode)
 
-    if isinstance(overrides, str):
-        try:
-            overrides = json.loads(overrides)
-        except ValueError:
-            raise _Refused("Abstract page overrides could not be read.")
+    overrides = _decode(overrides, "Abstract page overrides")
     if not isinstance(overrides, dict):
         raise _Refused("Abstract page overrides must be an object.")
     ranges = {}
@@ -210,14 +226,15 @@ def _run_options(model, mode, fixes_only, overrides) -> dict:
 
     # Preflight before anything is written: if Ollama is down or the chosen
     # model is missing, say so now, in plain words, rather than letting the
-    # job fail deep inside the pipeline. A page-fixes-only run never calls
+    # job fail deep inside the pipeline. A run without OCR never calls
     # Ollama, so it is checked as if the VLM were off.
     check = runner.preflight(model, current_app.config["OLLAMA_URL"],
                              "off" if fixes_only else mode)
     if not check["ok"]:
         raise _Refused(check["message"], 409)
 
-    return {"model": model, "mode": mode, "fixes_only": fixes_only, "overrides": ranges}
+    return {"model": model, "mode": mode, "steps": steps, "fixes_only": fixes_only,
+            "overrides": ranges}
 
 
 def _launch_job(job, files: list, options: dict):
@@ -228,6 +245,7 @@ def _launch_job(job, files: list, options: dict):
         files=files,
         model=options["model"],
         mode=options["mode"],
+        steps=options["steps"],
         fixes_only=options["fixes_only"],
         overrides={n: r for n, r in options["overrides"].items() if n in files},
         file_total=len(files),
@@ -248,7 +266,8 @@ def _launch_job(job, files: list, options: dict):
     thread.start()
 
     return jsonify({"job_id": job.id, "files": files, "model": options["model"],
-                    "mode": options["mode"], "fixes_only": options["fixes_only"]})
+                    "mode": options["mode"], "steps": options["steps"],
+                    "fixes_only": options["fixes_only"]})
 
 
 def _fixes_detail(repeats: int, rotated: int, review: int) -> str:
@@ -307,7 +326,7 @@ def _run_job(app, job_id: str) -> None:
             elif kind == "fix_start":
                 store.update(job_id, current_file=event.get("filename"),
                              file_index=event.get("index", 0),
-                             message="Checking for repeated and sideways pages")
+                             message=event.get("detail", "Checking pages"))
                 store.set_file_state(job_id, event["filename"], "fixing")
 
             elif kind == "fix_done":
@@ -365,7 +384,7 @@ def _run_job(app, job_id: str) -> None:
                 ollama_url=app.config["OLLAMA_URL"],
                 report=report,
                 overrides=job.overrides,
-                fixes_only=job.fixes_only,
+                steps=job.steps,
             )
 
             documents = result["documents"]
@@ -578,6 +597,7 @@ def document(job_id: str, name: str):
         "name": doc["name"],
         "filename": doc["filename"],
         "fixes_only": doc["fixes_only"],
+        "steps": doc.get("steps"),
         "abstract_pages": doc["abstract_pages"],
         "text": current,
         "saved_text": on_disk,

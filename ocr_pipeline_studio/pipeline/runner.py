@@ -276,6 +276,8 @@ def fix_pdf(
     classifier=None,
     dpi: int = 100,
     min_score: float = 0.70,
+    dedupe: bool = True,
+    rotate: bool = True,
 ) -> PageFixResult:
     """Find repeated and sideways pages with the original scripts, then write
     one corrected copy of the PDF into ``fixed_dir``.
@@ -297,15 +299,21 @@ def fix_pdf(
     if pdf_path.parent.resolve() == fixed_dir.resolve():
         raise ValueError("fixed_dir must differ from the folder holding %s" % pdf_path.name)
 
-    if classifier is None:
-        classifier = load_orientation_classifier()
+    # Either check can be left out (``dedupe`` / ``rotate``), when the person
+    # running the batch only needs the other. Rotation is the slow one -- it
+    # renders every page through the orientation model -- so skipping it also
+    # skips loading that model.
 
     # We pass no output_dir, so it does not write its comparison PDF -- only
     # the detection result is wanted here.
-    duplicates = find_and_export_duplicates(pdf_path)
+    duplicates = find_and_export_duplicates(pdf_path) if dedupe else []
 
     # No output_dir and apply=False: the script only reports, it writes nothing.
-    rotations = find_and_fix_rotations(pdf_path, classifier, dpi=dpi, min_score=min_score)
+    rotations = []
+    if rotate:
+        if classifier is None:
+            classifier = load_orientation_classifier()
+        rotations = find_and_fix_rotations(pdf_path, classifier, dpi=dpi, min_score=min_score)
 
     with fitz.open(pdf_path) as doc:
         original_page_count = doc.page_count
@@ -1485,6 +1493,20 @@ DRAFTS_DIRNAME = "drafts"
 OUTPUT_DIRNAME = "output"
 
 
+# The steps a run can include, all on unless the person running it says not.
+STEP_NAMES = ("dedupe", "rotate", "ocr")
+
+
+def normalize_steps(steps: Optional[dict]) -> dict:
+    """``{"dedupe", "rotate", "ocr"}`` as booleans; missing ones default on.
+
+    Unknown keys are dropped, so the dict can be stored and sent back to the
+    UI as it is.
+    """
+    steps = steps or {}
+    return {name: bool(steps.get(name, True)) for name in STEP_NAMES}
+
+
 def run_pipeline(
     workdir: Path,
     model: str,
@@ -1492,15 +1514,17 @@ def run_pipeline(
     ollama_url: str = DEFAULT_OLLAMA_URL,
     report: Optional[Callable[..., None]] = None,
     overrides: Optional[dict] = None,
-    fixes_only: bool = False,
+    steps: Optional[dict] = None,
 ) -> dict:
-    """Fix the pages of every uploaded PDF (repeats removed, sideways pages
-    turned), then one batch OCR/VLM pass, then collect the results.
+    """Run the chosen steps over every uploaded PDF: the page fixes (repeats
+    flagged, sideways pages turned), then one batch OCR/VLM pass, then collect
+    the results.
 
+    ``steps`` is ``{"dedupe", "rotate", "ocr"}`` booleans -- see
+    normalize_steps() -- so a batch runs only what it needs. Without OCR the
+    run stops after the page fixes, for theses with no abstract to read.
     ``overrides`` maps an uploaded filename to its abstract pages as
-    ``(start, end)``, numbered as in the uploaded PDF. ``fixes_only`` stops
-    after the page fixes -- for theses that have no abstract to read, where
-    the corrected PDF is the whole point.
+    ``(start, end)``, numbered as in the uploaded PDF.
 
     ``report`` is a plain callback taking keyword arguments. Passing a
     callback -- rather than having this module import the job store -- keeps
@@ -1526,25 +1550,42 @@ def run_pipeline(
     if not pdfs:
         raise ValueError("No PDFs were uploaded for this job.")
 
-    # --- Pass 1: page fixes, one file at a time, one write each -----------
-    emit(event="stage", stage="fixes", detail="Fixing pages")
-    classifier = load_orientation_classifier()
-    fix_results = {}
-    for index, pdf in enumerate(pdfs, 1):
-        emit(event="fix_start", index=index, total=len(pdfs), filename=pdf.name)
-        result = fix_pdf(pdf, fixed_dir, classifier=classifier)
-        fix_results[pdf.name] = result
-        emit(event="fix_done", filename=pdf.name,
-             repeats=result.duplicates_flagged,
-             rotated=result.pages_rotated,
-             review=result.pages_for_review)
+    steps = normalize_steps(steps)
 
-    if fixes_only:
+    def finish(documents: list, exit_code: int) -> dict:
+        # Recorded on each document so the review screen can tell a check
+        # that found nothing from one that was never run.
+        for d in documents:
+            d["steps"] = dict(steps)
+        write_manifest(output_dir, documents)
+        return {"documents": documents, "exit_code": exit_code}
+
+    # --- Pass 1: page fixes, one file at a time, one write each -----------
+    # OCR reads the fixed copies; with neither page fix chosen it reads the
+    # uploads as they are, and no copy of each PDF is made at all.
+    fix_results = {}
+    ocr_input = uploads_dir
+    if steps["dedupe"] or steps["rotate"]:
+        doing = " and ".join(
+            what for what, on in (("repeated", steps["dedupe"]), ("sideways", steps["rotate"])) if on)
+        emit(event="stage", stage="fixes", detail="Checking for %s pages" % doing)
+        classifier = load_orientation_classifier() if steps["rotate"] else None
+        for index, pdf in enumerate(pdfs, 1):
+            emit(event="fix_start", index=index, total=len(pdfs), filename=pdf.name,
+                 detail="Checking for %s pages" % doing)
+            result = fix_pdf(pdf, fixed_dir, classifier=classifier,
+                             dedupe=steps["dedupe"], rotate=steps["rotate"])
+            fix_results[pdf.name] = result
+            emit(event="fix_done", filename=pdf.name,
+                 repeats=result.duplicates_flagged,
+                 rotated=result.pages_rotated,
+                 review=result.pages_for_review)
+        ocr_input = fixed_dir
+
+    if not steps["ocr"]:
         emit(event="stage", stage="collecting", detail="Collecting results")
         output_dir.mkdir(parents=True, exist_ok=True)
-        documents = collect_fix_outputs(pdfs, fix_results)
-        write_manifest(output_dir, documents)
-        return {"documents": documents, "exit_code": 0}
+        return finish(collect_fix_outputs(pdfs, fix_results), 0)
 
     # --- Abstract page overrides, translated to the fixed copy ------------
     override_csv = None
@@ -1555,7 +1596,8 @@ def run_pipeline(
         if not requested:
             continue
         start, end = requested
-        mapped = map_pages_to_fixed(start, end, fix_results[pdf.name].kept_indices)
+        fixed = fix_results.get(pdf.name)
+        mapped = map_pages_to_fixed(start, end, fixed.kept_indices if fixed else None)
         if mapped is None:
             emit(event="log", detail="[override] %s: pages %d-%d were all removed or "
                  "past the end - finding the abstract automatically instead"
@@ -1572,7 +1614,7 @@ def run_pipeline(
     # --- Pass 2: the OCR + VLM abstract pass over the whole batch ---------
     emit(event="stage", stage="ocr", detail="Reading abstracts")
     exit_code = run_abstract_pass(
-        fixed_dir, drafts_dir,
+        ocr_input, drafts_dir,
         model=model, mode=mode, ollama_url=ollama_url,
         on_progress=lambda payload: emit(**payload),
         override_csv=override_csv,
@@ -1582,9 +1624,7 @@ def run_pipeline(
     emit(event="stage", stage="collecting", detail="Collecting results")
     documents = collect_outputs(drafts_dir, output_dir, fix_results, model, mode,
                                 abstract_pages)
-    write_manifest(output_dir, documents)
-
-    return {"documents": documents, "exit_code": exit_code}
+    return finish(documents, exit_code)
 
 
 def write_manifest(output_dir: Path, documents: list) -> Path:

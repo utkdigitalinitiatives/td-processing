@@ -51,7 +51,10 @@ class Job:
     files: list = field(default_factory=list)          # original uploaded names
     model: str = ""
     mode: str = ""
-    # A page-fixes-only job stops after the page fixes: no OCR, no text.
+    # Which steps this job runs, as {"dedupe", "rotate", "ocr"} booleans.
+    steps: dict = field(default_factory=lambda: {"dedupe": True, "rotate": True, "ocr": True})
+    # A job without OCR stops after the page fixes: no text. Kept alongside
+    # ``steps`` because everything that only asks "is there text?" uses it.
     fixes_only: bool = False
     # Abstract pages set by hand, as {filename: (start, end)} in the uploaded
     # PDF's own page numbers.
@@ -231,6 +234,7 @@ class JobStore:
                 "model": job.model,
                 "mode": job.mode,
                 "fixes_only": job.fixes_only,
+                "steps": dict(job.steps),
                 "files": job.files,
                 "file_index": job.file_index,
                 "file_total": job.file_total,

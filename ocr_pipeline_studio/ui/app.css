@@ -72,6 +72,12 @@ button.ghost.folder-btn { padding: 5px 12px; }
   border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;
 }
 
+/* Steps to run: one checkbox per step. */
+.steps { border: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 6px; }
+.steps legend { font-size: 12px; color: var(--muted); padding: 0; margin-bottom: 4px; }
+.steps .step { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; font-size: 13px; }
+.steps .step input { margin-top: 3px; }
+.steps .step small { display: block; color: var(--muted); font-size: 12px; }
 .controls { display: flex; gap: 16px; flex-wrap: wrap; }
 .controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 select {

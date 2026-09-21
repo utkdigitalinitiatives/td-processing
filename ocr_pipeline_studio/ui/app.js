@@ -184,7 +184,7 @@
       li.appendChild(remove);
       list.appendChild(li);
     });
-    $("run-btn").disabled = state.pending.length === 0;
+    $("run-btn").disabled = !canRun();
     $("clear-btn").disabled = state.pending.length === 0;
   }
 
@@ -192,8 +192,27 @@
   // Running the pipeline
   // =====================================================================
 
+  // The Steps to run checkboxes, as the server takes them.
+  function steps() {
+    return {
+      dedupe: $("step-dedupe").checked,
+      rotate: $("step-rotate").checked,
+      ocr: $("step-ocr").checked
+    };
+  }
+
+  function anyStep() {
+    var s = steps();
+    return s.dedupe || s.rotate || s.ocr;
+  }
+
+  // No OCR means no abstract: no text, and none of its settings apply.
   function isFixesOnly() {
-    return $("run-kind").value === "fixes";
+    return !$("step-ocr").checked;
+  }
+
+  function canRun() {
+    return state.pending.length > 0 && anyStep();
   }
 
   // Same forms the server accepts: "5-8", "5", or blank for automatic.
@@ -217,13 +236,14 @@
     return input;
   }
 
-  function updateRunKind() {
+  function updateSteps() {
     var fixesOnly = isFixesOnly();
-    // The model and VLM pass only matter to the OCR step a fixes-only run skips.
+    // The model and VLM pass only matter to the OCR step.
     $("model-select").disabled = fixesOnly;
     $("mode-select").disabled = fixesOnly;
     show($("mode-help"), !fixesOnly);
-    show($("kind-help"), fixesOnly);
+    show($("steps-help"), fixesOnly && anyStep());
+    show($("steps-none"), !anyStep());
     renderPending();
   }
 
@@ -255,7 +275,7 @@
     state.pending.forEach(function (entry) { form.append("files", entry.file); });
     form.append("model", $("model-select").value);
     form.append("mode", $("mode-select").value);
-    form.append("fixes_only", fixesOnly ? "1" : "0");
+    form.append("steps", JSON.stringify(steps()));
     form.append("overrides", JSON.stringify(overrides));
 
     $("run-btn").disabled = true;
@@ -273,7 +293,7 @@
         var box = $("run-error");
         box.textContent = err.message;
         show(box, true);
-        $("run-btn").disabled = state.pending.length === 0;
+        $("run-btn").disabled = !canRun();
       });
   }
 
@@ -338,7 +358,7 @@
     if (status.finished) {
       clearInterval(state.poll);
       state.poll = null;
-      $("run-btn").disabled = state.pending.length === 0;
+      $("run-btn").disabled = !canRun();
 
       if (status.status === "error") {
         var box = $("run-error");
@@ -389,33 +409,32 @@
     var pages = pagesInput("");
     row.appendChild(pages);
 
+    // One button: the checkboxes above already say which steps to run, so
+    // "abstract only" or "page fixes only" is a matter of what is ticked.
     var again = document.createElement("button");
     again.className = "ghost";
-    again.textContent = "Rerun abstract";
-    again.title = "Run the full pipeline on this file again, using the pages typed here.";
+    again.textContent = "Rerun";
+    again.title = "Run this file again with the steps ticked under Steps to run, "
+      + "using the abstract pages typed here if OCR is ticked.";
     on(again, "click", function () {
-      if (!validPages(pages.value)) {
+      if (!anyStep()) {
+        showRunError("Pick at least one step to run under Steps to run.");
+        return;
+      }
+      if (!isFixesOnly() && !validPages(pages.value)) {
         showRunError(badPagesMessage([name]));
         return;
       }
       var overrides = {};
-      if (pages.value.trim()) { overrides[name] = pages.value.trim(); }
-      rerunFiles(jobId, [name], false, overrides);
+      if (!isFixesOnly() && pages.value.trim()) { overrides[name] = pages.value.trim(); }
+      rerunFiles(jobId, [name], overrides);
     });
     row.appendChild(again);
-
-    var fixes = document.createElement("button");
-    fixes.className = "ghost";
-    fixes.textContent = "Page fixes only";
-    fixes.title = "Remove repeats and turn sideways pages, then download the "
-      + "corrected PDF. No OCR.";
-    on(fixes, "click", function () { rerunFiles(jobId, [name], true, {}); });
-    row.appendChild(fixes);
 
     return row;
   }
 
-  function rerunFiles(jobId, files, fixesOnly, overrides) {
+  function rerunFiles(jobId, files, overrides) {
     var unsaved = Object.keys(state.dirty).concat(Object.keys(state.fixesDirty))
       .filter(function (name, i, all) { return all.indexOf(name) === i; }).length;
     if (unsaved && !window.confirm("You have unsaved edits in " + unsaved
@@ -430,7 +449,7 @@
         files: files,
         model: $("model-select").value,
         mode: $("mode-select").value,
-        fixes_only: fixesOnly,
+        steps: steps(),
         overrides: overrides
       })
     }).then(function (data) {
@@ -446,11 +465,15 @@
   // Only done once the server has accepted the rerun: a refused one changes
   // nothing.
   function syncRunControls(run) {
-    $("run-kind").value = run.fixes_only ? "fixes" : "full";
+    if (run.steps) {
+      $("step-dedupe").checked = !!run.steps.dedupe;
+      $("step-rotate").checked = !!run.steps.rotate;
+      $("step-ocr").checked = !!run.steps.ocr;
+    }
     selectIfPresent($("model-select"), run.model);
     selectIfPresent($("mode-select"), run.mode);
     updateModeHelp();
-    updateRunKind();
+    updateSteps();
   }
 
   function selectIfPresent(select, value) {
@@ -964,10 +987,27 @@
     var applied = rotations.filter(function (r) { return r.applied; });
     var review = rotations.filter(function (r) { return !r.applied; });
 
+    // A check that was not run is said so, rather than looking like one
+    // that found nothing.
+    var ran = doc.steps || { dedupe: true, rotate: true };
+    var skipped = [];
+    if (!ran.dedupe) { skipped.push("The repeated-page check was not run for this document."); }
+    if (!ran.rotate) { skipped.push("The sideways-page check was not run for this document."); }
+    skipped.forEach(function (line) {
+      var note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = line;
+      body.appendChild(note);
+    });
+
     if (!duplicates.length && !rotations.length) {
       var empty = document.createElement("p");
       empty.className = "empty";
-      empty.textContent = "No repeated or sideways pages were found in this document.";
+      empty.textContent = ran.dedupe && ran.rotate
+        ? "No repeated or sideways pages were found in this document."
+        : ran.dedupe ? "No repeated pages were found."
+        : ran.rotate ? "No sideways pages were found."
+        : "No page checks were run.";
       body.appendChild(empty);
       return;
     }
@@ -996,8 +1036,8 @@
       var note = document.createElement("p");
       note.className = "hint";
       note.textContent = "Changing a page's turn updates the fixed PDF. The abstract was "
-        + "already read - if you change a page inside the abstract, use Rerun abstract "
-        + "on the Run screen to read it again.";
+        + "already read - if you change a page inside the abstract, use Rerun on the "
+        + "Run screen with OCR ticked to read it again.";
       body.appendChild(note);
     }
 
@@ -1375,8 +1415,10 @@
     setupDropzone();
     on($("run-btn"), "click", startRun);
     on($("mode-select"), "change", updateModeHelp);
-    on($("run-kind"), "change", updateRunKind);
-    updateRunKind();
+    ["step-dedupe", "step-rotate", "step-ocr"].forEach(function (id) {
+      on($(id), "change", updateSteps);
+    });
+    updateSteps();
     on($("editor"), "input", onEditorInput);
     on($("save-btn"), "click", saveEdits);
     on($("open-folder-btn"), "click", openFolder);

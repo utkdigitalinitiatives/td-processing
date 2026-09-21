@@ -97,9 +97,22 @@ python app.py
 
 **Run screen**
 
-1. Pick a vision model. The dropdown lists what `ollama list` reports, so it
-   only ever offers models you actually have.
-2. Pick a VLM pass:
+1. Tick the **Steps to run** -- any combination, all ticked by default:
+
+   | Step | What it does |
+   | --- | --- |
+   | Check for repeated pages | Flags pages that look like repeats of earlier ones. Quick. |
+   | Turn sideways pages | Finds sideways pages and turns them upright. The slowest step, since it looks at every page -- skip it for batches you know are upright. |
+   | Read the abstract (OCR) | Finds and reads each abstract. Needs the model and VLM pass below. |
+
+   Untick OCR and the model and VLM pass are greyed out, Ollama does not need
+   to be running, and the run stops after the page fixes -- for theses that
+   have no abstract, the corrected PDFs in the run's `fixed/` folder are the
+   result (**Open folder** takes you there). With neither page step ticked,
+   OCR reads your PDFs exactly as dropped.
+
+2. Pick a vision model. The dropdown lists what `ollama list` reports, so it
+   only ever offers models you actually have. Then pick a VLM pass:
 
    | Mode | What it does |
    | --- | --- |
@@ -111,26 +124,20 @@ python app.py
 
 3. Drop your PDFs and press **Run pipeline**.
 
-Every run first turns sideways pages upright and flags pages that look like
-repeats of earlier ones, then reads the abstracts. Repeats are **never removed
+The page steps run first, then OCR. Repeats are **never removed
 automatically** -- the matching gets it wrong too often -- so you decide on the
 Page fixes tab.
-
-**What to run** has a second option, **Page fixes only**. It flags repeats
-and turns sideways pages, and stops there: no OCR, no vision model, and Ollama
-does not need to be running. Use it for theses that have no abstract. The
-Review screen then shows the fixes, and the corrected PDFs are in the run's
-`fixed/` folder -- **Open folder** takes you there.
 
 **Abstract in the wrong place?** Each dropped file has a box for its abstract
 pages. Type them as numbered in your PDF (`5-8`, or `5` for one page) and the
 app uses those instead of searching for the heading. Leave it blank to search
 as usual.
 
-When a run finishes, every file in the queue gets a **Rerun abstract** button
-(with its own pages box) and a **Page fixes only** button. Either one starts a
-new run on just that file, without dropping it in again. The previous run's
-results are left alone.
+When a run finishes, every file in the queue gets a **Rerun** button with
+its own pages box. It starts a new run on just that file, without dropping it
+in again, using whatever is ticked under **Steps to run** -- so untick OCR
+first for page fixes only, or tick only OCR to read the abstract again. The
+previous run's results are left alone.
 
 The progress bar shows which file is being processed and which page within it.
 The vision-model pass runs at the very end, after all OCR is finished, across
@@ -166,7 +173,7 @@ another changes that page in the fixed PDF straight away. Use it to undo a
 wrong turn, turn a page the script was unsure about, or turn one the other
 way. Only the page's rotation setting changes, never the scan. In a full run
 the abstract has already been read by then, so if you change a page inside
-it, **Rerun abstract** reads it again.
+it, **Rerun** with OCR ticked reads it again.
 
 Page numbers on that tab are your PDF's own. The sidebar chips
 `possible repeat(s)`, `removed`, `rotated` and `rotation check` show the
