@@ -25,6 +25,7 @@ import html
 import inspect
 import subprocess
 import tempfile
+import atexit
 import numpy as np
 import tqdm
 from PIL import Image
@@ -487,32 +488,109 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
 # separate subprocess. If a crash occurs, we can retry once or skip the page
 # without affecting the rest of the document.
 def run_ocr_page_worker(pdf_path: Path, page_index: int, dpi: int, confidence_threshold: float, out_json: Path):
-    """Child-process entry point: render one page, OCR it, write results as JSON."""
+    """Child-process entry point: render one page, OCR it, write results as JSON.
+
+    PaddleOCR is loaded on the first page only and reused for every page after
+    it -- see run_ocr_worker_loop.
+    """
     with fitz.open(pdf_path) as doc:
         pix = render_page_image(doc, page_index, dpi=dpi)
-    init_paddle_ocr()
+    if paddle_ocr is None:
+        init_paddle_ocr()
     words = paddle_ocr_page(pix, confidence_threshold=confidence_threshold)
     payload = [{"text": w.text, "conf": w.conf, "bbox": list(w.bbox)} for w in words]
     out_json.write_text(json.dumps(payload), encoding="utf-8")
 
+# A worker answers each request with this line once the page's JSON is
+# written, so the parent can tell "done" from PaddleOCR's own chatter.
+_OCR_WORKER_DONE = "@@OCR-WORKER-DONE@@"
+
+def run_ocr_worker_loop():
+    """Child-process entry point: OCR pages on request until stdin closes.
+
+    One of these serves every page of a PDF. Starting a fresh process per
+    page cost ~15 s each time -- ~10 s importing PaddleOCR and ~5 s loading
+    its models -- before any reading happened. Crash isolation is unchanged:
+    a page that kills this process kills only this process, and the parent
+    starts a new one and retries that page (see ocr_page_isolated).
+    """
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        request = json.loads(line)
+        try:
+            run_ocr_page_worker(Path(request["pdf"]), int(request["page"]), int(request["dpi"]),
+                                float(request["conf"]), Path(request["out_json"]))
+        except Exception:
+            # No JSON written: the parent treats the page as failed and
+            # retries it in a fresh worker, as it would after a crash.
+            pass
+        print(_OCR_WORKER_DONE, request["id"], flush=True)
+
+_ocr_worker = None
+_ocr_worker_requests = 0
+
+def _stop_ocr_worker():
+    """End the current OCR worker, politely if it is still alive."""
+    global _ocr_worker
+    worker, _ocr_worker = _ocr_worker, None
+    if worker is None:
+        return
+    try:
+        if worker.poll() is None:
+            worker.stdin.close()
+            worker.wait(timeout=15)
+    except Exception:
+        try:
+            worker.kill()
+        except Exception:
+            pass
+
+atexit.register(_stop_ocr_worker)
+
+def _ocr_worker_ask(pdf_path: Path, page_index: int, dpi: int, confidence_threshold: float,
+                    out_json: Path) -> bool:
+    """Send one page to the OCR worker (starting it if needed); True once the
+    worker reports that page done. False means it died or answered wrongly."""
+    global _ocr_worker, _ocr_worker_requests
+    if _ocr_worker is None or _ocr_worker.poll() is not None:
+        env = dict(os.environ)
+        # The worker prints PaddleOCR's own status lines (with symbols such as
+        # a check mark); on Windows a piped stdout would otherwise be cp1252
+        # and the first of those prints would kill the worker.
+        env["PYTHONIOENCODING"] = "utf-8"
+        _ocr_worker = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--ocr-worker"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
+    _ocr_worker_requests += 1
+    request_id = str(_ocr_worker_requests)
+    request = {"id": request_id, "pdf": str(pdf_path), "page": page_index, "dpi": dpi,
+               "conf": confidence_threshold, "out_json": str(out_json)}
+    try:
+        _ocr_worker.stdin.write(json.dumps(request) + "\n")
+        _ocr_worker.stdin.flush()
+        for line in _ocr_worker.stdout:
+            if line.startswith(_OCR_WORKER_DONE):
+                return line.split()[1:2] == [request_id]
+    except (OSError, ValueError):
+        pass
+    return False  # the worker's output ended: it died mid-page
+
 def ocr_page_isolated(pdf_path: Path, page_index: int, dpi: int, confidence_threshold: float,
                        max_attempts: int = 2) -> List[OCRWord]:
-    """Run OCR for one page in an isolated subprocess, retrying once on crash."""
-    script_path = Path(__file__).resolve()
+    """Run OCR for one page in an isolated worker process, retrying once on crash.
+
+    The worker stays alive between pages (see run_ocr_worker_loop), so
+    PaddleOCR is loaded once per PDF rather than once per page. A page that
+    crashes it gets a fresh worker for its retry.
+    """
     for attempt in range(1, max_attempts + 1):
         with tempfile.TemporaryDirectory() as tmp:
             out_json = Path(tmp) / "words.json"
-            cmd = [
-                sys.executable, str(script_path),
-                "--ocr-page",
-                "--pdf", str(pdf_path),
-                "--page", str(page_index),
-                "--dpi", str(dpi),
-                "--confidence-threshold", str(confidence_threshold),
-                "--out-json", str(out_json),
-            ]
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode == 0 and out_json.exists():
+            answered = _ocr_worker_ask(pdf_path, page_index, dpi, confidence_threshold, out_json)
+            if answered and out_json.exists():
                 try:
                     payload = json.loads(out_json.read_text(encoding="utf-8"))
                 except Exception:
@@ -522,6 +600,8 @@ def ocr_page_isolated(pdf_path: Path, page_index: int, dpi: int, confidence_thre
                         OCRWord(page=page_index, text=item["text"], conf=item["conf"], bbox=tuple(item["bbox"]))
                         for item in payload
                     ]
+            # Dead, or alive but unable to read the page: start clean.
+            _stop_ocr_worker()
             if attempt < max_attempts:
                 print(" (crashed, retrying)", end="", flush=True)
     print(" ⚠ OCR crashed twice, skipping page", end="", flush=True)
@@ -2011,6 +2091,12 @@ def load_overrides(path: Optional[Path]) -> dict:
 
 def main():
     import argparse
+
+    # Internal/hidden: a long-lived OCR worker serving one PDF's pages (see
+    # run_ocr_worker_loop).
+    if "--ocr-worker" in sys.argv:
+        run_ocr_worker_loop()
+        return
 
     # Internal/hidden: used when this script re-invokes itself as a child
     # process for exactly one PDF (see the crash-isolation loop below).
