@@ -1585,7 +1585,7 @@ def collect_fix_outputs(pdfs: list, fix_results: dict) -> list:
 # --------------------------------------------------------------------------
 
 # Subdirectory names inside workdir/<job_id>/. Named constants because both
-# this module and the export route need to agree on them.
+# this module and the routes that serve a job's files need to agree on them.
 UPLOADS_DIRNAME = "uploads"
 FIXED_DIRNAME = "fixed"
 DRAFTS_DIRNAME = "drafts"

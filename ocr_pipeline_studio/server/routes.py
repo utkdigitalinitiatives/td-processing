@@ -16,7 +16,6 @@ import subprocess
 import sys
 import threading
 import traceback
-import zipfile
 from pathlib import Path
 
 from flask import (Blueprint, current_app, jsonify, request,
@@ -654,7 +653,7 @@ def job_list():
 
 
 # --------------------------------------------------------------------------
-# Review + export
+# Review
 # --------------------------------------------------------------------------
 
 def _find_document(job, name: str):
@@ -1209,84 +1208,3 @@ def save(job_id: str):
 
     return jsonify({"ok": True, "written": written, "page_fixes": page_fixes,
                     "saved_text": saved_text, "still_pending": still_pending})
-
-
-@bp.post("/export")
-def export():
-    """Download the reviewed output.
-
-    One document comes back as a single .md; several are zipped server-side
-    into one download. Either way the bytes are the *possibly edited* text
-    from the review screen, not necessarily what is on disk -- exporting is
-    meant to give the user what they are looking at.
-    """
-    store: jobstate.JobStore = current_app.config["JOB_STORE"]
-    payload = request.get_json(silent=True) or {}
-    job_id = payload.get("job_id", "")
-    job = store.get(job_id)
-    if job is None:
-        return jsonify({"error": "No such job."}), 404
-
-    names = payload.get("names") or [d["name"] for d in job.documents]
-    selected = [d for d in job.documents if d["name"] in names]
-    if not selected:
-        return jsonify({"error": "Nothing selected to export."}), 400
-
-    if job.fixes_only:
-        return _export_fixed_pdfs(job, selected)
-
-    def text_for(doc) -> str:
-        """Edited text if there is any, otherwise what the pipeline wrote."""
-        if doc["name"] in job.edits:
-            return job.edits[doc["name"]]
-        path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
-        return path.read_text(encoding="utf-8") if path.exists() else ""
-
-    if len(selected) == 1:
-        doc = selected[0]
-        buffer = io.BytesIO(text_for(doc).encode("utf-8"))
-        return send_file(buffer, mimetype="text/markdown",
-                         as_attachment=True, download_name=doc["md_file"])
-
-    # Built in memory rather than as a temp file: these are abstracts, a few
-    # KB each, so there is nothing to gain from touching the disk.
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for doc in selected:
-            archive.writestr(doc["md_file"], text_for(doc))
-        manifest = job.workdir / runner.OUTPUT_DIRNAME / "manifest.json"
-        if manifest.exists():
-            archive.writestr("manifest.json", manifest.read_text(encoding="utf-8"))
-    buffer.seek(0)
-    return send_file(buffer, mimetype="application/zip",
-                     as_attachment=True,
-                     download_name="ocr-pipeline-studio-%s.zip" % job.id)
-
-
-def _export_fixed_pdfs(job, selected: list):
-    """Download a page-fixes-only job's corrected PDFs.
-
-    The file in ``fixed/`` is the finished product: repeats removed and
-    sideways pages turned. Unlike abstracts these can run to tens of MB, so a
-    batch is zipped to a file in the job folder rather than in memory, and
-    stored uncompressed -- PDF scans are already compressed.
-    """
-    fixed_dir = job.workdir / runner.FIXED_DIRNAME
-    pdfs = [fixed_dir / d["filename"] for d in selected]
-    missing = [p.name for p in pdfs if not p.exists()]
-    if missing:
-        return jsonify({"error": "Fixed PDF missing for: %s" % ", ".join(missing)}), 404
-
-    if len(pdfs) == 1:
-        return send_file(pdfs[0], mimetype="application/pdf",
-                         as_attachment=True, download_name=pdfs[0].name)
-
-    zip_path = job.workdir / "fixed-pdfs.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as archive:
-        for pdf in pdfs:
-            archive.write(pdf, pdf.name)
-        manifest = job.workdir / runner.OUTPUT_DIRNAME / "manifest.json"
-        if manifest.exists():
-            archive.write(manifest, "manifest.json")
-    return send_file(zip_path, mimetype="application/zip", as_attachment=True,
-                     download_name="fixed-pdfs-%s.zip" % job.id)

@@ -63,8 +63,8 @@ class Job:
     ``edits`` is the review screen's scratch space: the textarea contents as
     the user has changed them, keyed by document name. It is deliberately
     separate from what is on disk. Edits only reach the filesystem when the
-    user explicitly saves or exports, which is what makes the review screen
-    safe to experiment in.
+    user explicitly saves, which is what makes the review screen safe to
+    experiment in.
     """
     id: str
     workdir: Path
