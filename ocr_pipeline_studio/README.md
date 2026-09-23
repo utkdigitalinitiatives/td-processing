@@ -10,6 +10,9 @@ preview so you can fix up the result before saving it.
 **Everything runs on this machine.** The only network traffic is to Ollama on
 `localhost:11434`. Nothing is ever sent to the internet.
 
+This is one of the tools in [td-processing](../README.md); the OCR script it
+drives lives beside it in [`auto_abstract/`](../auto_abstract/).
+
 ---
 
 ## What you need before you start
@@ -40,7 +43,8 @@ preview so you can fix up the result before saving it.
 
 ## Setup (once)
 
-Open PowerShell in this folder and run these four commands in order.
+Open PowerShell in this folder -- `ocr_pipeline_studio/`, not the repository
+root -- and run these three commands in order.
 
 ```powershell
 py -3.11 -m venv .venv
@@ -329,6 +333,14 @@ For anyone reading the code (the comments in each file go into more detail):
 - **`pipeline/dedupe.py`, `pipeline/fix_rotation.py` and
   `pipeline/vlm_abstract.py`** are the original scripts, unmodified. The
   originals are also still in `source_scripts/`.
+
+**On the duplicate copies of the OCR script.** `pipeline/vlm_abstract.py`,
+`source_scripts/abstract_ocr_paddle_cuda.py` and
+[`../auto_abstract/abstract_ocr_paddle_cuda.py`](../auto_abstract/abstract_ocr_paddle_cuda.py)
+are the same file, byte for byte. That is deliberate, not drift: this app
+vendors the script it drives rather than importing it across the repository, so
+the app keeps working on a copy of its own and `auto_abstract/` stays usable on
+its own terms. If you change one, change all three.
 
 One thing worth knowing about the dedupe step: the original script *detects*
 duplicate pages but has no function that removes them. The removal is done in
