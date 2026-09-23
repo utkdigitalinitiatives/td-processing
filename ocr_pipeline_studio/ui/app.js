@@ -1,0 +1,1559 @@
+/* OCR Pipeline Studio -- front-end.
+ *
+ * Plain ES modules-free JavaScript, no framework. The app has two screens and
+ * one polling loop, which is well under the size where a framework starts
+ * paying for itself.
+ *
+ * The one external dependency is markdown-it, vendored into ui/vendor/. It is
+ * never loaded from a CDN, because the whole app has to work with no internet
+ * connection.
+ */
+
+(function () {
+  "use strict";
+
+  // html: true is essential here rather than a stylistic choice. The pipeline
+  // emits an HTML fragment -- <p>, <sup>, <sub> and character entities like
+  // &alpha; -- and that markup is the actual product of the OCR work. With
+  // html:false markdown-it would escape it all and the preview would show raw
+  // tags instead of formatted text.
+  var md = window.markdownit({ html: true, linkify: false, breaks: false });
+
+  var state = {
+    pending: [],        // {file, pages} staged in the drop zone
+    jobId: null,
+    fixesOnly: false,   // whether the job on screen was a page-fixes-only run
+    openedFolder: null, // set when the run on screen was opened from a folder
+    poll: null,         // setInterval handle for /status
+    documents: [],      // summaries from /status
+    current: null,      // full payload for the open document
+    dirty: {},          // name -> true when edited but unsaved
+    fixesDirty: {},     // name -> true when Keep/Remove choices are unsaved
+    editTimer: null,
+    lastSkip: null,     // a single-span click that could not be carried out
+    choiceOpen: {}      // "page:index" -> open/closed, for copy pickers the user toggled
+  };
+
+  // ---------- tiny DOM helpers ----------
+  function $(id) { return document.getElementById(id); }
+  function on(el, evt, fn) { el.addEventListener(evt, fn); }
+  function show(el, visible) { el.hidden = !visible; }
+
+  function text(value) {
+    // Everything user- or pipeline-supplied goes through here before being
+    // put on the page, so a stray "<" in OCR output can never become markup.
+    var node = document.createElement("span");
+    node.textContent = value == null ? "" : String(value);
+    return node;
+  }
+
+  function api(path, options) {
+    return fetch(path, options).then(function (resp) {
+      return resp.json().then(function (body) {
+        if (!resp.ok) { throw new Error(body.error || ("Request failed: " + resp.status)); }
+        return body;
+      });
+    });
+  }
+
+  // =====================================================================
+  // Ollama banner + model picker
+  // =====================================================================
+
+  function refreshOllama() {
+    return api("/ollama").then(function (status) {
+      var banner = $("ollama-banner");
+      banner.className = "banner " + (status.running ? "ok" : "bad");
+      banner.textContent = status.running
+        ? "Ollama is running - " + status.models.length + " model(s) available locally."
+        : status.error;
+      show(banner, true);
+      return status;
+    });
+  }
+
+  function loadModels() {
+    return api("/models").then(function (data) {
+      var select = $("model-select");
+      select.innerHTML = "";
+
+      if (!data.models.length) {
+        var none = document.createElement("option");
+        none.textContent = "No models found - run: ollama pull qwen2.5vl:3b";
+        none.value = "";
+        select.appendChild(none);
+      }
+      data.models.forEach(function (name) {
+        var option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        // Preselect the model the OCR script itself defaults to, when present.
+        if (name === data.default_model) { option.selected = true; }
+        select.appendChild(option);
+      });
+
+      var modeSelect = $("mode-select");
+      modeSelect.innerHTML = "";
+      data.modes.forEach(function (mode) {
+        var option = document.createElement("option");
+        option.value = mode.id;
+        option.textContent = mode.label;
+        option.dataset.help = mode.help;
+        if (mode.id === data.default_mode) { option.selected = true; }
+        modeSelect.appendChild(option);
+      });
+      updateModeHelp();
+      return data;
+    });
+  }
+
+  function updateModeHelp() {
+    var selected = $("mode-select").selectedOptions[0];
+    $("mode-help").textContent = selected ? (selected.dataset.help || "") : "";
+  }
+
+  // =====================================================================
+  // Drop zone
+  // =====================================================================
+
+  function setupDropzone() {
+    var zone = $("dropzone");
+    var input = $("file-input");
+
+    // dragover must be cancelled or the browser opens the file instead.
+    ["dragenter", "dragover"].forEach(function (evt) {
+      on(zone, evt, function (e) {
+        e.preventDefault();
+        zone.classList.add("is-over");
+      });
+    });
+    ["dragleave", "drop"].forEach(function (evt) {
+      on(zone, evt, function (e) {
+        e.preventDefault();
+        zone.classList.remove("is-over");
+      });
+    });
+
+    on(zone, "drop", function (e) {
+      addFiles(e.dataTransfer.files);
+    });
+    on($("browse-btn"), "click", function () { input.click(); });
+    on(input, "change", function () { addFiles(input.files); input.value = ""; });
+    on($("clear-btn"), "click", function () { state.pending = []; renderPending(); });
+  }
+
+  function addFiles(fileList) {
+    Array.prototype.forEach.call(fileList, function (file) {
+      if (!/\.pdf$/i.test(file.name)) { return; }
+      // Skip a file already staged, so dropping the same batch twice does not
+      // upload it twice.
+      var already = state.pending.some(function (entry) {
+        return entry.file.name === file.name && entry.file.size === file.size;
+      });
+      if (!already) { state.pending.push({ file: file, pages: "" }); }
+    });
+    renderPending();
+  }
+
+  function renderPending() {
+    var list = $("pending-list");
+    list.innerHTML = "";
+    var fixesOnly = isFixesOnly();
+    show($("pages-help"), state.pending.length > 0 && !fixesOnly);
+
+    state.pending.forEach(function (entry, index) {
+      var li = document.createElement("li");
+      var name = text(entry.file.name);
+      name.className = "file-name";
+      li.appendChild(name);
+
+      // Abstract pages set by hand. Not offered for a page-fixes-only run,
+      // which never looks for an abstract.
+      if (!fixesOnly) {
+        var pages = pagesInput(entry.pages);
+        on(pages, "input", function () { entry.pages = pages.value; });
+        li.appendChild(pages);
+      }
+
+      var remove = document.createElement("button");
+      remove.className = "linkish";
+      remove.textContent = "remove";
+      on(remove, "click", function () {
+        state.pending.splice(index, 1);
+        renderPending();
+      });
+      li.appendChild(remove);
+      list.appendChild(li);
+    });
+    $("run-btn").disabled = !canRun();
+    $("clear-btn").disabled = state.pending.length === 0;
+  }
+
+  // =====================================================================
+  // Running the pipeline
+  // =====================================================================
+
+  // The Steps to run checkboxes, as the server takes them.
+  function steps() {
+    return {
+      dedupe: $("step-dedupe").checked,
+      rotate: $("step-rotate").checked,
+      ocr: $("step-ocr").checked
+    };
+  }
+
+  function anyStep() {
+    var s = steps();
+    return s.dedupe || s.rotate || s.ocr;
+  }
+
+  // No OCR means no abstract: no text, and none of its settings apply.
+  function isFixesOnly() {
+    return !$("step-ocr").checked;
+  }
+
+  function canRun() {
+    return state.pending.length > 0 && anyStep();
+  }
+
+  // Same forms the server accepts: "5-8", "5", or blank for automatic.
+  function validPages(value) {
+    if (!(value || "").trim()) { return true; }
+    var m = /^\s*(\d+)\s*(?:-\s*(\d+))?\s*$/.exec(value);
+    return !!m && +m[1] >= 1 && +(m[2] || m[1]) >= +m[1];
+  }
+
+  function pagesInput(value) {
+    var input = document.createElement("input");
+    input.type = "text";
+    input.className = "pages-input";
+    input.placeholder = "abstract pages: auto";
+    input.title = "Abstract pages as numbered in this PDF, e.g. 5-8. "
+      + "Blank finds them automatically.";
+    input.value = value || "";
+    function check() { input.classList.toggle("is-invalid", !validPages(input.value)); }
+    on(input, "input", check);
+    check();
+    return input;
+  }
+
+  function updateSteps() {
+    var fixesOnly = isFixesOnly();
+    // The model and VLM pass only matter to the OCR step.
+    $("model-select").disabled = fixesOnly;
+    $("mode-select").disabled = fixesOnly;
+    show($("mode-help"), !fixesOnly);
+    show($("steps-help"), fixesOnly && anyStep());
+    show($("steps-none"), !anyStep());
+    renderPending();
+  }
+
+  function showRunError(message) {
+    var box = $("run-error");
+    box.textContent = message;
+    show(box, true);
+  }
+
+  function badPagesMessage(names) {
+    return "Check the abstract pages for " + names.join(", ") + " - use a form like 5-8 or 5.";
+  }
+
+  function startRun() {
+    var fixesOnly = isFixesOnly();
+    var overrides = {};
+    var bad = [];
+    state.pending.forEach(function (entry) {
+      if (fixesOnly || !entry.pages.trim()) { return; }
+      if (!validPages(entry.pages)) { bad.push(entry.file.name); }
+      overrides[entry.file.name] = entry.pages.trim();
+    });
+    if (bad.length) {
+      showRunError(badPagesMessage(bad));
+      return;
+    }
+
+    var form = new FormData();
+    state.pending.forEach(function (entry) { form.append("files", entry.file); });
+    form.append("model", $("model-select").value);
+    form.append("mode", $("mode-select").value);
+    form.append("steps", JSON.stringify(steps()));
+    form.append("overrides", JSON.stringify(overrides));
+
+    $("run-btn").disabled = true;
+    show($("run-error"), false);
+
+    api("/upload", { method: "POST", body: form })
+      .then(function (data) {
+        state.pending = [];
+        state.openedFolder = null;
+        renderPending();
+        beginJob(data.job_id);
+      })
+      .catch(function (err) {
+        // The most common failure here is the Ollama preflight, whose message
+        // is already written for a human -- show it as-is.
+        var box = $("run-error");
+        box.textContent = err.message;
+        show(box, true);
+        $("run-btn").disabled = !canRun();
+      });
+  }
+
+  // Point the screen at a newly started job. The review screen showed the
+  // previous job, so it is closed until this one finishes.
+  function beginJob(jobId) {
+    state.jobId = jobId;
+    state.documents = [];
+    state.current = null;
+    state.dirty = {};
+    state.fixesDirty = {};
+    $("tab-review").disabled = true;
+    show($("progress-panel"), true);
+    switchScreen("run");
+    startPolling();
+  }
+
+  function startPolling() {
+    if (state.poll) { clearInterval(state.poll); }
+    tick();
+    // 1.2s: fast enough to feel live on a per-page pass, slow enough that it
+    // costs nothing next to a multi-minute OCR run.
+    state.poll = setInterval(tick, 1200);
+  }
+
+  function tick() {
+    if (!state.jobId) { return; }
+    api("/status/" + state.jobId)
+      .then(renderProgress)
+      .catch(function () { /* a dropped poll is not worth interrupting for */ });
+  }
+
+  function renderProgress(status) {
+    $("progress-label").textContent = status.label;
+    // The full path, so the folder can be found even without the button.
+    $("job-folder").textContent = (status.opened_from_folder ? "Opened from: " : "Working folder: ")
+      + (status.folder || "");
+    show($("job-folder"), !!status.folder);
+
+    var count = "";
+    if (status.file_total) {
+      count = "file " + Math.max(status.file_index, 1) + " of " + status.file_total;
+    }
+    $("progress-count").textContent = count;
+
+    // Progress is approximated from pages within the current file plus how
+    // many files are done. There is no honest total up front -- the OCR script
+    // only reveals a document's abstract page range once it starts reading it.
+    var fraction = 0;
+    if (status.file_total) {
+      var done = Math.max(status.file_index - 1, 0) / status.file_total;
+      var within = status.page_total
+        ? (status.page_current / status.page_total) / status.file_total
+        : 0;
+      fraction = Math.min(done + within, 0.98);
+    }
+    if (status.finished) { fraction = 1; }
+    $("progress-fill").style.width = (fraction * 100).toFixed(1) + "%";
+
+    renderQueue(status);
+    $("log-output").textContent = (status.log || []).join("\n");
+
+    if (status.finished) {
+      clearInterval(state.poll);
+      state.poll = null;
+      $("run-btn").disabled = !canRun();
+
+      if (status.status === "error") {
+        var box = $("run-error");
+        box.textContent = status.error || "The pipeline failed.";
+        show(box, true);
+        return;
+      }
+      state.documents = status.documents || [];
+      state.fixesOnly = !!status.fixes_only;
+      // A finished run has just saved its folder; keep the list current.
+      loadRuns();
+      // Save writes text edits and Keep/Remove choices, so it shows for
+      // fixes-only jobs too; their product is the PDFs in the fixed folder.
+      $("save-status").textContent = state.fixesOnly
+        ? "Corrected PDFs are in the fixed folder - use Open folder."
+        : "";
+      if (state.documents.length) {
+        $("tab-review").disabled = false;
+        renderDocList();
+        switchScreen("review");
+        selectDocument(state.documents[0].name);
+      }
+    }
+  }
+
+  function renderQueue(status) {
+    var list = $("queue-list");
+    list.innerHTML = "";
+    (status.files || []).forEach(function (name) {
+      var info = (status.file_states || {})[name] || { state: "queued", detail: "" };
+      var li = document.createElement("li");
+      li.appendChild(text(name));
+      var span = document.createElement("span");
+      span.className = "state " + info.state;
+      span.textContent = info.detail ? info.state + " - " + info.detail : info.state;
+      li.appendChild(span);
+      // Once the job is over, any file can be run again: with its abstract
+      // pages set by hand, or as page fixes only when it has no abstract.
+      if (status.finished && status.status === "done") {
+        li.appendChild(buildRerun(status.job_id, name));
+      }
+      list.appendChild(li);
+    });
+  }
+
+  function buildRerun(jobId, name) {
+    var row = document.createElement("div");
+    row.className = "rerun";
+
+    var pages = pagesInput("");
+    row.appendChild(pages);
+
+    // One button: the checkboxes above already say which steps to run, so
+    // "abstract only" or "page fixes only" is a matter of what is ticked.
+    var again = document.createElement("button");
+    again.className = "ghost";
+    again.textContent = "Rerun";
+    again.title = "Run this file again with the steps ticked under Steps to run, "
+      + "using the abstract pages typed here if OCR is ticked.";
+    on(again, "click", function () {
+      if (!anyStep()) {
+        showRunError("Pick at least one step to run under Steps to run.");
+        return;
+      }
+      if (!isFixesOnly() && !validPages(pages.value)) {
+        showRunError(badPagesMessage([name]));
+        return;
+      }
+      var overrides = {};
+      if (!isFixesOnly() && pages.value.trim()) { overrides[name] = pages.value.trim(); }
+      rerunFiles(jobId, [name], overrides);
+    });
+    row.appendChild(again);
+
+    return row;
+  }
+
+  function confirmLosingUnsaved(what) {
+    var unsaved = Object.keys(state.dirty).concat(Object.keys(state.fixesDirty))
+      .filter(function (name, i, all) { return all.indexOf(name) === i; }).length;
+    return !unsaved || window.confirm("You have unsaved changes in " + unsaved
+      + " document(s). " + what + " moves on from this run - continue?");
+  }
+
+  function rerunFiles(jobId, files, overrides) {
+    if (!confirmLosingUnsaved("Rerunning")) { return; }
+    show($("run-error"), false);
+    api("/rerun/" + jobId, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        files: files,
+        model: $("model-select").value,
+        mode: $("mode-select").value,
+        steps: steps(),
+        overrides: overrides
+      })
+    }).then(function (data) {
+      syncRunControls(data);
+      beginJob(data.job_id);
+    }).catch(function (err) {
+      showRunError(err.message);
+    });
+  }
+
+  // Make the Run screen's dropdowns show what a rerun actually started with,
+  // so they never describe a different kind of run from the one in progress.
+  // Only done once the server has accepted the rerun: a refused one changes
+  // nothing.
+  function syncRunControls(run) {
+    if (run.steps) {
+      $("step-dedupe").checked = !!run.steps.dedupe;
+      $("step-rotate").checked = !!run.steps.rotate;
+      $("step-ocr").checked = !!run.steps.ocr;
+    }
+    selectIfPresent($("model-select"), run.model);
+    selectIfPresent($("mode-select"), run.mode);
+    updateModeHelp();
+    updateSteps();
+  }
+
+  function selectIfPresent(select, value) {
+    // Setting a value the list does not have would blank the dropdown.
+    var has = Array.prototype.some.call(select.options, function (option) {
+      return option.value === value;
+    });
+    if (has) { select.value = value; }
+  }
+
+  // =====================================================================
+  // Past runs
+  // =====================================================================
+  // Each run's folder holds its own state, so a batch can be run now and
+  // reviewed later, by whoever has the folder.
+
+  function loadRuns() {
+    return api("/saved-runs").then(function (data) {
+      var list = $("runs-list");
+      list.innerHTML = "";
+      var runs = data.runs || [];
+      show($("runs-empty"), runs.length === 0);
+
+      runs.forEach(function (run) {
+        var li = document.createElement("li");
+        li.className = "run-row";
+
+        var name = text(run.name);
+        name.className = "run-name";
+        li.appendChild(name);
+
+        var meta = text(describeRun(run));
+        meta.className = "run-meta";
+        li.appendChild(meta);
+
+        if (!run.reviewable) {
+          var note = text("no saved review");
+          note.className = "run-rebuilt";
+          note.title = "This folder has no saved state; opening it recovers the "
+            + "text and differences from its files.";
+          li.appendChild(note);
+        }
+
+        var open = document.createElement("button");
+        open.className = "ghost";
+        open.textContent = "Open";
+        on(open, "click", function () { openRun(run.folder); });
+        li.appendChild(open);
+
+        list.appendChild(li);
+      });
+      return runs;
+    }).catch(function (err) {
+      showRunsError(err.message);
+    });
+  }
+
+  function describeRun(run) {
+    var parts = [];
+    if (run.saved_at) { parts.push(run.saved_at.replace("T", " ")); }
+    parts.push((run.files || []).length + " file(s)");
+    parts.push(run.documents + " document(s)");
+    var steps = run.steps || {};
+    var ran = [];
+    if (steps.dedupe) { ran.push("repeats"); }
+    if (steps.rotate) { ran.push("rotation"); }
+    if (steps.ocr) { ran.push("OCR"); }
+    if (ran.length) { parts.push(ran.join(" + ")); }
+    return parts.join(" - ");
+  }
+
+  function showRunsError(message) {
+    var box = $("runs-error");
+    box.textContent = message;
+    show(box, true);
+  }
+
+  // folder omitted -> the window asks for one, so a run copied from another
+  // machine can be opened from wherever it was put.
+  function openRun(folder) {
+    if (!confirmLosingUnsaved("Opening another run")) { return; }
+    show($("runs-error"), false);
+    api("/open-run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(folder ? { folder: folder } : {})
+    }).then(function (data) {
+      if (data.cancelled) { return; }
+      syncRunControls(data);
+      state.openedFolder = data.folder;
+      beginJob(data.job_id);
+      if (data.rebuilt) {
+        showRunsError("That folder had no saved review, so the text and differences "
+          + "were rebuilt from its files. Repeated and sideways pages are not recorded.");
+      }
+    }).catch(function (err) {
+      showRunsError(err.message);
+    });
+  }
+
+  // =====================================================================
+  // Review screen
+  // =====================================================================
+
+  function switchScreen(name) {
+    show($("screen-run"), name === "run");
+    show($("screen-review"), name === "review");
+    document.querySelectorAll(".topbar .tab").forEach(function (tab) {
+      tab.classList.toggle("is-active", tab.dataset.screen === name);
+    });
+  }
+
+  function renderDocList() {
+    var list = $("doc-list");
+    list.innerHTML = "";
+    $("doc-count").textContent = state.documents.length + " total";
+
+    state.documents.forEach(function (doc) {
+      var li = document.createElement("li");
+      var button = document.createElement("button");
+      button.dataset.name = doc.name;
+
+      var name = document.createElement("span");
+      name.className = "doc-name";
+      name.textContent = doc.name;
+      button.appendChild(name);
+
+      var chips = document.createElement("span");
+      chips.className = "doc-flags";
+
+      // Flag chips come straight from the pipeline's own per-page reasons.
+      // Pages the script flagged as low-confidence are shown first, since
+      // those are the ones worth looking at before anything else.
+      var pagesByKind = {};
+      (doc.flags || []).forEach(function (flag) {
+        (pagesByKind[flag.kind] = pagesByKind[flag.kind] || []).push(flag);
+      });
+      // Page fixes come first: they happened before OCR, to the whole PDF.
+      if (doc.duplicates_flagged) {
+        chips.appendChild(fixChip("rotate-review", doc.duplicates_flagged + " possible repeat(s)",
+          "Pages that may repeat an earlier page. Nothing is removed unless you "
+            + "choose to - see the Page fixes tab."));
+      }
+      if (doc.duplicates_removed) {
+        chips.appendChild(fixChip("dedupe", doc.duplicates_removed + " removed",
+          "Repeated pages you removed from the fixed PDF."));
+      }
+      if (doc.pages_rotated) {
+        chips.appendChild(fixChip("rotate", doc.pages_rotated + " rotated",
+          "Sideways pages turned upright before OCR - see the Page fixes tab."));
+      }
+      if (doc.pages_for_review) {
+        chips.appendChild(fixChip("rotate-review", doc.pages_for_review + " rotation check",
+          "Pages that may be sideways but were left alone - check them on the Page fixes tab."));
+      }
+
+      ["low_confidence", "equation", "diff"].forEach(function (kind) {
+        var flags = pagesByKind[kind];
+        if (!flags) { return; }
+        var chip = document.createElement("span");
+        chip.className = "chip " + kind;
+        // The chip names the actual pages, not just a count, so the sidebar
+        // answers "where do I look first?" without a click.
+        var pages = flags.map(function (f) { return f.page; });
+        chip.textContent = kindLabel(kind) + " p" + pages.join(",");
+        // Hovering gives the pipeline's own wording for why each was flagged.
+        chip.title = flags.map(function (f) {
+          return "Page " + f.page + ": " + f.labels.join("; ");
+        }).join("\n");
+        chips.appendChild(chip);
+      });
+      if (state.dirty[doc.name] || state.fixesDirty[doc.name]) {
+        var dirty = document.createElement("span");
+        dirty.className = "chip dirty";
+        dirty.textContent = "unsaved";
+        chips.appendChild(dirty);
+      }
+      button.appendChild(chips);
+
+      if (state.current && state.current.name === doc.name) {
+        button.classList.add("is-active");
+      }
+      on(button, "click", function () { selectDocument(doc.name); });
+      li.appendChild(button);
+      list.appendChild(li);
+    });
+  }
+
+  function fixChip(kind, label, title) {
+    var chip = document.createElement("span");
+    chip.className = "chip " + kind;
+    chip.textContent = label;
+    chip.title = title;
+    return chip;
+  }
+
+  function kindLabel(kind) {
+    if (kind === "low_confidence") { return "low-conf"; }
+    if (kind === "equation") { return "equation"; }
+    return "diff";
+  }
+
+  function selectDocument(name) {
+    api("/document/" + state.jobId + "/" + encodeURIComponent(name))
+      .then(function (doc) {
+        state.current = doc;
+        state.choiceOpen = {};
+        $("doc-title").textContent = doc.name;
+
+        var meta = [];
+        if (doc.fixes_only) { meta.push("page fixes only"); }
+        if (doc.abstract_pages) {
+          meta.push("abstract pages " + doc.abstract_pages.requested + " set by hand");
+        }
+        if (doc.page_count != null) { meta.push(doc.page_count + " pages after fixes"); }
+        if (doc.duplicates_removed) { meta.push(doc.duplicates_removed + " repeated page(s) removed by you"); }
+        if (doc.pages_rotated) { meta.push(doc.pages_rotated + " sideways page(s) rotated"); }
+        if (doc.model_used) { meta.push("model: " + doc.model_used); }
+        $("doc-meta").textContent = meta.join(" - ");
+
+        $("editor").value = doc.text;
+        renderPreview();
+
+        // Tabs are disabled rather than hidden when a mode produced no such
+        // data, so the UI never shows a control that silently does nothing.
+        $("tab-edit").disabled = !!doc.fixes_only;
+        $("tab-diff").disabled = !(doc.diffs && doc.diffs.length);
+        $("tab-recovery").disabled = !(doc.recovery && doc.recovery.length);
+        // Always open for a fixes-only document: the fixes are all it has,
+        // and "none were needed" is itself an answer.
+        $("tab-fixes").disabled = !(doc.fixes_only
+          || (doc.duplicates && doc.duplicates.length)
+          || (doc.rotations && doc.rotations.length));
+
+        renderDiff(doc);
+        renderRecovery(doc);
+        renderFixes(doc);
+        renderDocList();
+        switchView(doc.fixes_only ? "fixes" : "edit");
+      });
+  }
+
+  function renderPreview() {
+    // The preview is markdown-it output of content the pipeline produced and
+    // the user edits locally. Nothing here crosses a trust boundary: it is a
+    // single-user local tool rendering that same user's own document.
+    $("preview").innerHTML = md.render($("editor").value || "");
+  }
+
+  function switchView(view) {
+    show($("view-edit"), view === "edit");
+    show($("view-diff"), view === "diff");
+    show($("view-recovery"), view === "recovery");
+    show($("view-fixes"), view === "fixes");
+    document.querySelectorAll(".view-toggle .tab").forEach(function (tab) {
+      tab.classList.toggle("is-active", tab.dataset.view === view);
+    });
+  }
+
+  function renderDiff(doc) {
+    var body = $("diff-body");
+    body.innerHTML = "";
+
+    if (!doc.diffs || !doc.diffs.length) {
+      $("diff-intro").textContent = "";
+      var empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "This run produced no OCR/VLM comparison. "
+        + "Choose one of the diff modes on the Run screen to generate one.";
+      body.appendChild(empty);
+      return;
+    }
+
+    $("diff-intro").textContent =
+      "Left is what PaddleOCR read; right is what the vision model read on the "
+      + "same page. Click a side to put it into the document - you do not have "
+      + "to find the text in the editor yourself.";
+
+    // Bulk actions. These sweep every span that is not already on the chosen
+    // side, which is the whole point: the flagged ones are scattered through
+    // the document and hunting for each by hand is the tedious part.
+    var bulk = document.createElement("div");
+    bulk.className = "bulk-actions";
+
+    var remaining = countOnSide(doc.diffs, "ocr");
+    var applyAll = document.createElement("button");
+    applyAll.className = "primary";
+    applyAll.textContent = "Apply all remaining VLM fixes (" + remaining + ")";
+    applyAll.disabled = remaining === 0;
+    on(applyAll, "click", function () { applyDiff({ all: true, direction: "vlm" }); });
+    bulk.appendChild(applyAll);
+
+    var revertAll = document.createElement("button");
+    revertAll.className = "ghost";
+    revertAll.textContent = "Revert all to OCR";
+    on(revertAll, "click", function () { applyDiff({ all: true, direction: "ocr" }); });
+    bulk.appendChild(revertAll);
+
+    var note = document.createElement("span");
+    note.className = "muted small";
+    note.id = "diff-status";
+    bulk.appendChild(note);
+    body.appendChild(bulk);
+
+    doc.diffs.forEach(function (page) {
+      var section = document.createElement("section");
+      section.className = "diff-page";
+
+      var header = document.createElement("header");
+      header.textContent = "Page " + page.page + " - " + page.spans.length + " difference(s)";
+      section.appendChild(header);
+
+      page.spans.forEach(function (span, index) {
+        section.appendChild(buildDiffRow(page.page, index, span));
+      });
+      body.appendChild(section);
+    });
+  }
+
+  function countOnSide(diffs, side) {
+    var total = 0;
+    (diffs || []).forEach(function (page) {
+      page.spans.forEach(function (span) {
+        if (span.state === side) { total += 1; }
+      });
+    });
+    return total;
+  }
+
+  function buildDiffRow(pageNo, index, span) {
+    var row = document.createElement("div");
+    var label = (span.label || "DIFF").toLowerCase().replace(/\s+/g, "-");
+    row.className = "diff-row " + label + " state-" + (span.state || "unclear");
+
+    var labelCell = document.createElement("div");
+    labelCell.className = "label";
+    labelCell.textContent = span.label || "diff";
+
+    // "unclear" means neither side was found verbatim in the document -- the
+    // script's own text fixups rewrote this passage after the diff was taken
+    // (rejoining a hyphenated line break, say). Saying so up front is better
+    // than letting the user click a button that can only report failure.
+    if (span.state === "unclear") {
+      var mark = document.createElement("span");
+      mark.className = "unclear-mark";
+      mark.textContent = "manual";
+      mark.title = "Neither reading appears verbatim in the document, so this "
+        + "one cannot be applied automatically. Edit it on the Edit tab.";
+      labelCell.appendChild(document.createElement("br"));
+      labelCell.appendChild(mark);
+    }
+    row.appendChild(labelCell);
+
+    // If the last click on this exact row could not be carried out, say so
+    // on the row itself. The summary line lives at the top of a long list,
+    // so on its own it is easy to miss and the click looks like it did
+    // nothing at all.
+    var skip = state.lastSkip;
+    if (skip && skip.page === pageNo && skip.index === index) {
+      row.classList.add("did-nothing");
+      var why = document.createElement("div");
+      why.className = "row-note";
+      why.textContent = "Not changed - " + describeSkips([skip]) + ".";
+      row.appendChild(why);
+    }
+
+    // Each side is a button. Clicking it puts that reading into the document,
+    // so "merge this one" and "put it back" are the same single gesture.
+    row.appendChild(buildSideButton(pageNo, index, span, "ocr"));
+    row.appendChild(buildSideButton(pageNo, index, span, "vlm"));
+
+    if (span.occurrences) {
+      row.classList.add("needs-choice");
+      row.appendChild(buildChoices(pageNo, index, span));
+    }
+
+    return row;
+  }
+
+  // The words this difference is about appear more than once, and nothing
+  // says which copy is its own. Rather than guess -- and quietly change the
+  // wrong sentence -- each copy is listed in its surrounding words for the
+  // user to pick. The list is a dropdown that stays on the row: open until a
+  // copy is picked, then collapsed to show which one, so a wrong pick can be
+  // reopened and moved to the right copy.
+  function buildChoices(pageNo, index, span) {
+    var picked = span.selected != null;
+
+    // Every apply redraws all the rows, so a picker keeps whatever the user
+    // last did with it -- one they folded away stays folded while they work
+    // on other rows. Untouched, it is open until a copy is picked.
+    var key = pageNo + ":" + index;
+    var box = document.createElement("details");
+    box.className = "choices" + (picked ? " is-picked" : "");
+    box.open = key in state.choiceOpen ? state.choiceOpen[key] : !picked;
+    on(box, "toggle", function () { state.choiceOpen[key] = box.open; });
+
+    var summary = document.createElement("summary");
+    if (picked) {
+      var chosen = span.occurrences[span.selected];
+      summary.appendChild(text("Changed copy " + (span.selected + 1) + " of "
+        + span.occurrences.length + ": "));
+      // Shown with the reading the document now has at that copy.
+      summary.appendChild(copyInContext(chosen, span[span.state]));
+      var change = document.createElement("span");
+      change.className = "choices-change";
+      change.textContent = "change";
+      summary.appendChild(change);
+    } else {
+      summary.textContent = "This appears " + span.occurrences.length
+        + " times - pick which one to change";
+    }
+    box.appendChild(summary);
+
+    var list = document.createElement("div");
+    list.className = "choices-list";
+    span.occurrences.forEach(function (occurrence, i) {
+      var isSelected = i === span.selected;
+      var button = document.createElement("button");
+      button.className = "choice"
+        + (isSelected ? " is-selected" : "")
+        + (i === span.suggested ? " is-suggested" : "");
+      button.title = isSelected ? "This is the copy currently changed."
+        : picked ? "Move the change to this copy instead."
+        : "Change this copy only.";
+      button.appendChild(copyInContext(occurrence, occurrence.match));
+
+      var tagText = isSelected ? "current" : (i === span.suggested ? "likely" : "");
+      if (tagText) {
+        var tag = document.createElement("span");
+        tag.className = "likely";
+        tag.textContent = tagText;
+        button.appendChild(tag);
+      }
+
+      on(button, "click", function () {
+        if (isSelected) { box.open = false; return; }
+        // Picking folds this picker away on the redraw that follows.
+        state.choiceOpen[key] = false;
+        applyDiff({ page: pageNo, index: index, direction: span.choose_direction,
+                    at_offset: occurrence.offset });
+      });
+      list.appendChild(button);
+    });
+    box.appendChild(list);
+    return box;
+  }
+
+  // "...words before [match] words after..." with the match in bold.
+  function copyInContext(occurrence, matchText) {
+    var wrap = document.createElement("span");
+    wrap.appendChild(text(occurrence.before ? "…" + occurrence.before + " " : ""));
+    var match = document.createElement("strong");
+    match.textContent = matchText;
+    wrap.appendChild(match);
+    wrap.appendChild(text(occurrence.after ? " " + occurrence.after + "…" : ""));
+    return wrap;
+  }
+
+  function buildSideButton(pageNo, index, span, side) {
+    var button = document.createElement("button");
+    button.className = "side " + side + (span.state === side ? " is-current" : "");
+    button.textContent = span[side];
+
+    if (span.state === side) {
+      // Already what the document says -- shown as the active side rather
+      // than as a button that would do nothing.
+      button.title = "This is what the document currently says.";
+      button.disabled = true;
+    } else if (span.occurrences && span.selected == null && side === span.choose_direction) {
+      button.title = "This text appears more than once - pick which copy below.";
+      on(button, "click", function () {
+        var choices = button.parentNode.querySelector(".choices");
+        if (!choices) { return; }
+        choices.open = true;
+        choices.scrollIntoView({ block: "nearest" });
+        choices.classList.remove("flash");
+        void choices.offsetWidth;  // restart the animation on a repeat click
+        choices.classList.add("flash");
+      });
+    } else {
+      button.title = "Put this reading into the document.";
+      on(button, "click", function () {
+        applyDiff({ page: pageNo, index: index, direction: side });
+      });
+    }
+    return button;
+  }
+
+  function applyDiff(request) {
+    if (!state.current) { return; }
+    api("/apply/" + state.jobId + "/" + encodeURIComponent(state.current.name), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request)
+    }).then(function (result) {
+      // Remember a single-span click that achieved nothing, so the row can
+      // say why rather than appearing inert.
+      state.lastSkip = (!request.all && result.skipped.length)
+        ? result.skipped[0]
+        : null;
+      // A pick that could not be made leaves its picker open to pick again.
+      if (request.at_offset != null && result.skipped.length) {
+        delete state.choiceOpen[request.page + ":" + request.index];
+      }
+
+      // The server returns the whole document, so the editor and preview stay
+      // in step with what the diff view just did.
+      state.current.text = result.text;
+      state.current.diffs = result.diffs;
+      $("editor").value = result.text;
+      renderPreview();
+      state.dirty[state.current.name] = true;
+
+      renderDiff(state.current);
+      renderDocList();
+
+      var status = $("diff-status");
+      if (status) { status.textContent = describeApply(result); }
+    }).catch(function (err) {
+      var status = $("diff-status");
+      if (status) { status.textContent = "Could not apply: " + err.message; }
+    });
+  }
+
+  function describeApply(result) {
+    var counts = result.counts || {};
+    var parts = [];
+    if (counts.applied) { parts.push(counts.applied + " applied"); }
+    if (counts.unchanged) { parts.push(counts.unchanged + " already set"); }
+
+    // Anything the server refused to place is reported rather than hidden --
+    // a silently skipped span would leave the user believing it was applied.
+    var refused = (counts.not_found || 0) + (counts.ambiguous || 0)
+      + (counts.unplaceable || 0) + (counts.moved || 0);
+    if (refused) {
+      parts.push(refused + " left alone (" + describeSkips(result.skipped) + ")");
+    }
+    return parts.length ? parts.join(", ") + "." : "Nothing to change.";
+  }
+
+  function describeSkips(skipped) {
+    var reasons = {
+      ambiguous: "text appears more than once - pick the copy on its row",
+      moved: "the text changed since the copies were listed - pick again",
+      not_found: "text not found in the document",
+      unplaceable: "nothing to match against"
+    };
+    var seen = [];
+    (skipped || []).forEach(function (item) {
+      var reason = reasons[item.status] || item.status;
+      if (seen.indexOf(reason) === -1) { seen.push(reason); }
+    });
+    return seen.join("; ");
+  }
+
+  function renderRecovery(doc) {
+    var body = $("recovery-body");
+    body.innerHTML = "";
+
+    if (!doc.recovery || !doc.recovery.length) {
+      $("recovery-intro").textContent = "";
+      var empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No pages were sent to the vision model for recovery in this run.";
+      body.appendChild(empty);
+      return;
+    }
+
+    $("recovery-intro").textContent =
+      "The vision model's own transcription of pages the OCR pass flagged. "
+      + "It is shown for comparison only - it was never spliced into the draft.";
+
+    doc.recovery.forEach(function (block) {
+      var section = document.createElement("section");
+      section.className = "recovery-page";
+
+      var header = document.createElement("header");
+      header.textContent = "Page " + block.page + " - " + block.reason;
+      section.appendChild(header);
+
+      var content = document.createElement("div");
+      content.className = "recovery-body";
+      // The block is HTML the pipeline built from the model's transcription,
+      // already escaped by the script's own escape_user_content().
+      content.innerHTML = block.html;
+      section.appendChild(content);
+
+      body.appendChild(section);
+    });
+  }
+
+  // ---------- page fixes: dedupe + rotation ----------
+
+  function renderFixes(doc) {
+    var body = $("fixes-body");
+    body.innerHTML = "";
+
+    var duplicates = doc.duplicates || [];
+    var rotations = doc.rotations || [];
+    var applied = rotations.filter(function (r) { return r.applied; });
+    var review = rotations.filter(function (r) { return !r.applied; });
+
+    // A check that was not run is said so, rather than looking like one
+    // that found nothing.
+    if (doc.fixes_recorded === false) {
+      var norecord = document.createElement("p");
+      norecord.className = "hint";
+      norecord.textContent = "This run was opened from a folder with no saved review, so "
+        + "there is no record of repeated or sideways pages. The corrected PDF itself is "
+        + "in the folder's fixed subfolder.";
+      body.appendChild(norecord);
+    }
+
+    var ran = doc.steps || { dedupe: true, rotate: true };
+    var skipped = [];
+    if (!ran.dedupe) { skipped.push("The repeated-page check was not run for this document."); }
+    if (!ran.rotate) { skipped.push("The sideways-page check was not run for this document."); }
+    skipped.forEach(function (line) {
+      var note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = line;
+      body.appendChild(note);
+    });
+
+    if (!duplicates.length && !rotations.length) {
+      var empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = ran.dedupe && ran.rotate
+        ? "No repeated or sideways pages were found in this document."
+        : ran.dedupe ? "No repeated pages were found."
+        : ran.rotate ? "No sideways pages were found."
+        : "No page checks were run.";
+      body.appendChild(empty);
+      return;
+    }
+
+    // Page numbers everywhere below are the uploaded PDF's own, so they match
+    // what the user sees when they open their file.
+    if (duplicates.length) {
+      body.appendChild(fixSection(
+        "Possible repeated pages (" + duplicates.length + ")",
+        "Each of these pages looked like an earlier page. Nothing has been removed - "
+          + "compare the two and remove the page only if it really is a repeat.",
+        duplicates.map(function (d) { return duplicateCard(doc, d); })
+      ));
+    }
+
+    if (doc.fixes_pending) {
+      var pending = document.createElement("p");
+      pending.className = "pending-note";
+      pending.textContent = doc.pending_removals + " Keep/Remove change(s) not saved yet - "
+        + "press Save changes to update the fixed PDF.";
+      body.appendChild(pending);
+    }
+
+    // Changing a turn rewrites the fixed PDF, but OCR has already read it.
+    if (rotations.length && !doc.fixes_only) {
+      var note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = "Changing a page's turn updates the fixed PDF. The abstract was "
+        + "already read - if you change a page inside the abstract, use Rerun on the "
+        + "Run screen with OCR ticked to read it again.";
+      body.appendChild(note);
+    }
+
+    // Grouped by what the rotation step decided; each card can be switched
+    // to any turn, the way an OCR/VLM difference can be flipped either way.
+    if (applied.length) {
+      body.appendChild(fixSection(
+        "Sideways pages rotated (" + applied.length + ")",
+        "Turned upright before OCR. Only the page's rotation setting changes; "
+          + "the scan itself is untouched. Wrong? Pick another turn below the page.",
+        applied.map(function (r) { return rotationCard(doc, r); })
+      ));
+    }
+
+    if (review.length) {
+      body.appendChild(fixSection(
+        "Possibly sideways - left alone (" + review.length + ")",
+        "The evidence was too weak to rotate these automatically. Check each "
+          + "one and pick its turn - the suggested one is marked.",
+        review.map(function (r) { return rotationCard(doc, r); })
+      ));
+    }
+  }
+
+  function rotationCard(doc, r) {
+    if (r.fixed_idx == null) {
+      return fixCard(
+        [pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0)],
+        "Not in the fixed PDF - removed as a repeated page. Keep it and save "
+          + "to turn it again."
+      );
+    }
+    var card = fixCard(
+      [
+        pageFigure(doc, "original", r.original_idx, "Page " + r.original_page + " - as scanned", 0),
+        pageFigure(doc, "fixed", r.fixed_idx, turnLabel(r.current) + " in the fixed PDF", 0,
+                   r.current + "-" + (state.fixesVersion || 0))
+      ],
+      (r.applied ? r.confidence + " confidence: " : "") + r.why
+        + (r.decided ? " - set by you" : "")
+    );
+    card.appendChild(turnSwitch(doc, r));
+    return card;
+  }
+
+  function duplicateCard(doc, d) {
+    var card = fixCard(
+      [
+        pageFigure(doc, "original", d.dupe_idx, "Page " + d.duplicate_page
+          + duplicateState(d), 0),
+        pageFigure(doc, "original", d.orig_idx, "Page " + d.original_page + " - the earlier page", 0)
+      ],
+      d.score + "% text match, printed page number: " + d.folio
+        + (d.decided ? " - set by you" : "")
+    );
+    if (d.removed) { card.classList.add("is-removed"); }
+    card.appendChild(keepSwitch(doc, d));
+    return card;
+  }
+
+  function duplicateState(d) {
+    var saved = !!d.saved_removed;
+    if (d.removed && !saved) { return " - removed when you save"; }
+    if (!d.removed && saved) { return " - put back when you save"; }
+    return d.removed ? " - removed" : " - possible repeat";
+  }
+
+  // Keep / Remove: whether this flagged page is in the fixed PDF.
+  function keepSwitch(doc, d) {
+    var row = document.createElement("div");
+    row.className = "turn-switch";
+    [[false, "Keep"], [true, "Remove"]].forEach(function (option) {
+      var remove = option[0];
+      var button = document.createElement("button");
+      button.className = "turn" + (remove === d.removed ? " is-current" : "");
+      button.textContent = option[1];
+      button.title = remove === d.removed
+        ? (remove ? "This page is removed from the fixed PDF." : "This page is in the fixed PDF.")
+        : (remove ? "Take this page out of the fixed PDF." : "Put this page back in the fixed PDF.");
+      button.disabled = remove === d.removed;
+      on(button, "click", function () { setRemoved(doc, d, remove, row); });
+      row.appendChild(button);
+    });
+    return row;
+  }
+
+  function setRemoved(doc, d, remove, row) {
+    Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) { b.disabled = true; });
+    api("/duplicate/" + state.jobId + "/" + encodeURIComponent(doc.name), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dupe_idx: d.dupe_idx, remove: remove })
+    }).then(function (result) {
+      // Only the choice is recorded; the fixed PDF is rebuilt on Save.
+      doc.duplicates = result.duplicates;
+      doc.fixes_pending = result.fixes_pending;
+      doc.pending_removals = result.pending_removals;
+      if (result.fixes_pending) {
+        state.fixesDirty[doc.name] = true;
+      } else {
+        delete state.fixesDirty[doc.name];
+      }
+      renderFixes(doc);
+      renderDocList();
+    }).catch(function (err) {
+      renderFixes(doc);
+      var note = document.createElement("p");
+      note.className = "error";
+      note.textContent = "Could not change page " + d.duplicate_page + ": " + err.message;
+      $("fixes-body").insertBefore(note, $("fixes-body").firstChild);
+    });
+  }
+
+  function turnLabel(turn) {
+    return turn ? "Turned " + turn + "°" : "Not turned";
+  }
+
+  // None / 90 / 180 / 270: the turn the fixed PDF has, on top of the page
+  // as scanned. The current one is pressed; the script's suggestion is marked.
+  function turnSwitch(doc, r) {
+    var row = document.createElement("div");
+    row.className = "turn-switch";
+    [0, 90, 180, 270].forEach(function (turn) {
+      var button = document.createElement("button");
+      button.className = "turn" + (turn === r.current ? " is-current" : "")
+        + (turn === r.rotation ? " is-suggested" : "");
+      button.textContent = turn ? turn + "°" : "None";
+      if (turn === r.rotation) {
+        var tag = document.createElement("span");
+        tag.className = "suggested-tag";
+        tag.textContent = "suggested";
+        button.appendChild(tag);
+      }
+      button.title = turn === r.current ? "This is how the page is turned now."
+        : turn ? "Turn this page " + turn + "° clockwise from how it was scanned."
+        : "Leave this page as it was scanned.";
+      button.disabled = turn === r.current;
+      on(button, "click", function () { setTurn(doc, r, turn, row); });
+      row.appendChild(button);
+    });
+    return row;
+  }
+
+  function setTurn(doc, r, turn, row) {
+    Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) { b.disabled = true; });
+    api("/rotation/" + state.jobId + "/" + encodeURIComponent(doc.name), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ original_idx: r.original_idx, turn: turn })
+    }).then(function (result) {
+      doc.rotations = result.rotations;
+      doc.pages_rotated = result.pages_rotated;
+      doc.pages_for_review = result.pages_for_review;
+      // The sidebar chips read the summaries from /status; keep them in step.
+      state.documents.forEach(function (summary) {
+        if (summary.name === doc.name) {
+          summary.pages_rotated = result.pages_rotated;
+          summary.pages_for_review = result.pages_for_review;
+        }
+      });
+      renderFixes(doc);
+      renderDocList();
+    }).catch(function (err) {
+      renderFixes(doc);
+      var note = document.createElement("p");
+      note.className = "error";
+      note.textContent = "Could not change page " + r.original_page + ": " + err.message;
+      $("fixes-body").insertBefore(note, $("fixes-body").firstChild);
+    });
+  }
+
+  function fixSection(title, hint, cards) {
+    var section = document.createElement("section");
+    section.className = "fix-section";
+
+    var header = document.createElement("h3");
+    header.textContent = title;
+    section.appendChild(header);
+
+    var note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = hint;
+    section.appendChild(note);
+
+    var grid = document.createElement("div");
+    grid.className = "fix-grid";
+    cards.forEach(function (card) { grid.appendChild(card); });
+    section.appendChild(grid);
+    return section;
+  }
+
+  function fixCard(figures, caption) {
+    var card = document.createElement("div");
+    card.className = "fix-card";
+
+    var pair = document.createElement("div");
+    pair.className = "fix-pair";
+    figures.forEach(function (figure) { pair.appendChild(figure); });
+    card.appendChild(pair);
+
+    var note = document.createElement("p");
+    note.className = "fix-caption";
+    note.textContent = caption;
+    card.appendChild(note);
+    return card;
+  }
+
+  function pageFigure(doc, source, pageIdx, label, previewTurn, version) {
+    var figure = document.createElement("figure");
+    figure.className = "page-thumb";
+
+    // A square frame, so a portrait page and the same page turned landscape
+    // take up the same space and the card does not jump around.
+    var frame = document.createElement("div");
+    frame.className = "thumb-frame";
+
+    var img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = label;
+    img.src = "/page-image/" + state.jobId + "/" + source + "/" + pageIdx + "/"
+      + encodeURIComponent(doc.name)
+      // A fixed-PDF page changes when its rotation does; a new URL per turn
+      // keeps the browser from showing the cached old one.
+      + (version != null ? "?turn=" + version : "");
+    // /Rotate turns a page clockwise, and so does a positive CSS rotate, so
+    // the preview shows exactly what applying the suggestion would give.
+    if (previewTurn) { img.style.transform = "rotate(" + previewTurn + "deg)"; }
+    frame.appendChild(img);
+    figure.appendChild(frame);
+
+    var caption = document.createElement("figcaption");
+    caption.textContent = label;
+    figure.appendChild(caption);
+    return figure;
+  }
+
+  // ---------- working folder ----------
+
+  function openFolder() {
+    // The job on screen, or all of workdir/ before there is one.
+    var path = state.jobId ? "/open-folder/" + encodeURIComponent(state.jobId) : "/open-folder";
+    api(path, { method: "POST" }).catch(function (err) {
+      // Said wherever the user is looking; the message includes the path.
+      if ($("screen-run").hidden) {
+        $("save-status").textContent = err.message;
+      } else {
+        showRunError(err.message);
+      }
+    });
+  }
+
+  // ---------- copying the abstract ----------
+
+  // Puts the abstract on the clipboard in two forms at once, and the pasting
+  // program picks: a plain text field (the catalog) gets the HTML source --
+  // the <sup>/<sub> tags and entities are the point -- while Word or email
+  // gets the formatted text, as the preview shows it.
+  function copyAbstract() {
+    var source = $("editor").value || "";
+    if (!source.trim()) { flashCopyStatus("Nothing to copy."); return; }
+    var rendered = md.render(source);
+
+    var copied;
+    if (navigator.clipboard && window.ClipboardItem) {
+      copied = navigator.clipboard.write([new ClipboardItem({
+        "text/plain": new Blob([source], { type: "text/plain" }),
+        "text/html": new Blob([rendered], { type: "text/html" })
+      })]);
+    } else if (navigator.clipboard) {
+      copied = navigator.clipboard.writeText(source);
+    } else {
+      copied = Promise.reject(new Error("clipboard unavailable"));
+    }
+
+    copied.then(function () {
+      flashCopyStatus("Copied.");
+    }).catch(function () {
+      // Older fallback: select the source text and copy it.
+      var editor = $("editor");
+      editor.focus();
+      editor.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      flashCopyStatus(ok ? "Copied." : "Could not copy - select the source text and press Ctrl+C.");
+    });
+  }
+
+  function flashCopyStatus(message) {
+    var status = $("copy-status");
+    status.textContent = message;
+    clearTimeout(state.copyTimer);
+    state.copyTimer = setTimeout(function () { status.textContent = ""; }, 2500);
+  }
+
+  // ---------- editing and saving ----------
+
+  function onEditorInput() {
+    renderPreview();
+    if (!state.current) { return; }
+    state.dirty[state.current.name] = true;
+
+    // Debounced: the preview updates on every keystroke locally, but the
+    // server only needs the text when the user pauses.
+    clearTimeout(state.editTimer);
+    state.editTimer = setTimeout(function () {
+      api("/edit/" + state.jobId + "/" + encodeURIComponent(state.current.name), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: $("editor").value })
+      }).then(renderDocList).catch(function () { /* retried on next keystroke */ });
+    }, 400);
+  }
+
+  function saveEdits() {
+    // One save at a time: a second press mid-save would race the first.
+    $("save-btn").disabled = true;
+    $("save-status").textContent = "Saving...";
+    api("/save/" + state.jobId, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    }).then(function (result) {
+      // Only what the save actually wrote stops being unsaved. A Keep/Remove
+      // click or a keystroke that landed while it ran stays marked.
+      var pending = result.still_pending || {};
+      Object.keys(pending).forEach(function (name) {
+        if (pending[name].fixes) { state.fixesDirty[name] = true; }
+        else { delete state.fixesDirty[name]; }
+      });
+      Object.keys(result.saved_text || {}).forEach(function (name) {
+        var typedSince = state.current && state.current.name === name
+          && $("editor").value !== result.saved_text[name];
+        if (!typedSince) { delete state.dirty[name]; }
+      });
+
+      // Page fixes that were saved rebuilt the fixed PDF and moved its pages.
+      var fixes = result.page_fixes || {};
+      if (state.current && fixes[state.current.name]) {
+        var saved = fixes[state.current.name];
+        state.current.rotations = saved.rotations;
+        state.current.duplicates = saved.duplicates;
+        state.current.page_count = saved.page_count;
+        state.current.duplicates_removed = saved.duplicates_removed;
+        state.fixesVersion = (state.fixesVersion || 0) + 1;
+      }
+      if (state.current && pending[state.current.name]) {
+        state.current.fixes_pending = pending[state.current.name].fixes;
+        state.current.pending_removals = pending[state.current.name].pending_removals;
+        renderFixes(state.current);
+      }
+      state.documents.forEach(function (summary) {
+        if (fixes[summary.name]) {
+          summary.duplicates_removed = fixes[summary.name].duplicates_removed;
+          summary.page_count = fixes[summary.name].page_count;
+        }
+      });
+      renderDocList();
+      var leftOver = Object.keys(state.fixesDirty).length;
+      $("save-status").textContent = (result.written.length
+        ? "Saved " + result.written.length + " file(s) - use Open folder to find them."
+        : "Nothing to save.")
+        + (leftOver ? " Some changes were made while saving - press Save changes again." : "");
+    }).catch(function (err) {
+      $("save-status").textContent = "Save failed: " + err.message;
+    }).then(function () {
+      $("save-btn").disabled = false;
+    });
+  }
+
+  // =====================================================================
+  // Wiring
+  // =====================================================================
+
+  function init() {
+    setupDropzone();
+    on($("run-btn"), "click", startRun);
+    on($("mode-select"), "change", updateModeHelp);
+    ["step-dedupe", "step-rotate", "step-ocr"].forEach(function (id) {
+      on($(id), "change", updateSteps);
+    });
+    updateSteps();
+    on($("editor"), "input", onEditorInput);
+    on($("save-btn"), "click", saveEdits);
+    on($("open-folder-btn"), "click", openFolder);
+    on($("copy-btn"), "click", copyAbstract);
+    on($("open-run-btn"), "click", function () { openRun(null); });
+    on($("refresh-runs-btn"), "click", function () { show($("runs-error"), false); loadRuns(); });
+
+    document.querySelectorAll(".topbar .tab").forEach(function (tab) {
+      on(tab, "click", function () {
+        if (!tab.disabled) { switchScreen(tab.dataset.screen); }
+      });
+    });
+    document.querySelectorAll(".view-toggle .tab").forEach(function (tab) {
+      on(tab, "click", function () {
+        if (!tab.disabled) { switchView(tab.dataset.view); }
+      });
+    });
+
+    refreshOllama();
+    loadModels();
+    loadRuns();
+    // Re-check Ollama periodically so starting it while the app is open
+    // clears the banner without a restart.
+    setInterval(refreshOllama, 15000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();

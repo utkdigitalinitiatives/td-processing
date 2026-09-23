@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OCR Pipeline Studio</title>
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+
+<!-- Banner for Ollama reachability. Hidden until we know the answer, so it
+     never flashes a scary message during the first poll. -->
+<div id="ollama-banner" class="banner" hidden></div>
+
+<header class="topbar">
+  <h1>OCR Pipeline Studio</h1>
+  <div class="topbar-right">
+    <nav class="tabs">
+      <button class="tab is-active" data-screen="run">Run</button>
+      <button class="tab" data-screen="review" id="tab-review" disabled>Review</button>
+    </nav>
+    <!-- Opens the current job's folder, or all of workdir before any job. -->
+    <button id="open-folder-btn" class="ghost folder-btn"
+            title="Open the working folder in File Explorer">Open folder</button>
+  </div>
+</header>
+
+<!-- ==================== RUN SCREEN ==================== -->
+<main id="screen-run" class="screen">
+
+  <section class="panel">
+    <h2>1. Choose what to run</h2>
+    <!-- Each step on its own, so a batch runs only what it needs. -->
+    <fieldset class="steps">
+      <legend>Steps to run</legend>
+      <label class="step">
+        <input type="checkbox" id="step-dedupe" checked>
+        <span><strong>Check for repeated pages</strong>
+          <small>Flags them for you to keep or remove on the Page fixes tab.</small></span>
+      </label>
+      <label class="step">
+        <input type="checkbox" id="step-rotate" checked>
+        <span><strong>Turn sideways pages</strong>
+          <small>The slowest step - it looks at every page. Skip it for batches you know are upright.</small></span>
+      </label>
+      <label class="step">
+        <input type="checkbox" id="step-ocr" checked>
+        <span><strong>Read the abstract (OCR)</strong>
+          <small>Uses the vision model and VLM pass settings below.</small></span>
+      </label>
+    </fieldset>
+    <p class="hint" id="steps-help" hidden>
+      Without OCR there is no abstract text: the run stops after the page fixes,
+      and the corrected PDFs are in the run's fixed folder.
+    </p>
+    <p class="error" id="steps-none" hidden>Pick at least one step to run.</p>
+    <p class="hint">
+      The vision models listed are the ones actually pulled on this machine
+      (<code>ollama list</code>). Nothing is downloaded automatically -- if the
+      model you want is missing, pull it yourself first.
+    </p>
+    <div class="controls">
+      <label>
+        <span>Vision model</span>
+        <select id="model-select"></select>
+      </label>
+      <label>
+        <span>VLM pass</span>
+        <select id="mode-select"></select>
+      </label>
+    </div>
+    <p class="hint" id="mode-help"></p>
+  </section>
+
+  <section class="panel">
+    <h2>2. Drop your PDFs</h2>
+    <!-- Plain HTML5 drag/drop -- no library. -->
+    <div id="dropzone" class="dropzone">
+      <div class="dropzone-inner">
+        <strong>Drop PDFs here</strong>
+        <span>or <button type="button" id="browse-btn" class="linkish">browse for files</button></span>
+        <small>Several at a time is fine -- they run as one batch.</small>
+      </div>
+      <input type="file" id="file-input" accept="application/pdf" multiple hidden>
+    </div>
+    <p class="hint" id="pages-help">
+      Abstract found in the wrong place, or not at all? Type its pages next to
+      the file (e.g. <code>5-8</code>), numbered as in your PDF. Leave blank to
+      find it automatically.
+    </p>
+    <ul id="pending-list" class="file-list"></ul>
+    <div class="actions">
+      <button id="run-btn" class="primary" disabled>Run pipeline</button>
+      <button id="clear-btn" class="ghost" disabled>Clear</button>
+    </div>
+    <p id="run-error" class="error" hidden></p>
+  </section>
+
+  <!-- Past runs: every run saves its state into its own folder, so a batch
+       run by one person can be reviewed by another, later. -->
+  <section class="panel" id="runs-panel">
+    <h2>Or open a past run</h2>
+    <p class="hint">
+      Each run keeps its own folder, so you can come back to it - or review a
+      folder someone else ran, copied from their machine.
+    </p>
+    <ul id="runs-list" class="file-list"></ul>
+    <p class="hint" id="runs-empty" hidden>No past runs in this app's workdir yet.</p>
+    <div class="actions">
+      <button id="open-run-btn" class="ghost">Choose a folder...</button>
+      <button id="refresh-runs-btn" class="ghost">Refresh</button>
+    </div>
+    <p id="runs-error" class="error" hidden></p>
+  </section>
+
+  <section class="panel" id="progress-panel" hidden>
+    <h2>Progress</h2>
+    <div class="progress-head">
+      <span id="progress-label">Starting...</span>
+      <span id="progress-count" class="muted"></span>
+    </div>
+    <div class="progressbar"><div id="progress-fill"></div></div>
+    <p class="muted small folder-line" id="job-folder" hidden></p>
+
+    <!-- Batch queue: one row per file, with its own state. -->
+    <ul id="queue-list" class="file-list queue"></ul>
+
+    <details class="log-details">
+      <summary>Pipeline log</summary>
+      <pre id="log-output" class="log"></pre>
+    </details>
+  </section>
+</main>
+
+<!-- ==================== REVIEW SCREEN ==================== -->
+<main id="screen-review" class="screen" hidden>
+  <div class="review-layout">
+
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>Documents</h2>
+        <span id="doc-count" class="muted"></span>
+      </div>
+      <ul id="doc-list" class="doc-list"></ul>
+      <div class="sidebar-actions">
+        <button id="save-btn" class="primary">Save changes</button>
+      </div>
+      <p id="save-status" class="muted small"></p>
+    </aside>
+
+    <section class="workspace">
+      <div class="workspace-head">
+        <div>
+          <h2 id="doc-title">-</h2>
+          <p id="doc-meta" class="muted small"></p>
+        </div>
+        <div class="view-toggle">
+          <button class="tab is-active" data-view="edit" id="tab-edit">Edit</button>
+          <button class="tab" data-view="diff" id="tab-diff">OCR vs VLM</button>
+          <button class="tab" data-view="recovery" id="tab-recovery">VLM recovery</button>
+          <button class="tab" data-view="fixes" id="tab-fixes">Page fixes</button>
+        </div>
+      </div>
+
+      <!-- Edit view: raw text on the left, live preview on the right. -->
+      <div id="view-edit" class="view split">
+        <div class="pane">
+          <div class="pane-head">Source <span class="muted small">(HTML from the pipeline)</span></div>
+          <textarea id="editor" spellcheck="false"></textarea>
+        </div>
+        <div class="pane">
+          <div class="pane-head">Preview</div>
+          <div id="preview" class="preview"></div>
+          <!-- Copies the abstract as HTML source for plain fields (the
+               catalog), and as formatted text for Word or email. -->
+          <div class="pane-foot">
+            <span id="copy-status" class="muted small"></span>
+            <button id="copy-btn" class="ghost copy-btn"
+                    title="Copy this abstract: HTML source when pasted into a plain text field, formatted text in Word or email">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="5.5" y="2.5" width="8" height="10" rx="1.5"/>
+                <path d="M3.5 5.5v7a1.5 1.5 0 0 0 1.5 1.5h5.5"/>
+              </svg>
+              Copy
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Diff view: what the VLM read differently from PaddleOCR. -->
+      <div id="view-diff" class="view" hidden>
+        <p class="hint" id="diff-intro"></p>
+        <div id="diff-body"></div>
+      </div>
+
+      <!-- Recovery view: the VLM's own re-read of flagged pages. -->
+      <div id="view-recovery" class="view" hidden>
+        <p class="hint" id="recovery-intro"></p>
+        <div id="recovery-body"></div>
+      </div>
+
+      <!-- Page fixes view: repeated pages removed and sideways pages turned,
+           each shown as page images so the fix can be checked at a glance. -->
+      <div id="view-fixes" class="view" hidden>
+        <div id="fixes-body"></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- Vendored locally on purpose: this app must work with no internet. -->
+<script src="/ui/vendor/markdown-it.min.js"></script>
+<script src="/ui/app.js"></script>
+</body>
+</html>

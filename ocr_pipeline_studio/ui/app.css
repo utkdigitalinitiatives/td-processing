@@ -1,0 +1,345 @@
+/* OCR Pipeline Studio -- all styling for the app.
+   One stylesheet, no framework: the whole UI is three screens and a handful
+   of components, and a CSS framework would be more bytes than the app. */
+
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #1c2024;
+  --muted: #5f6b76;
+  --line: #dfe3e8;
+  --accent: #2f6feb;
+  --accent-ink: #ffffff;
+  --ok: #1a7f4b;
+  --warn: #a86500;
+  --danger: #b3261e;
+  --flag-low: #fff4e0;
+  --flag-eq: #eef0ff;
+  --flag-diff: #eaf7ef;
+  --mono: ui-monospace, "Cascadia Code", "Consolas", monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 system-ui, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+h1 { font-size: 16px; margin: 0; }
+h2 { font-size: 14px; margin: 0 0 6px; }
+code { font-family: var(--mono); font-size: 12px; }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.hint { color: var(--muted); font-size: 12px; margin: 4px 0 12px; }
+.error { color: var(--danger); font-size: 13px; }
+
+/* ---------- Top bar ---------- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+.tabs { display: flex; gap: 4px; }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+button.ghost.folder-btn { padding: 5px 12px; }
+.folder-line { margin: 8px 0 0; word-break: break-all; }
+.tab {
+  border: 1px solid transparent; background: none; cursor: pointer;
+  padding: 5px 12px; border-radius: 6px; font: inherit; color: var(--muted);
+}
+.tab:hover:not(:disabled) { background: #eef1f5; }
+.tab.is-active { background: #e7eefc; color: var(--accent); border-color: #cfe0fb; }
+.tab:disabled { opacity: .45; cursor: default; }
+
+/* ---------- Banner ---------- */
+.banner {
+  padding: 8px 16px; font-size: 13px;
+  background: #fff3cd; color: #6b4e00; border-bottom: 1px solid #f2e3ad;
+}
+.banner.ok { background: #e7f6ec; color: var(--ok); border-bottom-color: #cdebd8; }
+.banner.bad { background: #fdeceb; color: var(--danger); border-bottom-color: #f6cfcc; }
+
+/* ---------- Screens / panels ---------- */
+.screen { padding: 16px; max-width: 1500px; margin: 0 auto; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;
+}
+
+/* Steps to run: one checkbox per step. */
+.steps { border: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 6px; }
+.steps legend { font-size: 12px; color: var(--muted); padding: 0; margin-bottom: 4px; }
+.steps .step { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; font-size: 13px; }
+.steps .step input { margin-top: 3px; }
+.steps .step small { display: block; color: var(--muted); font-size: 12px; }
+.controls { display: flex; gap: 16px; flex-wrap: wrap; }
+.controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+select {
+  font: inherit; padding: 6px 8px; border: 1px solid var(--line);
+  border-radius: 6px; background: #fff; color: var(--ink); min-width: 260px;
+}
+
+/* ---------- Drop zone ---------- */
+.dropzone {
+  border: 2px dashed var(--line); border-radius: 10px;
+  padding: 28px; text-align: center; background: #fafbfc;
+  transition: border-color .15s, background .15s;
+}
+.dropzone.is-over { border-color: var(--accent); background: #eef4fe; }
+.dropzone-inner { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.dropzone-inner small { color: var(--muted); }
+.linkish {
+  background: none; border: none; padding: 0; font: inherit;
+  color: var(--accent); text-decoration: underline; cursor: pointer;
+}
+
+/* ---------- Buttons ---------- */
+button.primary, button.ghost {
+  font: inherit; padding: 7px 14px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line);
+}
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.primary:disabled { background: #a9c1f3; border-color: #a9c1f3; cursor: default; }
+button.ghost { background: #fff; color: var(--ink); }
+button.ghost:disabled { opacity: .5; cursor: default; }
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+
+/* ---------- File lists ---------- */
+.file-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.file-list li {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  padding: 7px 10px; background: #fafbfc; border: 1px solid var(--line); border-radius: 6px;
+  font-size: 13px;
+}
+.file-list .state { font-size: 12px; color: var(--muted); }
+.file-list .file-name { flex: 1; min-width: 0; word-break: break-word; }
+.queue li { flex-wrap: wrap; }
+
+/* Abstract pages typed by hand, beside a staged file or a finished one. */
+.pages-input {
+  font: inherit; font-size: 12px; width: 150px;
+  padding: 4px 7px; border: 1px solid var(--line); border-radius: 6px; background: #fff;
+}
+.pages-input.is-invalid { border-color: var(--danger); background: #fdeceb; }
+
+/* Rerun controls under a finished queue row. */
+.rerun { flex-basis: 100%; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.rerun button.ghost { padding: 3px 10px; font-size: 12px; }
+select:disabled { background: #f1f3f6; color: var(--muted); }
+.queue .state.done { color: var(--ok); }
+.queue .state.skipped { color: var(--warn); }
+.queue .state.ocr, .queue .state.fixing { color: var(--accent); }
+.queue .state.done, .queue .state.skipped { flex: 1; text-align: right; }
+
+/* Past runs list. */
+.run-row { flex-wrap: wrap; }
+.run-row .run-name { flex: 1; min-width: 0; word-break: break-all; font-weight: 600; }
+.run-row .run-meta { color: var(--muted); font-size: 12px; }
+.run-row button.ghost { padding: 3px 10px; font-size: 12px; }
+.run-row .run-rebuilt { color: var(--warn); font-size: 12px; }
+
+/* ---------- Progress ---------- */
+.progress-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
+.progressbar { height: 8px; background: #e9edf2; border-radius: 999px; overflow: hidden; }
+.progressbar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.log-details { margin-top: 14px; }
+.log-details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.log {
+  font-family: var(--mono); font-size: 11px; line-height: 1.45;
+  background: #10151c; color: #cdd6e0; padding: 10px; border-radius: 6px;
+  max-height: 260px; overflow: auto; white-space: pre-wrap; margin: 8px 0 0;
+}
+
+/* ---------- Review layout ---------- */
+.review-layout { display: grid; grid-template-columns: 280px 1fr; gap: 14px; align-items: start; }
+.sidebar {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px; position: sticky; top: 62px;
+}
+.sidebar-head { display: flex; justify-content: space-between; align-items: baseline; }
+.doc-list { list-style: none; margin: 10px 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.doc-list button {
+  width: 100%; text-align: left; font: inherit; cursor: pointer;
+  background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+}
+.doc-list button:hover { border-color: #c4cdd8; }
+.doc-list button.is-active { border-color: var(--accent); background: #f2f6fe; }
+.doc-list .doc-name { display: block; font-size: 13px; word-break: break-word; }
+.doc-list .doc-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
+.sidebar-actions { display: flex; gap: 6px; }
+.sidebar-actions button { flex: 1; }
+
+/* Flag chips -- one colour per real, script-produced reason. */
+.chip {
+  font-size: 11px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line);
+}
+.chip.low_confidence { background: var(--flag-low); border-color: #f0dcb4; color: var(--warn); }
+.chip.equation { background: var(--flag-eq); border-color: #d3d8f7; color: #3b41a8; }
+.chip.diff { background: var(--flag-diff); border-color: #c9e6d5; color: var(--ok); }
+.chip.dirty { background: #fdeceb; border-color: #f6cfcc; color: var(--danger); }
+.chip.dedupe { background: #f1f3f6; border-color: #d9dee5; color: var(--muted); }
+.chip.rotate { background: #e7eefc; border-color: #cfe0fb; color: var(--accent); }
+.chip.rotate-review { background: var(--flag-low); border-color: #f0dcb4; color: var(--warn); }
+
+/* ---------- Workspace ---------- */
+.workspace { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.workspace-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+.view-toggle { display: flex; gap: 4px; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pane { display: flex; flex-direction: column; min-width: 0; }
+.pane-head { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+
+textarea#editor {
+  width: 100%; height: 62vh; resize: vertical;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
+  padding: 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: #fcfcfd; color: var(--ink);
+}
+.preview {
+  height: 62vh; overflow: auto; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 8px; background: #fff;
+}
+/* Under the preview, right-aligned, sized like the diff tab's Apply all /
+   Revert all buttons (the standard ghost button). */
+.pane-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 8px; }
+button.ghost.copy-btn { display: inline-flex; align-items: center; gap: 6px; }
+button.ghost.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+.copy-btn .icon {
+  width: 15px; height: 15px; fill: none; stroke: currentColor;
+  stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round;
+}
+.preview p { margin: 0 0 12px; }
+.preview sup, .preview sub { font-size: .75em; }
+
+/* ---------- Diff / recovery views ---------- */
+.diff-page, .recovery-page {
+  border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; overflow: hidden;
+}
+.diff-page > header, .recovery-page > header {
+  background: #f4f6f9; padding: 6px 10px; font-size: 12px; color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.diff-row {
+  display: grid; grid-template-columns: 90px 1fr 1fr; gap: 10px;
+  padding: 7px 10px; border-bottom: 1px solid #eef1f4; font-size: 12.5px;
+}
+.diff-row:last-child { border-bottom: none; }
+.diff-row .label { font-size: 11px; color: var(--muted); }
+.diff-row.merged .label { color: var(--ok); }
+.diff-row.flagged .label { color: var(--warn); }
+
+/* Each side of a diff is a button: clicking it puts that reading into the
+   document. The side the document currently shows is marked and disabled, so
+   the row doubles as a display of the current state. */
+.diff-row .side {
+  font-family: var(--mono); font-size: 12.5px; text-align: left;
+  word-break: break-word; cursor: pointer;
+  padding: 4px 8px; border-radius: 4px; border: 1px solid transparent;
+}
+.diff-row .side.ocr { background: #fdf1f0; color: var(--ink); }
+.diff-row .side.vlm { background: #eef8f2; color: var(--ink); }
+.diff-row .side:hover:not(:disabled) { border-color: var(--accent); }
+.diff-row .side:disabled { cursor: default; opacity: 1; }
+.diff-row .side.is-current { box-shadow: inset 0 0 0 2px currentColor; font-weight: 600; }
+.diff-row .side.ocr.is-current { color: #8a2b22; }
+.diff-row .side.vlm.is-current { color: var(--ok); }
+
+/* A click on this row could not be carried out -- say so on the row, since
+   the summary line at the top of a long list is easy to miss. */
+.diff-row.did-nothing { background: #fffaf0; }
+
+/* A difference whose words appear more than once: a dropdown listing each
+   copy in its surrounding words. Open until a copy is picked, then collapsed
+   to show which one, and reopenable to move a wrong pick. */
+.diff-row .choices {
+  grid-column: 2 / -1; padding: 4px 8px; border-radius: 6px;
+  background: #f7f9fc; border: 1px solid var(--line);
+}
+.diff-row .choices summary {
+  cursor: pointer; font-size: 11.5px; color: var(--muted); padding: 2px 0;
+}
+.diff-row .choices.is-picked summary { color: var(--ink); }
+.diff-row .choices summary strong { background: #eef8f2; padding: 0 2px; border-radius: 2px; }
+.diff-row .choices-change { margin-left: 8px; color: var(--accent); text-decoration: underline; }
+.diff-row .choices[open] .choices-change { display: none; }
+.diff-row .choices-list { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 2px; }
+.diff-row .choice {
+  font-family: var(--mono); font-size: 12px; text-align: left; cursor: pointer;
+  padding: 4px 8px; border-radius: 4px; border: 1px solid var(--line); background: #fff;
+  color: var(--ink); word-break: break-word;
+}
+.diff-row .choice:hover { border-color: var(--accent); }
+.diff-row .choice strong { background: #fdf1f0; padding: 0 2px; border-radius: 2px; }
+.diff-row .choice.is-suggested { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.diff-row .choice.is-selected { border-color: var(--ok); box-shadow: inset 0 0 0 1px var(--ok); background: #f4fbf7; }
+.diff-row .choice.is-selected .likely { color: var(--ok); }
+.diff-row .choice .likely {
+  margin-left: 8px; font-family: system-ui, "Segoe UI", sans-serif; font-size: 10px;
+  color: var(--accent); text-transform: uppercase; letter-spacing: .04em;
+}
+.diff-row .choices.flash { animation: choices-flash .9s ease-out; }
+@keyframes choices-flash { from { background: #e7eefc; } to { background: #f7f9fc; } }
+.diff-row .row-note {
+  grid-column: 2 / -1; font-size: 11.5px; color: var(--warn); padding-top: 2px;
+}
+
+/* A span neither side of which can be located in the document. */
+.unclear-mark {
+  display: inline-block; margin-top: 2px; font-size: 10px; cursor: help;
+  padding: 0 5px; border-radius: 999px;
+  background: #f1f3f6; color: var(--muted); border: 1px dotted #c2cad4;
+}
+.diff-row.state-unclear .side { opacity: .72; }
+
+.bulk-actions {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line);
+}
+.recovery-body { padding: 10px 12px; }
+
+/* ---------- Page fixes view ---------- */
+.fix-section { margin-bottom: 18px; }
+.fix-section h3 { font-size: 13px; margin: 0; }
+.fix-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+.fix-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fafbfc; }
+.fix-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.page-thumb { margin: 0; min-width: 0; }
+.thumb-frame {
+  aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+  background: #fff; border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+}
+/* Capped at 72% so a page previewed with a CSS turn still fits the square:
+   the transform does not change the image's layout box. */
+.thumb-frame img { max-width: 72%; max-height: 100%; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+.page-thumb figcaption { font-size: 11.5px; color: var(--muted); margin-top: 4px; text-align: center; }
+.fix-caption { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+
+/* The turn a page has in the fixed PDF: pressed = current, marked = suggested. */
+.turn-switch { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
+.turn-switch .turn {
+  font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: #fff; color: var(--ink);
+}
+.turn-switch .turn:hover:not(:disabled) { border-color: var(--accent); }
+.turn-switch .turn.is-current {
+  background: #e7eefc; border-color: var(--accent); color: var(--accent); font-weight: 600; cursor: default;
+}
+.turn-switch .turn:disabled:not(.is-current) { opacity: .5; cursor: default; }
+.fix-card.is-removed .page-thumb:first-child img { opacity: .45; }
+.pending-note {
+  font-size: 12.5px; color: var(--warn); background: var(--flag-low);
+  border: 1px solid #f0dcb4; border-radius: 6px; padding: 6px 10px; margin: 0 0 12px;
+}
+.turn-switch .suggested-tag {
+  margin-left: 6px; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--warn);
+}
+.empty { color: var(--muted); font-size: 13px; padding: 18px; text-align: center; }
