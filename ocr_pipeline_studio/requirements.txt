@@ -13,23 +13,9 @@ PyMuPDF>=1.24              # the "fitz" module: PDF page rendering + page copyin
 rapidfuzz>=3.0             # fuzzy text ratio used for duplicate-page detection
 
 # --- Used directly by source_scripts/abstract_ocr_paddle_cuda.py ---
-#
-# These three are pinned exactly, and the pins matter. Do not loosen them
-# without re-testing an actual OCR run end to end.
-#
-#   * paddlepaddle 3.3.x + paddleocr 3.7.x (what "latest" resolves to today)
-#     fails on every page with:
-#         (Unimplemented) ConvertPirAttribute2RuntimeAttribute not support
-#     which surfaces as "0 text segments found" rather than as a crash, so
-#     the pipeline appears to run fine and silently produces nothing. That is
-#     the exact PIR/executor mismatch the OCR script's own comments warn
-#     about near its FLAGS_enable_pir_api settings; those env flags no longer
-#     suppress it in Paddle 3.3.
-#   * paddleocr 3.0.x and 3.1.x work, but drag in langchain + an OpenAI client
-#     as transitive dependencies. This app must never be able to call a cloud
-#     service, so those versions are ruled out on principle.
-#   * 3.2.0 works and pulls neither. It also uses the PP-OCRv5 models the
-#     script was tuned against, rather than the newer PP-OCRv6 default.
+# These three are pinned exactly because paddlepaddle 3.3.x reports every page
+# as zero text instead of failing, so a run looks healthy and quietly produces
+# nothing -- see the troubleshooting section of INSTRUCTIONS.md.
 paddleocr==3.2.0           # the OCR engine itself
 paddlex==3.2.1             # paddleocr's pipeline backend; must match paddleocr
 paddlepaddle==3.0.0        # the inference runtime (CPU build)

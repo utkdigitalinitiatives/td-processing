@@ -1,22 +1,17 @@
 """Job and progress tracking, held in memory and saved to each run's folder.
 
-Why in memory and not a database: this is a single-user desktop tool. Only one
-process ever touches this state, and the results themselves live on disk as
-real files in ``workdir/``. A database here would add a schema, a migration
-story, and a file to corrupt, in exchange for nothing.
+In memory, not a database: one process touches this state and the results
+themselves are real files in ``workdir/``.
 
-Why it is also written to a file: a run is reviewed by a person, possibly a
-different person, possibly days later. Everything the review screen needs that
-is *not* already a file -- the parsed flags and OCR/VLM differences, which copy
-of a repeated span was picked, the Keep/Remove and page-turn choices, unsaved
-edits, and the run's own settings -- is saved as ``job.json`` in the run's own
-folder (see save_job). The folder then holds the whole run and can be copied to
-another machine and opened there (see load_job).
+Also written to a file, because a run may be reviewed later, by someone else,
+on another machine. Everything the review screen needs that is not already a
+file -- flags, OCR/VLM differences, which copy of a repeated span was picked,
+Keep/Remove and page-turn choices, unsaved edits, and the run's settings --
+goes into ``job.json`` in the run's own folder, so the folder holds the whole
+run (see save_job / load_state).
 
-Why a lock: the pipeline runs on a background thread so the UI stays
-responsive, but Flask answers ``/status`` on a *different* thread. Both touch
-the same Job objects. The lock is what keeps a status poll from reading a job
-halfway through an update.
+The lock is what keeps a ``/status`` poll, answered on a Flask thread, from
+reading a Job the pipeline's background thread is halfway through updating.
 """
 
 from __future__ import annotations
@@ -31,8 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Job lifecycle. Kept as plain strings because they are sent to the UI as JSON
-# and read there directly; an enum would only have to be converted back.
+# Job lifecycle. Plain strings because they go to the UI as JSON and are read
+# there directly; an enum would only have to be converted back.
 STATUS_QUEUED = "queued"
 STATUS_PREFLIGHT = "preflight"
 STATUS_FIXING = "fixing"
@@ -44,14 +39,13 @@ STATUS_ERROR = "error"
 # Terminal states -- the UI stops polling when it sees one of these.
 FINISHED = (STATUS_DONE, STATUS_ERROR)
 
-# The run's saved state, and a short summary read when listing past runs
-# (job.json can run to megabytes on a large batch, which is too much to read
-# just to show a row per run).
+# The run's saved state, plus a short summary for listing past runs: job.json
+# can run to megabytes on a large batch, too much to read just to show a row.
 STATE_FILE = "job.json"
 SUMMARY_FILE = "run.json"
 
-# Bumped only when a change would confuse an older build. A file whose version
-# is higher than this is refused rather than half-read.
+# Bumped only when a change would confuse an older build. A higher version is
+# refused rather than half-read.
 STATE_FORMAT = "ocr-pipeline-studio/job"
 STATE_VERSION = 1
 
@@ -60,11 +54,10 @@ STATE_VERSION = 1
 class Job:
     """One run of the pipeline over one batch of PDFs.
 
-    ``edits`` is the review screen's scratch space: the textarea contents as
-    the user has changed them, keyed by document name. It is deliberately
-    separate from what is on disk. Edits only reach the filesystem when the
-    user explicitly saves, which is what makes the review screen safe to
-    experiment in.
+    ``edits`` is the review screen's scratch space: textarea contents keyed by
+    document name, kept separate from what is on disk. Edits only reach the
+    filesystem on an explicit save, which is what makes the review screen safe
+    to experiment in.
     """
     id: str
     workdir: Path
@@ -74,10 +67,10 @@ class Job:
     # Which steps this job runs, as {"dedupe", "rotate", "ocr"} booleans.
     steps: dict = field(default_factory=lambda: {"dedupe": True, "rotate": True, "ocr": True})
     # A job without OCR stops after the page fixes: no text. Kept alongside
-    # ``steps`` because everything that only asks "is there text?" uses it.
+    # ``steps`` for everything that only asks "is there text?"
     fixes_only: bool = False
-    # Abstract pages set by hand, as {filename: (start, end)} in the uploaded
-    # PDF's own page numbers.
+    # Abstract pages set by hand, {filename: (start, end)}, numbered as in the
+    # uploaded PDF.
     overrides: dict = field(default_factory=dict)
 
     status: str = STATUS_QUEUED
@@ -100,29 +93,27 @@ class Job:
     edits: dict = field(default_factory=dict)          # in-memory textarea state
 
     # Where each diff span was last written, as
-    # ``{document name: {"<page>:<index>": offset}}``. This is what lets the
-    # review screen swap a span back and forth reliably: once a correction has
-    # been applied the same words can occur in two places, and only a
-    # remembered position can say which one belongs to that diff.
+    # ``{document name: {"<page>:<index>": offset}}``. Applying a correction
+    # can make the same words occur twice, and only a remembered position can
+    # say which one belongs to that diff.
     span_offsets: dict = field(default_factory=dict)
 
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
-    # True for a run opened from a folder rather than run in this window. The
-    # review screen says so, since its progress and log belong to the run that
-    # produced it, not to this session.
+    # True for a run opened from a folder rather than run in this window; its
+    # progress and log belong to the run that produced it, not this session.
     opened_from_folder: bool = False
 
-    # Bounded so a very long batch cannot grow the log without limit. 400 lines
-    # is far more than the UI shows but enough to diagnose a failed run.
+    # Bounded so a long batch cannot grow the log without limit. More than the
+    # UI shows, but enough to diagnose a failed run.
     log: deque = field(default_factory=lambda: deque(maxlen=400))
 
     def progress_label(self) -> str:
         """The single human-readable line the UI puts under the progress bar."""
         if self.status in FINISHED:
             return self.message
-        # page_current stays 0 until the first page actually finishes, and
-        # "page 0 of 5" reads like a fault rather than a start.
+        # page_current stays 0 until the first page finishes, and "page 0 of
+        # 5" reads like a fault rather than a start.
         if self.page_total and self.page_current:
             return "%s - page %d of %d" % (self.message, self.page_current, self.page_total)
         if self.page_total:
@@ -131,16 +122,16 @@ class Job:
 
 
 # Long enough to recognise a thesis call number, short enough to keep Windows
-# paths well under their limit once a job's own subfolders are added.
+# paths under their limit once a job's subfolders are added.
 _LABEL_MAX = 40
 
 
 def _folder_label(filenames: list) -> str:
     """The "what is in it" part of a job folder name.
 
-    The first file's name without its extension, plus how many others came
-    with it. Anything other than letters, digits, dot, dash and underscore is
-    dropped, so the result is safe as a folder name and in a URL.
+    The first file's stem plus how many others came with it. Anything but
+    letters, digits, dot, dash and underscore is dropped, so the result is safe
+    as a folder name and in a URL.
     """
     if not filenames:
         return ""
@@ -155,9 +146,8 @@ def _folder_label(filenames: list) -> str:
 class JobStore:
     """Thread-safe registry of Jobs, keyed by job id.
 
-    Every public method takes the lock. Callers never touch ``_jobs``
-    directly, so there is exactly one place where concurrent access is
-    reasoned about.
+    Every public method takes the lock and callers never touch ``_jobs``
+    directly, so concurrent access is reasoned about in one place.
     """
 
     def __init__(self) -> None:
@@ -167,16 +157,14 @@ class JobStore:
     def create(self, workdir_root: Path, filenames: Optional[list] = None) -> Job:
         """Make a new job with a server-generated id and its own scratch dir.
 
-        The id doubles as the folder name, so it is built to be found by a
-        person browsing ``workdir/``: when the job started, then what is in
-        it -- ``2026-09-16_143205_Thesis80.W5465_and_2_more``. Sorting by name
-        is sorting by time.
+        The id doubles as the folder name, built to be found by someone
+        browsing ``workdir/``: start time then contents, as in
+        ``2026-09-16_143205_Thesis80.W5465_and_2_more``, so sorting by name is
+        sorting by time.
 
-        The id is still generated here, on the server, and never taken from
-        the client: it becomes a directory name, so letting the browser choose
-        it would be a path-traversal hole in a tool that reads and writes
-        files. The filename part is reduced to plain characters for the same
-        reason.
+        Generated here and never taken from the client: it becomes a directory
+        name, so letting the browser choose it would be a path-traversal hole.
+        The filename part is reduced to plain characters for the same reason.
         """
         base = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         label = _folder_label(filenames or [])
@@ -186,7 +174,7 @@ class JobStore:
         workdir_root.mkdir(parents=True, exist_ok=True)
         with self._lock:
             # Two jobs started in the same second over the same file would
-            # otherwise share a folder. mkdir without exist_ok is the check:
+            # otherwise share a folder. mkdir without exist_ok is the check --
             # it fails if the folder is already there, whoever made it.
             job_id = base
             suffix = 1
@@ -213,9 +201,8 @@ class JobStore:
     def update(self, job_id: str, **fields) -> None:
         """Apply attribute updates to a job atomically.
 
-        Used by the background thread for every progress tick, so a status
-        poll can never observe a job with, say, a new page number but a stale
-        filename.
+        Used for every progress tick, so a status poll can never see a job with
+        a new page number but a stale filename.
         """
         with self._lock:
             job = self._jobs.get(job_id)
@@ -240,9 +227,9 @@ class JobStore:
     def state_payload(self, job_id: str) -> Optional[dict]:
         """One run's saveable state, assembled under the lock.
 
-        Carries the run's folder as ``_workdir`` for save_job to write into;
-        that key is removed before anything is written, since a saved path
-        would be wrong the moment the folder is copied somewhere else.
+        Carries the run's folder as ``_workdir`` for save_job to write into.
+        That key is removed before anything is written: a saved path would be
+        wrong the moment the folder is copied elsewhere.
         """
         with self._lock:
             job = self._jobs.get(job_id)
@@ -256,11 +243,9 @@ class JobStore:
                  documents: Optional[list] = None) -> Job:
         """Add a job for a run folder that already exists on disk.
 
-        Used when a past run is opened: from its saved state, or -- for a
-        folder with none -- from ``documents`` rebuilt out of the files
-        themselves. The id is the folder's own name, suffixed if a run of that
-        name is already open, so two copies of the same run can be open at
-        once.
+        Built from the folder's saved state, or -- for a folder with none --
+        from ``documents`` rebuilt out of the files themselves. The id is the
+        folder's name, suffixed if a run of that name is already open.
         """
         saved = (payload or {}).get("job", {})
         with self._lock:
@@ -298,9 +283,8 @@ class JobStore:
     def snapshot(self, job_id: str, log_lines: int = 40) -> Optional[dict]:
         """Build the JSON payload for ``/status/<job_id>``.
 
-        Assembled under the lock and returned as a plain dict, so the caller
-        serialises a consistent point-in-time copy rather than a live object
-        the worker thread is still mutating.
+        A plain dict assembled under the lock, so the caller serialises a
+        point-in-time copy rather than an object the worker is still mutating.
         """
         with self._lock:
             job = self._jobs.get(job_id)
@@ -327,8 +311,8 @@ class JobStore:
                 "page_total": job.page_total,
                 "file_states": dict(job.file_states),
                 "documents": [
-                    # The review screen needs names and flags up front; the
-                    # bulky text/diff payloads are fetched per document.
+                    # Names and flags up front; the bulky text/diff payloads
+                    # are fetched per document.
                     {
                         "name": d["name"],
                         "filename": d["filename"],
@@ -349,16 +333,14 @@ class JobStore:
             }
 
 
-# --------------------------------------------------------------------------
-# Saving a run to its folder, and reading it back
-# --------------------------------------------------------------------------
+# ---- Saving a run to its folder, and reading it back ----
 
 def _state_payload(job: Job) -> dict:
     """Everything about a run that is not already a file in its folder.
 
-    Only names are stored, never paths: ``workdir`` is wherever the folder is
-    found when it is opened, and every route builds its paths from that. That
-    is what lets a run folder be copied to another machine.
+    Names only, never paths: ``workdir`` is wherever the folder is found when
+    opened and every route builds from that, which is what lets a run folder be
+    copied to another machine.
     """
     return {
         "format": STATE_FORMAT,
@@ -371,8 +353,7 @@ def _state_payload(job: Job) -> dict:
             "mode": job.mode,
             "steps": dict(job.steps),
             "fixes_only": job.fixes_only,
-            # Tuples would come back from JSON as lists; the pipeline wants
-            # (start, end), so they are restored as tuples in load_job.
+            # JSON has no tuples; restored as (start, end) when loaded.
             "overrides": {name: list(pages) for name, pages in job.overrides.items()},
             "status": job.status,
             "message": job.message,
@@ -411,9 +392,8 @@ def _write_json(path: Path, payload: dict) -> None:
 def save_job(store: "JobStore", job_id: str) -> Optional[Path]:
     """Write one run's state into its own folder.
 
-    The payload is built under the store's lock, for the same reason
-    snapshot() is -- the worker thread may be mid-update -- and written
-    outside it, since writing megabytes must not hold up a status poll.
+    Built under the store's lock, as snapshot() is, but written outside it:
+    writing megabytes must not hold up a status poll.
     """
     payload = store.state_payload(job_id)
     if payload is None:
@@ -450,8 +430,8 @@ class StateError(Exception):
 def load_state(folder: Path) -> Optional[dict]:
     """Read a folder's saved state, or None when it has none.
 
-    Raises StateError for a file that is there but unusable, so "no saved
-    state, rebuild what we can" stays distinct from "this file is wrong".
+    Raises StateError for a file that is there but unusable, keeping "no saved
+    state, rebuild what we can" distinct from "this file is wrong".
     """
     path = folder / STATE_FILE
     if not path.is_file():

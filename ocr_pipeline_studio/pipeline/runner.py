@@ -1,35 +1,22 @@
 """Thin adapters around the original scripts in ``source_scripts/``.
 
-Nothing in this file reimplements what those scripts already do. The copies
-that live beside this module (``pipeline/dedupe.py``,
-``pipeline/fix_rotation.py`` and ``pipeline/vlm_abstract.py``) are
-byte-for-byte the files that were handed to us; this module only *calls* them
-and reshapes their output into something a background thread and a JSON API
-can work with.
+Nothing here reimplements them. The copies beside this module
+(``pipeline/dedupe.py``, ``pipeline/fix_rotation.py``, ``pipeline/vlm_abstract.py``)
+are byte-for-byte the originals; this module only calls them and reshapes
+their output for a background thread and a JSON API.
 
-Two very different calling styles are used here, and the reason for each
-matters:
+dedupe.py and fix_rotation.py are called in-process: their core functions
+already return plain Python lists.
 
-``dedupe.py`` and ``fix_rotation.py`` are called **in-process, as a normal
-import**. Their core functions (``find_and_export_duplicates()`` and
-``find_and_fix_rotations()``) already return real Python lists, so there is
-nothing awkward to work around.
-
-``vlm_abstract.py`` is called **as a subprocess, through its own CLI**. That is
-deliberate and is the single most important design decision in this file:
-
-  1. Its ``main()`` contains a "deferred VLM phase" that must run strictly
-     after every PDF's PaddleOCR work is finished. The script's own comments
-     explain why -- an Ollama model resident on the GPU has been observed to
-     break PaddleOCR's initialization. Importing ``process_pdf()`` directly
-     would skip ``main()`` entirely, so we would have to re-implement that
-     phase ourselves. That would be rewriting the script's logic, which we
-     were told not to do.
-  2. The script already re-invokes *itself* as a subprocess (once per PDF, and
-     again once per page for OCR crash isolation). Driving it by CLI is
-     therefore the interface it was actually built to expose.
-  3. It reports progress by printing to stdout rather than returning values.
-     Wrapping it in a pipe lets us read that progress without editing it.
+vlm_abstract.py is called as a subprocess, through its own CLI, because:
+  1. Its main() runs a deferred VLM phase only after every PDF's PaddleOCR
+     work is done -- an Ollama model resident on the GPU has been observed to
+     break PaddleOCR init. Importing process_pdf() would skip main() and mean
+     reimplementing that phase here.
+  2. The script already re-invokes itself as a subprocess (per PDF, and per
+     page for OCR crash isolation), so the CLI is the interface it exposes.
+  3. It reports progress by printing, so a pipe reads that progress without
+     editing the script.
 """
 
 from __future__ import annotations
@@ -48,26 +35,24 @@ from typing import Callable, Optional
 
 import fitz  # PyMuPDF -- used only to *write* the fixed PDF, see fix_pdf()
 
-# The original detector, imported and used exactly as written.
 from pipeline.dedupe import find_and_export_duplicates
 
-# The original rotation fixer, likewise. Importing it only pulls in fitz --
-# the script defers its paddleocr import to where the classifier is built.
+# Importing this only pulls in fitz -- the script defers its paddleocr import
+# to where the classifier is built.
 from pipeline.fix_rotation import ORIENTATION_MODEL, find_and_fix_rotations
 
-# Absolute path to the OCR/VLM script we shell out to. Resolved once at import
-# time so a change of working directory later can never break the call.
+# Resolved at import time so a later change of working directory cannot break
+# the call.
 VLM_SCRIPT = Path(__file__).resolve().parent / "vlm_abstract.py"
 
 # Kept in sync with the script's own DEFAULT_VLM_MODEL / DEFAULT_OLLAMA_URL.
-# Duplicated here rather than imported because importing vlm_abstract.py into
-# this process would pull in PaddleOCR (slow, and it prints on import).
+# Duplicated rather than imported: importing vlm_abstract.py here would pull in
+# PaddleOCR, which is slow and prints on import.
 DEFAULT_VLM_MODEL = "qwen2.5vl:3b"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
-# The VLM modes we expose in the UI, mapped to the script's real CLI flags.
-# Keeping this as data (not an if/elif chain at the call site) means adding a
-# mode later is a one-line change here plus one <option> in the UI.
+# The VLM modes the UI offers, mapped to the script's real CLI flags. Data
+# rather than an if/elif chain, so adding a mode is one entry here.
 VLM_MODES: dict[str, dict] = {
     "off": {
         "label": "OCR only (no VLM)",
@@ -100,16 +85,13 @@ VLM_MODES: dict[str, dict] = {
 DEFAULT_VLM_MODE = "merge"
 
 
-# --------------------------------------------------------------------------
-# Stage 0: Ollama preflight
-# --------------------------------------------------------------------------
-# Everything here runs *before* a job starts. The point is to fail loudly and
-# in plain language at the top of the pipeline, rather than let a job die
-# fifteen minutes deep with a connection traceback the user cannot act on.
+# ---- Stage 0: Ollama preflight ----
+# Runs before a job starts, so a missing model fails in plain language up front
+# rather than fifteen minutes deep with a connection traceback.
 
 def ollama_status(ollama_url: str = DEFAULT_OLLAMA_URL, timeout: float = 4.0) -> dict:
-    """Ask Ollama what models it has, via the same REST endpoint the OCR
-    script uses (``GET /api/tags``).
+    """Ask Ollama what models it has, over the same ``GET /api/tags`` the OCR
+    script uses.
 
     Returns ``{"running": bool, "models": [...], "error": str|None}``. Never
     raises -- a preflight check that can itself explode is useless.
@@ -129,18 +111,17 @@ def ollama_status(ollama_url: str = DEFAULT_OLLAMA_URL, timeout: float = 4.0) ->
         return {
             "running": False,
             "models": [],
-            # Phrased for the person looking at the window, not for a log file.
+            # Phrased for the window, not a log file.
             "error": "Ollama isn't running - start it and try again. (%s)" % exc,
         }
 
 
 def list_local_models(ollama_url: str = DEFAULT_OLLAMA_URL) -> dict:
-    """List the models actually pulled on this machine, for the UI dropdown.
+    """List the models pulled on this machine, for the UI dropdown.
 
-    Shells out to ``ollama list`` as the primary source, because that is the
-    command a user would run themselves and its output is what they expect to
-    see. Falls back to the REST API when the CLI is not on PATH -- the app can
-    still work in that case, since the pipeline only ever needs the HTTP API.
+    ``ollama list`` first, since that is the command a user would run and its
+    output is what they expect to see. Falls back to the REST API when the CLI
+    is not on PATH -- the pipeline only ever needs the HTTP API anyway.
     """
     try:
         proc = subprocess.run(
@@ -150,9 +131,8 @@ def list_local_models(ollama_url: str = DEFAULT_OLLAMA_URL) -> dict:
         )
         if proc.returncode == 0:
             models = []
-            # Output is a padded table: NAME  ID  SIZE  MODIFIED. The first
-            # whitespace-delimited field of each line after the header is the
-            # model tag, which is the only column we need.
+            # Padded table: NAME  ID  SIZE  MODIFIED. The first field of each
+            # line after the header is the model tag, the only column needed.
             for line in proc.stdout.splitlines()[1:]:
                 if not line.strip():
                     continue
@@ -160,8 +140,7 @@ def list_local_models(ollama_url: str = DEFAULT_OLLAMA_URL) -> dict:
             if models:
                 return {"models": models, "source": "ollama list", "error": None}
     except Exception:
-        # Fall through to the REST API below -- no need to surface this, since
-        # the fallback answers the same question.
+        # Fall through to the REST API, which answers the same question.
         pass
 
     status = ollama_status(ollama_url)
@@ -175,9 +154,9 @@ def list_local_models(ollama_url: str = DEFAULT_OLLAMA_URL) -> dict:
 def preflight(model: str, ollama_url: str = DEFAULT_OLLAMA_URL, mode: str = DEFAULT_VLM_MODE) -> dict:
     """Check Ollama is up and ``model`` is present, before any job starts.
 
-    Returns ``{"ok": bool, "message": str|None}``. When the chosen mode makes
-    no VLM calls at all ("off"), this passes unconditionally -- refusing to run
-    a pure-OCR job because Ollama is down would be wrong.
+    Returns ``{"ok": bool, "message": str|None}``. Mode "off" makes no VLM
+    calls, so it passes unconditionally: refusing a pure-OCR job because Ollama
+    is down would be wrong.
     """
     if mode == "off":
         return {"ok": True, "message": None}
@@ -186,13 +165,13 @@ def preflight(model: str, ollama_url: str = DEFAULT_OLLAMA_URL, mode: str = DEFA
     if not status["running"]:
         return {"ok": False, "message": status["error"]}
 
-    # The script matches model tags exactly against this same list, so an
-    # exact check here is what actually predicts whether the job will work.
+    # The script matches tags exactly against this same list, so an exact
+    # check here is what predicts whether the job will work.
     if model not in status["models"]:
         return {
             "ok": False,
-            # Deliberately tells the user to pull it themselves: a first pull
-            # can be several GB, which is not something to start mid-job.
+            # The user pulls it themselves: a first pull can be several GB,
+            # not something to start mid-job.
             "message": ("The model '%s' isn't pulled on this machine. "
                         "Run:  ollama pull %s" % (model, model)),
         }
@@ -200,18 +179,14 @@ def preflight(model: str, ollama_url: str = DEFAULT_OLLAMA_URL, mode: str = DEFA
     return {"ok": True, "message": None}
 
 
-# --------------------------------------------------------------------------
-# Stage 1: page fixes -- remove repeated pages, turn sideways ones upright
-# --------------------------------------------------------------------------
-# Both original scripts detect on the uploaded PDF, and their findings are
-# then written out together in a single save into fixed/. Each script still
-# reads the file in its own way -- their per-page logic is theirs, and is not
-# merged or copied here -- but no intermediate copy is ever written: one read
-# per script, one write per PDF.
+# ---- Stage 1: page fixes -- flag repeated pages, turn sideways ones upright ----
+# Both scripts detect on the uploaded PDF and their findings are written out
+# together in one save into fixed/: one read per script, one write per PDF, no
+# intermediate copy.
 
-# The confidence levels fix_rotation.py actually applies. "review" pages are
-# reported but left alone -- the script's own rule, mirrored here only so the
-# pages turned below are exactly the ones it would have turned.
+# The confidence levels fix_rotation.py applies. "review" pages are reported
+# but left alone -- the script's own rule, mirrored so the pages turned below
+# are exactly the ones it would have turned.
 _APPLIED_CONFIDENCE = ("high", "medium")
 
 
@@ -219,18 +194,18 @@ _APPLIED_CONFIDENCE = ("high", "medium")
 class PageFixResult:
     """What one PDF's page fixes found and did.
 
-    A dataclass rather than a bare dict because these fields flow straight
-    into manifest.json, and a typo in a dict key would only surface much
-    later, in the UI, as a missing number.
+    A dataclass rather than a dict because these fields flow into
+    manifest.json, where a mistyped key would only surface later, in the UI, as
+    a missing number.
     """
     source_name: str
     fixed_path: Path
     original_page_count: int
-    # 0-based page numbers of the original PDF, in the order they were kept.
-    # Position i in the fixed PDF is original page kept_indices[i]. Every page
-    # is kept: suspected repeats are only flagged, and removed by a person.
+    # 0-based original page numbers, in kept order: position i in the fixed
+    # PDF is original page kept_indices[i]. Every page starts kept -- suspected
+    # repeats are only flagged, and removed by a person.
     kept_indices: list = field(default_factory=list)
-    # dedupe.py's findings, one dict per suspected repeat:
+    # dedupe.py's findings, one per suspected repeat:
     #   {dupe_idx, orig_idx, duplicate_page, original_page, score, folio}
     duplicates: list = field(default_factory=list)
     # fix_rotation.py's decisions, numbered as in the original PDF:
@@ -261,9 +236,9 @@ class PageFixResult:
 def load_orientation_classifier():
     """Build the orientation model the rotation script uses, once per batch.
 
-    The script builds this inside scan_directory(), which we do not call (it
-    only prints its results), so the same construction is repeated here.
-    Loading takes about a second, hence doing it once rather than per PDF.
+    The script builds this inside scan_directory(), which only prints its
+    results and so is not called here. Loading takes about a second, hence once
+    per batch rather than per PDF.
     """
     from paddleocr import DocImgOrientationClassification
 
@@ -282,16 +257,14 @@ def fix_pdf(
     """Find repeated and sideways pages with the original scripts, then write
     one corrected copy of the PDF into ``fixed_dir``.
 
-    Repeated pages are **flagged, never removed**: dedupe.py's matches have
-    proved wrong often enough that every one goes to a person, who removes it
-    from the Page fixes tab if it really is a repeat (see
-    rebuild_fixed_pdf()). Sideways pages the rotation script is confident
-    about are turned, as before; its uncertain ones are left for review.
+    Repeats are flagged, never removed: dedupe.py's matches have been wrong
+    often enough that a person decides, from the Page fixes tab (see
+    rebuild_fixed_pdf()). Sideways pages the rotation script is confident about
+    are turned; its uncertain ones are left for review.
 
-    Both scripts only detect here -- ``dedupe.py`` has no function that
-    removes pages, and ``fix_rotation.py`` runs in its detect-only mode -- so
-    the write happens in write_fixed_pdf(), driven entirely by what they
-    returned. All of the matching and deciding stays in the original files.
+    Both scripts only detect here, so the write happens in write_fixed_pdf(),
+    driven entirely by what they returned -- all the matching and deciding
+    stays in the original files.
     """
     fixed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -299,16 +272,14 @@ def fix_pdf(
     if pdf_path.parent.resolve() == fixed_dir.resolve():
         raise ValueError("fixed_dir must differ from the folder holding %s" % pdf_path.name)
 
-    # Either check can be left out (``dedupe`` / ``rotate``), when the person
-    # running the batch only needs the other. Rotation is the slow one -- it
-    # renders every page through the orientation model -- so skipping it also
-    # skips loading that model.
+    # Either check can be left out when the batch only needs the other.
+    # Rotation is the slow one -- it renders every page through the
+    # orientation model -- so skipping it also skips loading that model.
 
-    # We pass no output_dir, so it does not write its comparison PDF -- only
-    # the detection result is wanted here.
+    # No output_dir, so it writes no comparison PDF: only the findings.
     duplicates = find_and_export_duplicates(pdf_path) if dedupe else []
 
-    # No output_dir and apply=False: the script only reports, it writes nothing.
+    # Detect-only: the script reports and writes nothing.
     rotations = []
     if rotate:
         if classifier is None:
@@ -341,18 +312,17 @@ class FixedPdfBusy(Exception):
 def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict) -> None:
     """Write the fixed PDF: the pages in ``keep``, each turned by ``turns``.
 
-    ``keep`` is 0-based original page numbers in order; ``turns`` maps an
-    original page number to degrees added to that page's own /Rotate (the
-    same addition the rotation script's apply step makes). Always built from
-    the untouched upload, so earlier choices never compound.
+    ``keep`` is 0-based original page numbers in order; ``turns`` maps one to
+    degrees added to that page's own /Rotate, the same addition the rotation
+    script's apply step makes. Always built from the untouched upload, so
+    earlier choices never compound.
 
-    Written beside the target and swapped in, so the fixed PDF is never left
-    half-written if something goes wrong mid-save. Raises FixedPdfBusy when
-    the swap is refused, which on Windows means something else has the file
-    open -- a PDF viewer, usually.
+    Written beside the target and swapped in, so the file is never left half
+    written. Raises FixedPdfBusy when the swap is refused, which on Windows
+    means something else has the file open -- usually a PDF viewer.
     """
-    # The folder can be missing: a run's folder may have been opened after
-    # someone deleted part of it.
+    # The folder can be missing: part of a run's folder may have been deleted
+    # before it was opened.
     fixed_pdf.parent.mkdir(parents=True, exist_ok=True)
     temp = fixed_pdf.with_name(fixed_pdf.stem + ".tmp.pdf")
     with fitz.open(original_pdf) as doc:
@@ -374,7 +344,7 @@ def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict
                     page.set_rotation((page.rotation + turn) % 360)
             if removing:
                 # Removed pages leave unreferenced objects behind; garbage
-                # collection is what actually takes them out of the file.
+                # collection is what takes them out of the file.
                 doc.save(temp, garbage=4, deflate=True)
             else:
                 # Turns only: no garbage/deflate, so only the page
@@ -383,8 +353,8 @@ def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict
     try:
         os.replace(temp, fixed_pdf)
     except OSError as exc:
-        # Leaving the half-made copy behind would be litter, and would be
-        # picked up as a stray PDF by anything reading the folder.
+        # A half-made copy left behind would be read as a stray PDF by
+        # anything scanning the folder.
         try:
             temp.unlink()
         except OSError:
@@ -396,20 +366,18 @@ def write_fixed_pdf(original_pdf: Path, fixed_pdf: Path, keep: list, turns: dict
 
 def rebuild_fixed_pdf(original_pdf: Path, fixed_pdf: Path, duplicates: list,
                       rotations: list) -> list:
-    """Rewrite the fixed PDF from a document's records, after a person
-    removes or restores a repeated page.
+    """Rewrite the fixed PDF after a person removes or restores a repeat.
 
-    Removing a page shifts every page after it, so the whole file is rebuilt
-    from the upload with the current removals (``duplicates`` records marked
-    ``removed``) and turns (each rotation record's ``current``), and each
-    rotation record's ``fixed_idx`` is updated in place -- None for a page
-    that is now removed. Returns the kept original page numbers.
+    Removing a page shifts every page after it, so the file is rebuilt from the
+    upload with the current removals and turns. Each rotation record's
+    ``fixed_idx`` is updated in place -- None for a page now removed. Returns
+    the kept original page numbers.
     """
     with fitz.open(original_pdf) as doc:
         page_count = doc.page_count
     removed = {d["dupe_idx"] for d in duplicates if d.get("removed")}
     keep = [i for i in range(page_count) if i not in removed]
-    # The same guard fix_pdf always had: never a zero-page PDF.
+    # Never a zero-page PDF.
     if not keep:
         keep = list(range(page_count))
 
@@ -425,9 +393,9 @@ def rebuild_fixed_pdf(original_pdf: Path, fixed_pdf: Path, duplicates: list,
 def rotation_records(result: Optional[PageFixResult]) -> list:
     """The rotation script's decisions, located in both copies of the PDF.
 
-    ``original_idx`` / ``original_page`` place the page in the uploaded PDF
-    (the numbers the user sees when opening their own file); ``fixed_idx``
-    places it in the fixed copy, which is shorter by every removed repeat.
+    ``original_idx`` / ``original_page`` place the page in the uploaded PDF --
+    the numbers the user sees in their own file -- and ``fixed_idx`` in the
+    fixed copy, which is shorter by every removed repeat.
     """
     if result is None:
         return []
@@ -441,8 +409,8 @@ def rotation_records(result: Optional[PageFixResult]) -> list:
             original_idx=d["page_idx"],
             original_page=d["page_idx"] + 1,
             fixed_idx=position[d["page_idx"]],
-            # The turn the fixed PDF has now, on top of the page's own /Rotate.
-            # Starts as the script's decision; the user can change it.
+            # The turn the fixed PDF has now, on top of the page's own
+            # /Rotate. Starts as the script's decision; the user can change it.
             current=d["rotation"] if applied else 0,
             decided=False,
         ))
@@ -456,13 +424,12 @@ def set_page_rotation(original_pdf: Path, fixed_pdf: Path, original_idx: int,
                       fixed_idx: int, turn: int) -> None:
     """Set one page of the fixed PDF to its original orientation plus ``turn``.
 
-    For correcting the rotation step by hand: undoing a wrong turn, turning a
-    page the script was unsure about, or turning one the other way. Measured
-    from the uploaded page rather than added to the fixed one, so choosing the
-    same option twice is harmless and every option is always reachable.
+    For correcting the rotation step by hand. Measured from the uploaded page
+    rather than added to the fixed one, so choosing the same option twice is
+    harmless and every option stays reachable.
 
-    Saved incrementally where possible -- only the page dictionary changes,
-    exactly as when the rotation script applies a turn itself.
+    Saved incrementally where possible: only the page dictionary changes, as
+    when the rotation script applies a turn itself.
     """
     if turn not in VALID_TURNS:
         raise ValueError("turn must be one of %s" % (VALID_TURNS,))
@@ -491,7 +458,7 @@ def page_fix_fields(result: Optional[PageFixResult]) -> dict:
     """The page-fixes part of a document record.
 
     Shared by the full pipeline and the page-fixes-only run, so the review
-    screen reads the same fields whichever produced the document.
+    screen reads the same fields either way.
     """
     return {
         "page_count": result.kept_page_count if result else None,
@@ -507,14 +474,11 @@ def page_fix_fields(result: Optional[PageFixResult]) -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# Abstract page overrides
-# --------------------------------------------------------------------------
-# The OCR script accepts ``--override-csv`` naming each PDF's abstract pages
-# by hand, for theses whose heading it cannot find or finds in the wrong
-# place. People read those page numbers off their own PDF, but the script
-# reads the fixed copy, where every removed repeat shifts later pages down
-# by one. So the numbers are translated before they are handed over.
+# ---- Abstract page overrides ----
+# The OCR script takes ``--override-csv`` naming each PDF's abstract pages by
+# hand, for theses whose heading it cannot find. People read those numbers off
+# their own PDF, but the script reads the fixed copy, where every removed
+# repeat shifts later pages down by one -- so they are translated first.
 
 _RE_PAGE_RANGE_INPUT = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
 
@@ -523,7 +487,7 @@ def parse_page_range(value: str) -> Optional[tuple]:
     """``"5-8"`` -> ``(5, 8)``, ``"5"`` -> ``(5, 5)``; blank -> None.
 
     Raises ValueError on anything else, so a typo is refused up front rather
-    than silently ignored and the abstract auto-detected after all.
+    than ignored and the abstract auto-detected after all.
     """
     if value is None or not str(value).strip():
         return None
@@ -540,9 +504,9 @@ def parse_page_range(value: str) -> Optional[tuple]:
 def map_pages_to_fixed(start: int, end: int, kept_indices: Optional[list]) -> Optional[tuple]:
     """Translate 1-based original page numbers to the fixed copy's.
 
-    The range covers every kept page between ``start`` and ``end``, so a
-    removed repeat inside it is simply skipped. Returns None when no page in
-    the range survived (all repeats, or past the end of the document).
+    Covers every kept page between ``start`` and ``end``, so a removed repeat
+    inside the range is skipped. None when no page survived -- all repeats, or
+    past the end of the document.
     """
     if kept_indices is None:
         return start, end
@@ -568,13 +532,10 @@ def write_override_csv(path: Path, ranges: dict) -> Path:
     return path
 
 
-# --------------------------------------------------------------------------
-# Stage 2: the OCR + VLM abstract pass
-# --------------------------------------------------------------------------
+# ---- Stage 2: the OCR + VLM abstract pass ----
 
-# Progress markers we look for in the script's stdout. The script was written
-# to be watched by a human, not parsed, so these patterns are matched
-# defensively: any line that does not match is simply logged and ignored.
+# Progress markers looked for in the script's stdout. It was written to be
+# watched, not parsed, so any line that does not match is logged and ignored.
 _RE_BATCH_INDEX = re.compile(r"\[(\d+)/(\d+)\]")
 _RE_PROCESSING = re.compile(r"Processing:\s+(.*\.pdf)\s*$")
 _RE_PAGE_RANGE = re.compile(r"Extracting text from pages (\d+) to (\d+)")
@@ -583,10 +544,9 @@ _RE_VLM_PHASE = re.compile(r"(VLM review pass|OCR/VLM diff pass)")
 _RE_VLM_DOC = re.compile(r"^\s*(.+\.pdf): (reviewing|diffing) (\d+)")
 
 # The three ways the script gives up on a document without writing a draft.
-# Each has a genuinely different cause, and telling them apart is the
-# difference between a user knowing what to do next and guessing. Mapped to
-# plain-language explanations here rather than in the UI, because the wording
-# depends on knowing what the script actually does.
+# Each has a different cause, and telling them apart is what lets the user know
+# what to do next. Worded here rather than in the UI, since the wording depends
+# on what the script actually does.
 _DOCUMENT_PROBLEMS = [
     (re.compile(r"Skipped - could not find abstract"),
      "no abstract heading found in the first 15 pages"),
@@ -607,10 +567,10 @@ def build_abstract_command(
     confidence_threshold: float = 0.60,
     override_csv: Optional[Path] = None,
 ) -> list:
-    """Assemble the exact argv used to invoke the original OCR script.
+    """Assemble the argv used to invoke the original OCR script.
 
     Split out from run_abstract_pass() so it can be logged and checked without
-    actually launching a multi-minute OCR run.
+    launching a multi-minute OCR run.
     """
     cmd = [
         sys.executable,
@@ -638,19 +598,18 @@ def run_abstract_pass(
 ) -> int:
     """Run the original script over every PDF in ``input_dir``.
 
-    A whole directory is handed over in one call, rather than looping over
-    files here, precisely because the script's deferred VLM phase is
-    batch-wide: it waits until all PaddleOCR work is done before making any
-    Ollama call. Calling it once per file would defeat that and reintroduce
-    the GPU-contention bug its author designed around.
+    The whole directory goes over in one call, not file by file, because the
+    script's deferred VLM phase is batch-wide: it waits for all PaddleOCR work
+    before any Ollama call. Per-file calls would reintroduce the GPU-contention
+    bug its author designed around.
 
     ``on_progress`` is called with small dicts as milestones are parsed out of
     stdout. Returns the script's exit code.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Unbuffered + UTF-8 so we see each line as it happens rather than in one
-    # burst at the end, and so the script's arrows/checkmarks survive the pipe.
+    # Unbuffered + UTF-8, so lines arrive as they happen rather than in one
+    # burst, and the script's arrows/checkmarks survive the pipe.
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -698,17 +657,16 @@ def run_abstract_pass(
 
             m = _RE_PAGE_DONE.search(line)
             if m and page_from is not None:
-                # The script prints 1-based page numbers of the *document*; the
-                # UI wants "N of M" within the abstract range being processed.
+                # The script prints the document's own 1-based page numbers;
+                # the UI wants "N of M" within the abstract range.
                 current = int(m.group(1)) - page_from + 1
                 total = (page_to - page_from + 1) if page_to is not None else None
                 emit(event="page_done", current=current, total=total)
 
             for pattern, explanation in _DOCUMENT_PROBLEMS:
                 if pattern.search(line):
-                    # Attributed to whichever file the script last announced;
-                    # it processes strictly one document at a time, so that is
-                    # unambiguous.
+                    # Attributed to the file the script last announced: it
+                    # processes strictly one document at a time.
                     emit(event="file_problem", reason=explanation)
                     break
 
@@ -725,17 +683,14 @@ def run_abstract_pass(
     return proc.returncode
 
 
-# --------------------------------------------------------------------------
-# Stage 3: reading the script's output back
-# --------------------------------------------------------------------------
+# ---- Stage 3: reading the script's output back ----
 
 # The script writes "<stem> draft.txt" -- an HTML fragment, not Markdown.
-# Everything below understands that shape.
 DRAFT_SUFFIX = " draft.txt"
 
-# Appended review blocks the script may add after the primary text. Both start
-# at the first "\n\n<!--", which is also exactly where the script itself splits
-# when it re-appends (see _apply_vlm_diff_merges), so this split is safe.
+# Review blocks the script may append after the primary text. Both start at the
+# first "\n\n<!--", which is where the script itself splits when it re-appends
+# (see _apply_vlm_diff_merges), so this split is safe.
 _APPENDED_MARKER = "\n\n<!--"
 
 _RE_RECOVERY_BLOCK = re.compile(
@@ -749,8 +704,8 @@ _RE_DIFF_BLOCK = re.compile(
 _RE_DIFF_LINE = re.compile(
     r'^\s*(?:\[(?P<label>[A-Z ]+)\]\s+)?OCR: "(?P<ocr>.*?)"\s+\|\s+VLM: "(?P<vlm>.*)"\s*$'
 )
-# Equation placeholders the OCR pass leaves inline when it meets a stacked
-# fraction it cannot read. A real, script-produced signal -- not a guess.
+# Placeholders the OCR pass leaves inline for a stacked fraction it cannot
+# read. A script-produced signal, not a guess.
 _RE_EQUATION_PLACEHOLDER = re.compile(
     r"\[EQUATION(?:\s+\d+)? - VERIFY MANUALLY, PAGE (\d+)\]"
 )
@@ -759,16 +714,13 @@ _RE_EQUATION_PLACEHOLDER = re.compile(
 def parse_draft(draft_text: str) -> dict:
     """Split one draft file into its primary text and its review artifacts.
 
-    Returns a dict with:
-      ``primary``   -- the HTML paragraphs that are the actual output
-      ``recovery``  -- VLM re-reads of flagged pages, if the run produced any
-      ``diffs``     -- per-page OCR-vs-VLM spans, if the run produced any
-      ``flags``     -- per-page review flags, assembled from the above
+    Returns ``primary`` (the HTML paragraphs that are the actual output),
+    ``recovery`` (VLM re-reads of flagged pages), ``diffs`` (per-page
+    OCR-vs-VLM spans) and ``flags``, assembled from the other three.
 
-    Important: there is no numeric per-page confidence score anywhere in this
-    output. The OCR script writes its confidence sidecar and then deletes it
-    at the end of its own run, so the only per-page signal that survives into
-    the draft is *categorical* -- a page was flagged, and for which reason.
+    Note there is no per-page confidence score to be had: the OCR script
+    deletes its confidence sidecar at the end of its run, so the only signal
+    surviving into the draft is categorical -- a page was flagged, and why.
     ``flags`` therefore carries reasons, never invented numbers.
     """
     split_at = draft_text.find(_APPENDED_MARKER)
@@ -797,12 +749,12 @@ def parse_draft(draft_text: str) -> dict:
         if spans:
             diffs.append({"page": int(page), "spans": spans})
 
-    # --- Assemble per-page flags from the real signals above ----------------
+    # ---- Per-page flags, assembled from the signals above
     flags = {}
 
     def add_flag(page, kind, label):
-        # A page can earn several flags; keep the first kind set but let the
-        # detail lines accumulate so the sidebar can show everything at once.
+        # A page can earn several flags: keep the first kind, but accumulate
+        # the detail lines so the sidebar shows everything at once.
         entry = flags.setdefault(page, {"page": page, "kind": kind, "labels": []})
         if label not in entry["labels"]:
             entry["labels"].append(label)
@@ -829,20 +781,16 @@ def parse_draft(draft_text: str) -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# Applying a single diff span to the draft text
-# --------------------------------------------------------------------------
-# The review screen lets the user apply any span the script left FLAGGED with
-# one click, instead of hunting for the text in the editor.
+# ---- Applying a single diff span to the draft text ----
+# The review screen applies any span the script left FLAGGED in one click.
 #
-# The hard part is that a diff span is *raw* text (straight from OCR or from
-# the model) while the draft has already been through the script's fixup
-# chain -- a span reading "ε = 0.05" appears in the draft as "&epsilon; = 0.05".
-# A plain find-and-replace would therefore silently fail on exactly the spans
-# most likely to still be flagged. So we reuse the script's own
-# _normalize_for_primary_text(), which is the function it uses for this same
-# purpose in _apply_vlm_diff_merges(). Reusing it means the UI can never drift
-# out of step with how the script itself locates text.
+# The catch: a diff span is raw text, straight from OCR or the model, while the
+# draft has been through the script's fixup chain -- a span reading "ε = 0.05"
+# appears in the draft as "&epsilon; = 0.05". A plain find-and-replace would
+# silently fail on exactly the spans most likely to still be flagged, so we
+# reuse the script's own _normalize_for_primary_text(), the function it uses
+# for this in _apply_vlm_diff_merges(). That keeps the UI in step with how the
+# script itself locates text.
 
 # The literal the script prints for "this side of the diff has no text".
 NOTHING_SPAN = "(nothing)"
@@ -853,10 +801,9 @@ _normalizer = None
 def _get_normalizer():
     """Import the original script's text normalizer, once, on first use.
 
-    Deferred rather than imported at module scope because importing
-    vlm_abstract.py pulls in PaddleOCR, which costs about nine seconds. The
-    server warms this in a background thread at startup (see server/__init__)
-    so the first click does not pay that cost.
+    Deferred because importing vlm_abstract.py pulls in PaddleOCR, about nine
+    seconds. The server warms it in a background thread at startup (see
+    server/__init__) so the first click does not pay that cost.
     """
     global _normalizer
     if _normalizer is None:
@@ -865,15 +812,14 @@ def _get_normalizer():
     return _normalizer
 
 
-# How much text either side of a span we remember in order to recognise it
-# again. Enough to be distinctive in an abstract; short enough that an edit
-# nearby does not invalidate it.
+# How much text either side of a span is remembered to recognise it again.
+# Distinctive enough in an abstract, short enough that a nearby edit does not
+# invalidate it.
 _CONTEXT_CHARS = 24
 
-# How many characters of surrounding text have to agree before we will accept
-# a candidate as this span's own. A handful of characters can line up by pure
-# chance -- a space, a closing tag -- so a winner below this is treated as no
-# winner at all.
+# How much surrounding text must agree before a candidate counts as this
+# span's own. A few characters line up by chance -- a space, a closing tag --
+# so a winner below this is no winner at all.
 _MIN_CONTEXT_MATCH = 6
 
 
@@ -905,8 +851,8 @@ def _offsets_of(text: str, needle: str) -> list:
     return positions
 
 
-# Tokens this short are found inside ordinary text everywhere, so a plain
-# substring search says nothing about whether *this* span is still there.
+# Tokens this short occur inside ordinary text everywhere, so a substring
+# search says nothing about whether this span is still there.
 _SHORT_TOKEN = 2
 _WORD_CHAR = r"A-Za-z0-9"
 
@@ -914,21 +860,20 @@ _WORD_CHAR = r"A-Za-z0-9"
 def _span_offsets(text: str, needle: str) -> list:
     """Where a diff span's text sits in the document, as the span means it.
 
-    The diff report splits on whitespace, so a span is a whole token. For
-    most spans a substring search finds it well enough, but two kinds match
-    all over the text and would make a resolved span look unresolved:
+    The diff report splits on whitespace, so a span is a whole token, and a
+    substring search finds most of them. Two kinds match all over the text and
+    would make a resolved span look unresolved:
 
     * Punctuation alone (a stray "." the OCR read twice): only a mark not
       attached to a word counts -- "Knoxville..", "word ." -- never the
-      ordinary full stop at the end of every sentence.
-    * One or two letters (a stray "y"): only as a word on its own, not
-      inside other words.
+      ordinary full stop ending every sentence.
+    * One or two letters (a stray "y"): only as a word on its own.
     """
     if not needle:
         return []
     if not re.search("[%s]" % _WORD_CHAR, needle):
-        # Not after a word, a closing bracket or quote, or a closing tag --
-        # "10<sup>3</sup>." ends a sentence like any other.
+        # Not after a word, bracket, quote or closing tag -- "10<sup>3</sup>."
+        # ends a sentence like any other.
         pattern = r"(?<![%s)\]\"'%%>])%s" % (_WORD_CHAR, re.escape(needle))
     elif len(needle) <= _SHORT_TOKEN:
         pattern = r"(?<![%s])%s(?![%s])" % (_WORD_CHAR, re.escape(needle), _WORD_CHAR)
@@ -944,9 +889,9 @@ def _span_present(text: str, needle: str) -> bool:
 def make_hint(text: str, offset: int, length: int) -> dict:
     """Record where a span sits, and what sits either side of it.
 
-    Position alone is not enough to find a span again: any edit earlier in the
-    document shifts it. The surrounding words move with the span, so they
-    identify it even after the text around it has changed.
+    Position alone is not enough to find it again, since any earlier edit
+    shifts it. The surrounding words move with the span, so they identify it
+    after the text around it changes.
     """
     return {
         "offset": offset,
@@ -956,13 +901,12 @@ def make_hint(text: str, offset: int, length: int) -> dict:
 
 
 def _resolve_offset(text: str, needle: str, hint):
-    """Find *this span's own* copy of ``needle``, not just any copy.
+    """Find this span's own copy of ``needle``, not just any copy.
 
-    This is what makes a swap reversible. Applying a correction can itself
-    make the words non-unique -- changing "PAo" to "PAO" in a document that
-    already says "PAO" somewhere else -- and from then on a plain text search
-    cannot tell which occurrence belongs to this diff. The remembered position
-    and surrounding words can.
+    What makes a swap reversible. Applying a correction can itself make the
+    words non-unique -- "PAo" to "PAO" in a document that already says "PAO"
+    elsewhere -- and a plain search then cannot tell which occurrence is this
+    diff's. The remembered position and surrounding words can.
 
     Returns ``(offset, status)`` with status "ok", "not_found" or "ambiguous".
     """
@@ -975,17 +919,15 @@ def _resolve_offset(text: str, needle: str, hint):
     if not hint:
         return -1, "ambiguous"
 
-    # Still exactly where we left it.
+    # Still exactly where it was left.
     offset = hint.get("offset")
     if offset in positions:
         return offset, "ok"
 
-    # Moved, because of an edit earlier in the document. The words either side
-    # of the span moved with it, so they still identify it -- but only
-    # partially: an insertion just before the span truncates what is left of
-    # the remembered text on that side. So each candidate is scored by how
-    # much of its surroundings still agree, rather than demanding an exact
-    # match on both sides.
+    # Moved by an earlier edit. The words either side moved with it, so they
+    # still identify it -- but only partly, since an insertion just before the
+    # span truncates the remembered text on that side. So candidates are scored
+    # on how much of their surroundings agree, not matched exactly.
     before = hint.get("before", "")
     after = hint.get("after", "")
     scored = sorted(
@@ -1009,23 +951,21 @@ def _resolve_offset(text: str, needle: str, hint):
 def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
     """Which side of this diff the document currently reflects.
 
-    Worked out from the text itself rather than stored as a flag, so it stays
-    right even after the user edits the textarea by hand. ``hint`` is the
-    span's last known position, which settles cases the text alone cannot --
-    notably when one reading contains the other ("Her" inside
-    "Her<sup>-</sup>"), where both would otherwise appear present.
+    Worked out from the text rather than stored as a flag, so it stays right
+    after the user edits the textarea by hand. ``hint`` is the span's last
+    known position, which settles what the text alone cannot -- notably when
+    one reading contains the other ("Her" inside "Her<sup>-</sup>") and both
+    appear present.
 
     Returns "ocr", "vlm", or "unclear" when neither reading can be located.
     """
     normalize = _get_normalizer()
 
-    # With a record of where this span sits, answer by looking at that spot
-    # specifically. Note that "the other reading exists somewhere in the
-    # document" is NOT the question -- the same words often appear elsewhere,
-    # and treating that as an answer is what used to make a span look already
+    # With a record of where this span sits, answer at that spot. "The other
+    # reading exists somewhere in the document" is NOT the question -- the same
+    # words often appear elsewhere, which used to make a span look already
     # applied when it was not. So every occurrence of both readings is scored
-    # on how well its surroundings match what we remember, and the best-placed
-    # one wins.
+    # on how well its surroundings match, and the best-placed one wins.
     if hint:
         before = hint.get("before", "")
         after = hint.get("after", "")
@@ -1049,14 +989,14 @@ def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
         if best is not None and best[0] >= _MIN_CONTEXT_MATCH:
             return best[2]
 
-        # Neither reading sits where this span belongs. For a one-sided span
-        # that is exactly what "the empty side was applied" looks like.
+        # Neither reading sits where this span belongs -- which, for a
+        # one-sided span, is what "the empty side was applied" looks like.
         if vlm_span == NOTHING_SPAN:
             return "vlm"
         if ocr_span == NOTHING_SPAN:
             return "ocr"
 
-    # No usable position -- fall back to plain presence.
+    # No usable position: fall back to plain presence.
     if vlm_span == NOTHING_SPAN:
         return "ocr" if _span_present(text, normalize(ocr_span)) else "vlm"
     if ocr_span == NOTHING_SPAN:
@@ -1071,8 +1011,8 @@ def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
     if ocr_present and not vlm_present:
         return "ocr"
     if ocr_present and vlm_present:
-        # One reading contains the other, so both "match". The longer one is
-        # the specific one, and therefore what the document actually shows.
+        # One reading contains the other, so both "match". The longer is the
+        # specific one, and so what the document actually shows.
         if vlm_needle != ocr_needle:
             return "vlm" if len(vlm_needle) > len(ocr_needle) else "ocr"
     return "unclear"
@@ -1081,10 +1021,10 @@ def span_state(text: str, ocr_span: str, vlm_span: str, hint=None) -> str:
 def _restore_point(text: str, hint):
     """Where text that was deleted should go back.
 
-    The span left no words behind to search for, so the only record of where
-    it belonged is what sat either side of it. Those neighbours are looked up
-    first, which keeps the restore correct even if the document has shifted
-    since; the remembered position is the fallback.
+    A deleted span leaves no words to search for, so the only record of where
+    it belonged is what sat either side. Those neighbours are looked up first,
+    which stays correct if the document has shifted since; the remembered
+    position is the fallback.
     """
     if not hint:
         return None
@@ -1092,9 +1032,9 @@ def _restore_point(text: str, hint):
     before = hint.get("before", "")
     after = hint.get("after", "")
 
-    # The gap is wherever the two remembered sides now meet. Scored the same
-    # way as _resolve_offset, so a partial match still counts: an edit
-    # elsewhere may have eaten into one side of the remembered context.
+    # The gap is where the two remembered sides now meet. Scored as in
+    # _resolve_offset, so a partial match counts: an edit elsewhere may have
+    # eaten into one side of the remembered context.
     if before and after:
         joins = _offsets_of(text, before + after)
         if len(joins) == 1:
@@ -1123,29 +1063,26 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
     """Rewrite one diff span in ``text`` to the chosen side.
 
     ``direction`` is "vlm" to take the model's reading or "ocr" to put the
-    OCR's reading back. ``hint`` is the record of where this span was last
-    written, which is what makes the swap reliably reversible -- see
-    _resolve_offset(). ``at_offset`` is a place the user picked from
-    span_occurrences() for text that appears more than once; it settles the
-    ambiguity in their words rather than ours.
+    OCR's back. ``hint`` records where this span was last written, which is
+    what makes the swap reversible (see _resolve_offset). ``at_offset`` is a
+    place the user picked for text that appears more than once.
 
-    Returns ``(new_text, status, hint)``. The returned hint describes where
-    the span's text now sits and should be passed back in next time; on a
-    refusal the incoming hint is handed back unchanged. Status is one of:
+    Returns ``(new_text, status, hint)``. The new hint says where the span's
+    text now sits and should be passed back next time; on a refusal the
+    incoming hint is returned unchanged. Status is one of:
 
       "applied"     -- the swap was made
       "unchanged"   -- that side is already what the document says
       "not_found"   -- the text to replace is not in the document
-      "ambiguous"   -- it occurs in several places and we have no record of
-                       which one is this span's, so replacing would be a guess
-      "unplaceable" -- there is nothing to match against and no remembered
-                       position, so there is nowhere to put the text
-      "moved"       -- ``at_offset`` no longer points at the text, because the
-                       document changed after the places were listed
+      "ambiguous"   -- it occurs in several places with no record of which is
+                       this span's, so replacing would be a guess
+      "unplaceable" -- nothing to match against and no remembered position
+      "moved"       -- ``at_offset`` no longer points at the text, the document
+                       having changed since the places were listed
 
-    Refusing an ambiguous match is the safety property that matters here:
-    rewriting the wrong occurrence would corrupt the document somewhere the
-    user is not looking.
+    Refusing an ambiguous match is the safety property that matters: rewriting
+    the wrong occurrence would corrupt the document where the user is not
+    looking.
     """
     normalize = _get_normalizer()
 
@@ -1156,27 +1093,26 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
 
     replacement = "" if put_raw == NOTHING_SPAN else normalize(put_raw)
 
-    # Restoring something that was deleted: there is no text to search for,
-    # but if we remember where it was taken from we can put it back exactly
-    # there. Without that record there is no honest place to insert it.
+    # Restoring something deleted: no text to search for, but a remembered
+    # position puts it back exactly where it came from. Without that record
+    # there is no honest place to insert it.
     if find_raw == NOTHING_SPAN:
         gap = _restore_point(text, hint)
         if gap is None or not replacement:
             return text, "unplaceable", None
 
-        # If the gap sits squarely between two tags, this span was a whole
-        # paragraph of its own -- a heading, typically -- and its <p> wrapper
-        # went with it when it was deleted. Put the wrapper back too, or the
-        # restored words would end up loose between paragraphs.
+        # A gap squarely between two tags means this span was a paragraph of
+        # its own -- usually a heading -- whose <p> wrapper went with it. Put
+        # the wrapper back, or the words end up loose between paragraphs.
         before_char = text[gap - 1] if gap > 0 else ""
         after_char = text[gap] if gap < len(text) else ""
         if before_char in ("", ">") and after_char in ("", "<"):
             insertion = "<p>" + replacement + "</p>"
             words_at = gap + len("<p>")
         else:
-            # Deleting the span also closed up the whitespace around it, so
-            # restoring has to reopen it -- otherwise the words fuse onto
-            # their neighbours ("noisemore").
+            # Deleting the span closed up the whitespace around it, so
+            # restoring reopens it -- otherwise the words fuse onto their
+            # neighbours ("noisemore").
             lead = "" if before_char in ("", " ", ">") else " "
             trail = "" if (after_char in ("", " ", "<") or after_char in ".,;:") else " "
             insertion = lead + replacement + trail
@@ -1187,8 +1123,8 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
 
     needle = normalize(find_raw)
     if at_offset is not None:
-        # Only honoured while the text is still exactly where it was listed.
-        # Anywhere else would be replacing something the user did not pick.
+        # Honoured only while the text is still where it was listed; anywhere
+        # else would replace something the user did not pick.
         if needle and 0 <= at_offset and text[at_offset:at_offset + len(needle)] == needle:
             offset, status = at_offset, "ok"
         else:
@@ -1206,21 +1142,20 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
 
     new_text = text[:offset] + replacement + text[offset + len(needle):]
 
-    # Deleting a span leaves debris behind: a doubled space where the words
-    # were, a space stranded before punctuation, and -- when the span was a
-    # whole paragraph, such as a heading the model was told to omit -- an
-    # empty <p></p>. Paragraph text in these drafts is single-spaced, so these
-    # cleanups are safe and keep the result looking like the rest of the file.
+    # Deleting a span leaves debris: a doubled space where the words were, a
+    # space stranded before punctuation, and -- when the span was a whole
+    # paragraph, such as a heading the model was told to omit -- an empty
+    # <p></p>. Paragraph text here is single-spaced, so these cleanups are safe.
     #
-    # The tidy-up works outwards from the gap the deletion left, so the
-    # position handed back still points at the span instead of drifting by
-    # however much whitespace got collapsed.
+    # The tidy-up works outwards from the gap, so the position handed back
+    # still points at the span rather than drifting by the collapsed
+    # whitespace.
     if not replacement:
         prefix = re.sub(r"[ \t]+$", "", new_text[:offset])
         suffix = re.sub(r"^[ \t]+", "", new_text[offset:])
 
-        # Put a single space back only where real words now sit on both
-        # sides; not against a tag boundary, and not before punctuation.
+        # A single space back only where real words sit on both sides: not
+        # against a tag boundary, and not before punctuation.
         needs_space = bool(
             prefix and suffix
             and not prefix.endswith(">")
@@ -1231,10 +1166,9 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
         new_text = prefix + joiner + suffix
         offset = len(prefix) + len(joiner)
 
-        # If the span was a whole paragraph -- a heading the model was told to
-        # omit -- the now-empty <p></p> goes too. Searched in a tight window
-        # around the edit so an empty paragraph elsewhere in the document is
-        # never mistaken for this one.
+        # A span that was a whole paragraph leaves an empty <p></p> behind,
+        # which goes too. Searched in a tight window around the edit, so an
+        # empty paragraph elsewhere is never mistaken for this one.
         emptied = re.compile(r"<p>\s*</p>").search(
             new_text, max(0, offset - 8), min(len(new_text), offset + 8))
         if emptied and emptied.start() <= offset <= emptied.end():
@@ -1244,13 +1178,11 @@ def apply_span(text: str, ocr_span: str, vlm_span: str, direction: str, hint=Non
     return new_text, "applied", make_hint(new_text, offset, len(replacement))
 
 
-# --------------------------------------------------------------------------
-# Choosing among repeated text
-# --------------------------------------------------------------------------
-# The diff report names each difference only by its words, never by where it
-# is. When those words appear more than once, apply_span() cannot know which
-# copy is meant, so the user picks -- from each copy shown in its surrounding
-# words, with a best guess marked.
+# ---- Choosing among repeated text ----
+# The diff report names each difference by its words, never by where it is.
+# When those words appear more than once apply_span() cannot know which copy is
+# meant, so the user picks, from each copy shown in its surrounding words with
+# a best guess marked.
 
 # How much surrounding text to show either side of each copy.
 _CHOICE_CONTEXT_CHARS = 40
@@ -1266,13 +1198,12 @@ def _readable(fragment: str) -> str:
 def span_choices(text: str, ocr_span: str, vlm_span: str, state: str, hint=None):
     """The copies a click on this span would have to choose between.
 
-    ``state`` is span_state()'s answer. The click switches to the other side,
+    ``state`` is span_state()'s answer; the click switches to the other side,
     so the text being replaced is the side the document shows now. Returns
-    ``(direction, occurrences)`` when that text appears more than once and
-    the span's remembered position does not settle which copy is its own;
-    otherwise None. Each occurrence is ``{offset, before, match, after}``,
-    where ``offset`` is the raw position to send back and the rest is
-    readable text.
+    ``(direction, occurrences)`` when that text appears more than once and the
+    remembered position does not settle which copy is this span's, otherwise
+    None. Each occurrence is ``{offset, before, match, after}`` -- a raw
+    position to send back, and readable text.
     """
     if state not in ("ocr", "vlm"):
         return None
@@ -1298,7 +1229,7 @@ def span_choices(text: str, ocr_span: str, vlm_span: str, state: str, hint=None)
             after = after[:after.rindex("<")]
         before = _readable(before)
         after = _readable(after)
-        # Trimmed to whole words, so the context never starts or ends mid-word.
+        # Trimmed to whole words, so context never starts or ends mid-word.
         if len(before) > _CHOICE_CONTEXT_CHARS:
             before = before[-_CHOICE_CONTEXT_CHARS:]
             before = before[before.find(" ") + 1:] if " " in before else before
@@ -1321,15 +1252,15 @@ def _picked_side(hint) -> Optional[str]:
 
 
 def span_choice_view(text: str, ocr_span: str, vlm_span: str, state: str, hint=None):
-    """What the copy picker for this span should show, or None for no picker.
+    """What the copy picker for this span should show, or None for none.
 
     Two situations get a picker:
 
     * Not yet picked: the text appears more than once and nothing says which
-      copy is this span's -- every copy is listed, none selected.
+      copy is this span's, so every copy is listed and none selected.
     * Already picked: the list stays available so a wrong pick can be moved.
-      The copies are listed as the document reads with the pick undone, since
-      that is the text a new pick applies to, and ``selected`` marks the copy
+      Copies are listed as the document reads with the pick undone, since that
+      is the text a new pick applies to, and ``selected`` marks the copy
       currently changed.
 
     Returns ``{choose_direction, occurrences, selected}``.
@@ -1347,7 +1278,7 @@ def span_choice_view(text: str, ocr_span: str, vlm_span: str, state: str, hint=N
                          if o["offset"] == base_hint["offset"]), None)
         return {"choose_direction": direction, "occurrences": occurrences, "selected": selected}
 
-    # A span picked before and since put back lists its copies afresh; its
+    # A span picked before and since put back lists its copies afresh: its
     # remembered position must not hide the picker.
     found = span_choices(text, ocr_span, vlm_span, state, None if picked else hint)
     if found is None:
@@ -1360,14 +1291,13 @@ def apply_span_choice(text: str, ocr_span: str, vlm_span: str, direction: str,
                       hint, at_offset: int):
     """Apply a span at the copy the user picked, moving an earlier pick.
 
-    ``at_offset`` is a position from span_choice_view(). If this span already
-    has a pick applied, that pick is undone first -- the listed positions
-    describe the text with it undone -- and the new copy changed instead, so
-    correcting a wrong pick is one click. On any refusal the text is handed
-    back exactly as it came in.
+    ``at_offset`` is a position from span_choice_view(). An existing pick is
+    undone first -- the listed positions describe the text with it undone --
+    and the new copy changed instead, so correcting a wrong pick is one click.
+    On any refusal the text comes back exactly as it went in.
 
     Returns ``(new_text, status, hint)``; the hint records the picked side,
-    which is what keeps the picker available afterwards.
+    which keeps the picker available afterwards.
     """
     picked = _picked_side(hint)
     base = text
@@ -1385,13 +1315,13 @@ def apply_span_choice(text: str, ocr_span: str, vlm_span: str, direction: str,
 
 
 def suggest_occurrences(text: str, spans: list) -> list:
-    """A best guess at where each span sits, for marking one choice "likely".
+    """A best guess at where each span sits, to mark one choice "likely".
 
     ``spans`` is ``[(ocr_span, vlm_span, state), ...]`` in report order. The
     report lists differences page by page, top to bottom, which is also the
-    order of the text -- so walking both together, each span most likely sits
-    at the first copy of its text after the previous span's. Returns one
-    offset (or None) per span. A guess, never applied on its own.
+    order of the text -- so each span most likely sits at the first copy of its
+    text after the previous span's. One offset (or None) per span, never
+    applied on its own.
     """
     normalize = _get_normalizer()
     cursor = 0
@@ -1422,12 +1352,11 @@ def collect_outputs(
       ``<stem>.md``         -- the draft's primary text, verbatim
       ``<stem>.pages.json`` -- per-page review flags, only if any exist
 
-    The ``.md`` extension with HTML inside it is intentional and was agreed up
-    front: the OCR script's output is an HTML fragment whose <sup>/<sub> tags
-    and character entities are the entire point of the pipeline. Converting it
-    to Markdown would destroy that, so the file keeps the HTML payload
-    byte-for-byte and the UI's Markdown renderer is configured with
-    ``html: true``, which passes inline HTML straight through.
+    The ``.md`` extension with HTML inside is intentional: the script's output
+    is an HTML fragment whose <sup>/<sub> tags and character entities are the
+    point of the pipeline, and converting to Markdown would destroy them. The
+    file keeps the HTML byte-for-byte and the UI's renderer runs with
+    ``html: true``, passing inline HTML straight through.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     documents = []
@@ -1439,9 +1368,8 @@ def collect_outputs(
         md_path = output_dir / (stem + ".md")
         md_path.write_text(parsed["primary"], encoding="utf-8")
 
-        # Only write the sidecar when there is something real in it -- an empty
-        # file would imply "checked, all clean" for runs where the chosen mode
-        # never produced flags at all.
+        # Only written when there is something in it: an empty file would
+        # imply "checked, all clean" for a mode that never produced flags.
         pages_path = output_dir / (stem + ".pages.json")
         if parsed["flags"]:
             pages_path.write_text(
@@ -1474,21 +1402,20 @@ def collect_outputs(
 
 
 def rebuild_documents(job_folder: Path) -> list:
-    """Document records read back from a run folder that has no saved state.
+    """Document records read back from a run folder with no saved state.
 
-    For a folder written before the app saved ``job.json``, or one assembled
-    by hand. What the files still hold is recovered: the draft gives the
-    flags, the OCR/VLM differences and the VLM recovery blocks (through the
-    same parse_draft() the pipeline uses), and ``output/<stem>.md`` gives the
-    text as last saved.
+    For a folder written before the app saved ``job.json``, or assembled by
+    hand. The draft gives the flags, OCR/VLM differences and VLM recovery
+    blocks, through the same parse_draft() the pipeline uses, and
+    ``output/<stem>.md`` gives the text as last saved.
 
-    Two things cannot come back, because nothing on disk records them: which
-    pages were flagged as repeats, and which were turned. Those lists are
-    empty and ``fixes_recorded`` is False, so the review screen can say the
-    folder has no record of them rather than implying none were found.
+    Which pages were flagged as repeats and which were turned cannot come back,
+    since nothing on disk records them. Those lists stay empty and
+    ``fixes_recorded`` is False, so the review screen can say the folder has no
+    record rather than implying none were found.
 
     Unlike collect_outputs() this writes nothing -- in particular it must not
-    overwrite an ``.md`` that holds someone's saved edits.
+    overwrite an ``.md`` holding someone's saved edits.
     """
     drafts_dir = job_folder / DRAFTS_DIRNAME
     output_dir = job_folder / OUTPUT_DIRNAME
@@ -1499,10 +1426,9 @@ def rebuild_documents(job_folder: Path) -> list:
         stem = draft_path.name[: -len(DRAFT_SUFFIX)]
         parsed = parse_draft(draft_path.read_text(encoding="utf-8"))
 
-        # The .md is the text as last saved. A folder that was never saved
-        # from the review screen has none, so the draft's own text is written
-        # out once -- that is creating what is missing, never overwriting
-        # someone's saved edits.
+        # The .md is the text as last saved. A folder never saved from the
+        # review screen has none, so the draft's own text is written once --
+        # creating what is missing, never overwriting saved edits.
         md_path = output_dir / (stem + ".md")
         if not md_path.exists():
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1526,7 +1452,7 @@ def rebuild_documents(job_folder: Path) -> list:
             },
             **page_fix_fields(None),
         ))
-    # A page-fixes-only run has no drafts at all: its documents are the PDFs.
+    # A page-fixes-only run has no drafts: its documents are the PDFs.
     if not documents and uploads_dir.is_dir():
         for pdf in sorted(uploads_dir.glob("*.pdf")):
             documents.append(dict(
@@ -1553,9 +1479,9 @@ def rebuild_documents(job_folder: Path) -> list:
 def collect_fix_outputs(pdfs: list, fix_results: dict) -> list:
     """Document records for a page-fixes-only run: no OCR, so no text.
 
-    ``md_file`` is None and the text fields are empty, which is how the
-    routes and the review screen tell these apart. The product of such a run
-    is the corrected PDF in ``fixed/`` itself.
+    ``md_file`` is None and the text fields are empty, which is how the routes
+    and the review screen tell these apart. The product of such a run is the
+    corrected PDF in ``fixed/`` itself.
     """
     processed_at = datetime.now().isoformat(timespec="seconds")
     return [
@@ -1580,27 +1506,25 @@ def collect_fix_outputs(pdfs: list, fix_results: dict) -> list:
     ]
 
 
-# --------------------------------------------------------------------------
-# The whole pipeline, start to finish
-# --------------------------------------------------------------------------
+# ---- The whole pipeline, start to finish ----
 
-# Subdirectory names inside workdir/<job_id>/. Named constants because both
-# this module and the routes that serve a job's files need to agree on them.
+# Subdirectory names inside workdir/<job_id>/. Named constants because this
+# module and the routes serving a job's files have to agree on them.
 UPLOADS_DIRNAME = "uploads"
 FIXED_DIRNAME = "fixed"
 DRAFTS_DIRNAME = "drafts"
 OUTPUT_DIRNAME = "output"
 
 
-# The steps a run can include, all on unless the person running it says not.
+# The steps a run can include, all on unless the batch says otherwise.
 STEP_NAMES = ("dedupe", "rotate", "ocr")
 
 
 def normalize_steps(steps: Optional[dict]) -> dict:
     """``{"dedupe", "rotate", "ocr"}`` as booleans; missing ones default on.
 
-    Unknown keys are dropped, so the dict can be stored and sent back to the
-    UI as it is.
+    Unknown keys are dropped, so the dict can be stored and sent back to the UI
+    as it is.
     """
     steps = steps or {}
     return {name: bool(steps.get(name, True)) for name in STEP_NAMES}
@@ -1615,26 +1539,23 @@ def run_pipeline(
     overrides: Optional[dict] = None,
     steps: Optional[dict] = None,
 ) -> dict:
-    """Run the chosen steps over every uploaded PDF: the page fixes (repeats
+    """Run the chosen steps over every uploaded PDF: page fixes (repeats
     flagged, sideways pages turned), then one batch OCR/VLM pass, then collect
     the results.
 
-    ``steps`` is ``{"dedupe", "rotate", "ocr"}`` booleans -- see
-    normalize_steps() -- so a batch runs only what it needs. Without OCR the
-    run stops after the page fixes, for theses with no abstract to read.
+    ``steps`` is ``{"dedupe", "rotate", "ocr"}`` booleans (see
+    normalize_steps()), so a batch runs only what it needs; without OCR the run
+    stops after the page fixes, for theses with no abstract to read.
     ``overrides`` maps an uploaded filename to its abstract pages as
     ``(start, end)``, numbered as in the uploaded PDF.
 
-    ``report`` is a plain callback taking keyword arguments. Passing a
-    callback -- rather than having this module import the job store -- keeps
-    the dependency arrow pointing one way: ``server`` knows about
-    ``pipeline``, never the reverse. That is also what makes this function
-    runnable from a plain script or a test with no Flask involved at all.
+    ``report`` is a plain keyword-argument callback rather than an import of
+    the job store, so the dependency points one way -- server knows about
+    pipeline, never the reverse -- and this function runs from a script or a
+    test with no Flask involved.
 
-    Note the shape of the run: *all* per-file work happens first, and then the
-    OCR script is invoked exactly once for the whole batch. That ordering is
-    not incidental -- see run_abstract_pass() for why the batch must stay
-    whole.
+    All per-file work happens first, then the OCR script is invoked once for
+    the whole batch; see run_abstract_pass() for why the batch must stay whole.
     """
     def emit(**kwargs):
         if report is not None:
@@ -1652,16 +1573,16 @@ def run_pipeline(
     steps = normalize_steps(steps)
 
     def finish(documents: list, exit_code: int) -> dict:
-        # Recorded on each document so the review screen can tell a check
-        # that found nothing from one that was never run.
+        # Recorded per document so the review screen can tell a check that
+        # found nothing from one that was never run.
         for d in documents:
             d["steps"] = dict(steps)
         write_manifest(output_dir, documents)
         return {"documents": documents, "exit_code": exit_code}
 
-    # --- Pass 1: page fixes, one file at a time, one write each -----------
+    # ---- Pass 1: page fixes, one file at a time, one write each
     # OCR reads the fixed copies; with neither page fix chosen it reads the
-    # uploads as they are, and no copy of each PDF is made at all.
+    # uploads as they are and no copy is made at all.
     fix_results = {}
     ocr_input = uploads_dir
     if steps["dedupe"] or steps["rotate"]:
@@ -1686,7 +1607,7 @@ def run_pipeline(
         output_dir.mkdir(parents=True, exist_ok=True)
         return finish(collect_fix_outputs(pdfs, fix_results), 0)
 
-    # --- Abstract page overrides, translated to the fixed copy ------------
+    # ---- Abstract page overrides, translated to the fixed copy
     override_csv = None
     abstract_pages = {}
     csv_ranges = {}
@@ -1710,7 +1631,7 @@ def run_pipeline(
     if csv_ranges:
         override_csv = write_override_csv(workdir / "overrides.csv", csv_ranges)
 
-    # --- Pass 2: the OCR + VLM abstract pass over the whole batch ---------
+    # ---- Pass 2: the OCR + VLM abstract pass over the whole batch
     emit(event="stage", stage="ocr", detail="Reading abstracts")
     exit_code = run_abstract_pass(
         ocr_input, drafts_dir,
@@ -1719,7 +1640,7 @@ def run_pipeline(
         override_csv=override_csv,
     )
 
-    # --- Pass 3: turn the script's drafts into this app's outputs ---------
+    # ---- Pass 3: turn the script's drafts into this app's outputs
     emit(event="stage", stage="collecting", detail="Collecting results")
     documents = collect_outputs(drafts_dir, output_dir, fix_results, model, mode,
                                 abstract_pages)
@@ -1729,12 +1650,10 @@ def run_pipeline(
 def write_manifest(output_dir: Path, documents: list) -> Path:
     """Write manifest.json for the whole job.
 
-    Shape: a top-level ``documents`` list of per-file records, each carrying
-    the fields asked for (filename, page_count, duplicates_removed,
-    model_used, processed_at). A list rather than a bare object because one
-    job can hold a whole batch, and a flat object could only describe one file.
-    The heavier diff/recovery payloads are left out -- they are review data
-    served over the API, not part of the durable record.
+    A top-level ``documents`` list of per-file records (filename, page_count,
+    duplicates_removed, model_used, processed_at). A list because one job can
+    hold a whole batch. The heavier diff/recovery payloads are left out: they
+    are review data served over the API, not part of the durable record.
     """
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),

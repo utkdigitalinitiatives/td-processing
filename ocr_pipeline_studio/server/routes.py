@@ -1,9 +1,8 @@
 """Every HTTP route the app exposes.
 
-All of it is served to exactly one client: the pywebview window running on
-this machine. There is no authentication anywhere in this file, which is only
-safe because the server is bound to 127.0.0.1 (see server/__init__.py) and is
-therefore unreachable from the network.
+All of it serves exactly one client: the pywebview window on this machine.
+There is no authentication in this file, which is only safe because the server
+binds to 127.0.0.1 (see app.py) and is unreachable from the network.
 """
 
 from __future__ import annotations
@@ -28,9 +27,7 @@ from server import jobs as jobstate
 bp = Blueprint("main", __name__)
 
 
-# --------------------------------------------------------------------------
-# Static UI
-# --------------------------------------------------------------------------
+# ---- Static UI ----
 
 @bp.get("/")
 def index():
@@ -42,24 +39,21 @@ def index():
 def ui_asset(filename: str):
     """Serve app.js, app.css and the vendored Markdown renderer.
 
-    send_from_directory is used rather than open() because it refuses paths
-    that escape the directory, which matters for any route with a
-    user-supplied path segment.
+    send_from_directory rather than open(): it refuses paths that escape the
+    directory, which matters for any route with a user-supplied path segment.
     """
     return send_from_directory(current_app.config["UI_DIR"], filename)
 
 
-# --------------------------------------------------------------------------
-# Ollama
-# --------------------------------------------------------------------------
+# ---- Ollama ----
 
 @bp.get("/models")
 def models():
-    """Which VLM models are actually pulled on this machine, plus the modes.
+    """Which VLM models are pulled on this machine, plus the modes.
 
-    The dropdown is built from this rather than from a hardcoded name, so it
-    always reflects reality. The pipeline's default model is reported too, so
-    the UI can preselect it when it happens to be installed.
+    The dropdown is built from this rather than a hardcoded name, so it
+    reflects reality. The pipeline's default is reported too, so the UI can
+    preselect it when it happens to be installed.
     """
     listing = runner.list_local_models(current_app.config["OLLAMA_URL"])
     return jsonify({
@@ -81,18 +75,15 @@ def ollama():
     return jsonify(runner.ollama_status(current_app.config["OLLAMA_URL"]))
 
 
-# --------------------------------------------------------------------------
-# Running a job
-# --------------------------------------------------------------------------
+# ---- Running a job ----
 
 @bp.post("/upload")
 def upload():
     """Accept dropped PDFs, create a job, and start the pipeline off-thread.
 
-    The response goes back as soon as the files are on disk. The actual work
-    happens on a background thread, because a full OCR + VLM run takes
-    minutes: doing it inline would hold the HTTP connection open the whole
-    time and leave the window looking frozen.
+    The response returns as soon as the files are on disk. A full OCR + VLM run
+    takes minutes, so doing it inline would hold the connection open and leave
+    the window looking frozen.
     """
     uploaded = request.files.getlist("files")
     if not uploaded:
@@ -105,17 +96,17 @@ def upload():
     except _Refused as exc:
         return jsonify({"error": exc.message}), exc.status
 
+    # The browser supplies these names, so they are never trusted as paths:
     # secure_filename strips directory components and unsafe characters.
-    # The browser supplies these names, so they are never trusted as paths.
     pdfs = []
     seen = set()
     for storage in uploaded:
         name = secure_filename(storage.filename or "")
         if not name.lower().endswith(".pdf"):
             continue
-        # Two files of the same name -- dropped from different folders, or
-        # differing only in characters secure_filename strips -- would save
-        # over each other, leaving a batch that claims more files than it has.
+        # Two files of the same name -- from different folders, or differing
+        # only in characters secure_filename strips -- would save over each
+        # other, leaving a batch claiming more files than it has.
         if name.lower() in seen:
             continue
         seen.add(name.lower())
@@ -141,11 +132,10 @@ def upload():
 def rerun(job_id: str):
     """Run some of a finished job's files again, as a new job.
 
-    For the files a run got wrong: a thesis whose abstract was missed or
-    misidentified is rerun with its pages set by hand, and one with no
-    abstract at all is rerun as page fixes only. The uploads are copied from
-    the old job, so nothing has to be dropped in again, and the old job's
-    results are left as they were.
+    For the files a run got wrong: a thesis whose abstract was missed is rerun
+    with its pages set by hand, one with no abstract at all as page fixes only.
+    The uploads are copied from the old job, so nothing has to be dropped in
+    again and the old job's results are left as they were.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     old = store.get(job_id)
@@ -155,7 +145,7 @@ def rerun(job_id: str):
         return jsonify({"error": "That job is still running."}), 409
 
     payload = request.get_json(silent=True) or {}
-    # Only names the old job actually holds -- never a path from the request.
+    # Only names the old job holds -- never a path from the request.
     files = [name for name in payload.get("files", []) if name in old.files]
     if not files:
         return jsonify({"error": "None of those files belong to that job."}), 400
@@ -175,13 +165,11 @@ def rerun(job_id: str):
     return _launch_job(job, files, options)
 
 
-# --------------------------------------------------------------------------
-# Saving a run, listing past runs, opening one
-# --------------------------------------------------------------------------
+# ---- Saving a run, listing past runs, opening one ----
 # A run's folder holds its own state (server/jobs.py), so a batch run by one
-# person can be reviewed by another, later, on another machine. Every route
-# that changes something calls _persist(); typing is coalesced, since a draft
-# edit arrives on every pause and the file can be megabytes.
+# person can be reviewed by another, later, elsewhere. Every route that changes
+# something calls _persist(); typing is coalesced, since a draft edit arrives
+# on every pause and the file can be megabytes.
 
 _PERSIST_EVERY = 3.0  # seconds, for the coalesced writes from /edit
 _persist_timers: dict = {}
@@ -237,8 +225,8 @@ def saved_runs():
 def open_run():
     """Open a run folder for review, from its saved state or from its files.
 
-    With no ``folder`` in the body the window's folder picker is used, so a
-    run copied from another machine can be opened from anywhere. A folder is
+    With no ``folder`` in the body the window's folder picker is used, so a run
+    copied from another machine can be opened from anywhere. A folder counts as
     a run if it holds the saved state or an ``uploads`` folder; anything else
     is refused rather than opened as an empty review.
     """
@@ -258,9 +246,9 @@ def open_run():
     if not folder.is_dir():
         return jsonify({"error": "There is no folder at: %s" % folder}), 404
 
-    # Already open: hand back that job rather than a second copy of the same
-    # run. Two copies would each hold their own choices and overwrite the
-    # other's saved state, last writer winning.
+    # Already open: hand back that job rather than a second copy. Two copies
+    # would each hold their own choices and overwrite the other's saved state,
+    # last writer winning.
     for job in store.all():
         if job.workdir == folder:
             return jsonify({
@@ -324,10 +312,9 @@ def _run_options(model, mode, steps, overrides) -> dict:
     """Validate the settings shared by /upload and /rerun.
 
     ``steps`` chooses what to run -- ``{"dedupe", "rotate", "ocr"}``, any
-    missing one on -- and ``overrides`` the abstract pages set by hand. Both
+    missing one on -- and ``overrides`` the abstract pages set by hand. Either
     may arrive as a JSON string (a form field) or already decoded (a JSON
-    body). Raises _Refused for anything that should stop the job from
-    starting.
+    body). Raises _Refused for anything that should stop the job starting.
     """
     steps = _decode(steps, "The steps to run") if steps is not None else {}
     if not isinstance(steps, dict):
@@ -335,7 +322,7 @@ def _run_options(model, mode, steps, overrides) -> dict:
     steps = runner.normalize_steps(steps)
     if not any(steps.values()):
         raise _Refused("Pick at least one step to run.")
-    # Everything downstream that only asks "is there text?" keeps working.
+    # For everything downstream that only asks "is there text?"
     fixes_only = not steps["ocr"]
 
     model = model or runner.DEFAULT_VLM_MODEL
@@ -357,10 +344,9 @@ def _run_options(model, mode, steps, overrides) -> dict:
                 # Keyed the way the saved upload is named, so it matches.
                 ranges[secure_filename(name)] = parsed
 
-    # Preflight before anything is written: if Ollama is down or the chosen
-    # model is missing, say so now, in plain words, rather than letting the
-    # job fail deep inside the pipeline. A run without OCR never calls
-    # Ollama, so it is checked as if the VLM were off.
+    # Preflight before anything is written, so a missing model or a stopped
+    # Ollama is reported now rather than deep inside the pipeline. A run
+    # without OCR never calls Ollama, so it is checked as if the VLM were off.
     check = runner.preflight(model, current_app.config["OLLAMA_URL"],
                              "off" if fixes_only else mode)
     if not check["ok"]:
@@ -388,8 +374,8 @@ def _launch_job(job, files: list, options: dict):
     for name in files:
         store.set_file_state(job.id, name, "queued")
 
-    # daemon=True so a half-finished job can never keep the process alive
-    # after the window is closed.
+    # daemon=True so a half-finished job cannot keep the process alive after
+    # the window is closed.
     thread = threading.Thread(
         target=_run_job,
         args=(current_app._get_current_object(), job.id),
@@ -412,7 +398,8 @@ def _busy_message(path: Path, exc: Exception) -> str:
 
 
 def _fixes_detail(repeats: int, rotated: int, review: int) -> str:
-    """One queue-row phrase for a file's page fixes; empty when there were none."""
+    """One queue-row phrase for a file's page fixes; empty when there were
+    none."""
     parts = []
     if repeats:
         parts.append("%d possible repeated page(s) to check" % repeats)
@@ -424,13 +411,13 @@ def _fixes_detail(repeats: int, rotated: int, review: int) -> str:
 
 
 def _run_job(app, job_id: str) -> None:
-    """Background worker: drive the pipeline and translate its events into
+    """Background worker: drive the pipeline, translating its events into
     job-store updates.
 
-    Runs inside an app context so it can read config the same way a route
-    does. Every exception is caught and recorded on the job: an unhandled
-    exception on a background thread would otherwise vanish silently and
-    leave the UI polling a job that never moves.
+    Runs inside an app context so it reads config the way a route does. Every
+    exception is caught and recorded on the job: an unhandled one on a
+    background thread would vanish silently and leave the UI polling a job that
+    never moves.
     """
     with app.app_context():
         store: jobstate.JobStore = app.config["JOB_STORE"]
@@ -438,16 +425,15 @@ def _run_job(app, job_id: str) -> None:
         if job is None:
             return
 
-        # Why a document produced no draft, keyed by filename. Filled in from
-        # the script's own warnings so the queue can state the real reason
-        # instead of guessing at one.
+        # Why a document produced no draft, keyed by filename, taken from the
+        # script's own warnings so the queue states the real reason.
         problems: dict = {}
 
         def report(**event) -> None:
             """Translate one pipeline event into job state.
 
-            Kept as a single function with a dispatch on ``event`` so all the
-            UI-facing wording lives in one place.
+            One function dispatching on ``event``, so all the UI-facing wording
+            lives in one place.
             """
             kind = event.get("event")
 
@@ -490,17 +476,17 @@ def _run_job(app, job_id: str) -> None:
                 store.update(job_id, page_total=event.get("total", 0))
 
             elif kind == "page_done":
-                # Only the fields this event actually carries are updated, so
-                # a missing total cannot blank out the one page_total already
-                # established -- and nothing is read off the job unlocked.
+                # Only the fields this event carries are updated, so a missing
+                # total cannot blank out the page_total already established --
+                # and nothing is read off the job unlocked.
                 fields = {"page_current": event.get("current", 0)}
                 if event.get("total"):
                     fields["page_total"] = event["total"]
                 store.update(job_id, **fields)
 
             elif kind == "file_problem":
-                # Recorded against the file the script is currently on, so the
-                # queue row can say why this document produced nothing.
+                # Recorded against the file the script is on, so the queue row
+                # can say why this document produced nothing.
                 current = store.get(job_id)
                 if current is not None and current.current_file:
                     problems[current.current_file] = event.get("reason", "")
@@ -530,8 +516,8 @@ def _run_job(app, job_id: str) -> None:
 
             documents = result["documents"]
             for doc in documents:
-                # The page fixes are repeated here because "done" replaces the
-                # dedupe/rotate details the row showed while the job ran.
+                # Repeated here because "done" replaces the dedupe/rotate
+                # details the row showed while the job ran.
                 parts = [] if doc["fixes_only"] else ["%d flag(s)" % len(doc["flags"])]
                 if doc["abstract_pages"]:
                     parts.append("abstract pages %s" % doc["abstract_pages"]["requested"])
@@ -543,8 +529,8 @@ def _run_job(app, job_id: str) -> None:
                     parts.append("no page fixes needed")
                 store.set_file_state(job_id, doc["filename"], "done", ", ".join(parts))
 
-            # A document the OCR script skipped (no abstract heading found)
-            # produces no draft, so it never appears in ``documents``. Say so
+            # A document the script skipped -- no abstract heading found --
+            # produces no draft and never appears in ``documents``. Say so
             # rather than leaving it showing "queued" forever.
             produced = {d["filename"] for d in documents}
             skipped = [name for name in job.files if name not in produced]
@@ -557,8 +543,8 @@ def _run_job(app, job_id: str) -> None:
             elif documents:
                 message = "Finished - %d document(s) ready to review." % len(documents)
             else:
-                # Report the reason the script actually gave. Distinct reasons
-                # are joined so a mixed batch does not hide one behind another.
+                # The reason the script actually gave. Distinct reasons are
+                # joined so a mixed batch does not hide one behind another.
                 reasons = sorted(set(problems.get(n, "") for n in skipped)) or [""]
                 detail = "; ".join(r for r in reasons if r)
                 message = "Finished, but nothing was extracted"
@@ -570,7 +556,7 @@ def _run_job(app, job_id: str) -> None:
                          message=message,
                          page_current=0, page_total=0,
                          current_file=None)
-            # The run's folder now holds everything needed to review it later.
+            # The folder now holds everything needed to review it later.
             _persist(job_id)
 
         except Exception as exc:
@@ -599,9 +585,9 @@ def open_folder(job_id: str = None):
     """Open a job's folder -- or all of ``workdir/`` -- in the file manager.
 
     The folder comes from the job store or the app's config, never from the
-    request, so this can only ever open the app's own folders. That is also
-    what makes it safe to hand to the OS: ``os.startfile`` on a folder opens
-    it, it does not run anything.
+    request, so only the app's own folders can be opened. That is what makes it
+    safe to hand to the OS: ``os.startfile`` on a folder opens it, it does not
+    run anything.
     """
     if job_id is None:
         folder = current_app.config["WORKDIR"]
@@ -652,16 +638,13 @@ def job_list():
     return jsonify({"jobs": listing})
 
 
-# --------------------------------------------------------------------------
-# Review
-# --------------------------------------------------------------------------
+# ---- Review ----
 
 def _find_document(job, name: str):
     """Look a document up by name on a job, or return None.
 
-    Matching on the name recorded in the job -- rather than building a path
-    from the request -- is what keeps this route from being a way to read
-    arbitrary files off the disk.
+    Matching the name recorded in the job, rather than building a path from the
+    request, is what stops these routes reading arbitrary files off the disk.
     """
     for doc in job.documents:
         if doc["name"] == name:
@@ -675,17 +658,17 @@ def _span_key(page_no, index) -> str:
 
 
 def _diffs_with_state(diffs: list, text: str, offsets: dict) -> list:
-    """Copy the diff blocks, tagging each span with which side the document
+    """Copy the diff blocks, tagging each span with the side the document
     currently shows.
 
     Worked out from the live text on every request rather than stored, so the
-    buttons stay honest even after the user has edited the textarea by hand or
-    applied a span and changed their mind. ``offsets`` supplies each span's
-    last known position, which resolves the cases the text alone cannot.
+    buttons stay honest after a hand edit or a change of mind. ``offsets``
+    supplies each span's last known position, resolving what the text alone
+    cannot.
 
     A span whose text appears more than once also gets ``occurrences`` to pick
-    from, ``selected`` (the copy currently changed, once one has been picked)
-    and ``suggested`` (the likeliest copy, while none is picked).
+    from, ``selected`` (the copy currently changed) and ``suggested`` (the
+    likeliest copy, while none is picked).
     """
     annotated = []
     for page in diffs:
@@ -718,9 +701,8 @@ def _diffs_with_state(diffs: list, text: str, offsets: dict) -> list:
 def document(job_id: str, name: str):
     """Full content for one document: text, flags, diffs, VLM recovery blocks.
 
-    Returns the in-memory edited text when the user has changed it in this
-    session, so switching between documents in the sidebar does not silently
-    discard unsaved work.
+    Returns the in-memory edited text when this session has changed it, so
+    switching documents in the sidebar does not discard unsaved work.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -731,7 +713,7 @@ def document(job_id: str, name: str):
     if doc is None:
         return jsonify({"error": "No such document."}), 404
 
-    # A page-fixes-only document has no text at all -- its product is the PDF.
+    # A page-fixes-only document has no text: its product is the PDF.
     on_disk = ""
     if doc["md_file"]:
         md_path = job.workdir / runner.OUTPUT_DIRNAME / doc["md_file"]
@@ -769,15 +751,14 @@ def document(job_id: str, name: str):
 
 
 # Which copy of a PDF a page image may be drawn from. A fixed map, never a
-# path taken from the request: each key names one of the job's own stage
-# folders, so the route cannot be pointed anywhere else on disk.
+# path from the request, so the route cannot be pointed elsewhere on disk.
 _PAGE_IMAGE_SOURCES = {
     "original": runner.UPLOADS_DIRNAME,
     "fixed": runner.FIXED_DIRNAME,
 }
 
-# PyMuPDF is not thread-safe, and Flask answers each thumbnail request on its
-# own thread. One lock makes the page renders take turns.
+# PyMuPDF is not thread-safe and Flask answers each thumbnail request on its
+# own thread, so the renders take turns.
 _render_lock = threading.Lock()
 
 
@@ -786,8 +767,8 @@ def page_image(job_id: str, source: str, page_idx: int, name: str):
     """A PNG of one page, for the before/after views on the Page fixes tab.
 
     ``page_idx`` is 0-based within the chosen copy. Rendering respects the
-    page's /Rotate, which is exactly what makes a rotation fix visible: the
-    original shows the page as scanned, the fixed copy as corrected.
+    page's /Rotate, which is what makes a rotation fix visible: the original
+    shows the page as scanned, the fixed copy as corrected.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -810,15 +791,15 @@ def page_image(job_id: str, source: str, page_idx: int, name: str):
         try:
             if not 0 <= page_idx < pdf.page_count:
                 return jsonify({"error": "No such page."}), 404
-            # 60 dpi is plenty to judge orientation or spot a repeated page,
-            # and keeps a document with dozens of fixes quick to open.
+            # Enough to judge orientation or spot a repeated page, and keeps
+            # a document with dozens of fixes quick to open.
             png = pdf[page_idx].get_pixmap(dpi=60).tobytes("png")
         finally:
             pdf.close()
 
     response = send_file(io.BytesIO(png), mimetype="image/png")
-    # Uploads never change, and the UI adds a version to a fixed-PDF page's
-    # URL whenever its rotation is changed, so caching stays correct.
+    # Uploads never change, and the UI versions a fixed-PDF page's URL
+    # whenever its rotation changes, so caching stays correct.
     response.headers["Cache-Control"] = "private, max-age=3600"
     return response
 
@@ -827,14 +808,14 @@ def page_image(job_id: str, source: str, page_idx: int, name: str):
 def set_rotation(job_id: str, name: str):
     """Change how one page is turned in the fixed PDF.
 
-    For the rotation step what the OCR/VLM swap is for the text: the script's
-    turn can be undone, a page it was unsure about turned, or a page turned
-    the other way. Body: ``{original_idx, turn}`` with turn 0, 90, 180 or 270
-    degrees on top of the page as scanned.
+    For the rotation step what the OCR/VLM swap is for the text: undo the
+    script's turn, turn a page it was unsure about, or turn one the other way.
+    Body ``{original_idx, turn}``, turn being 0, 90, 180 or 270 degrees on top
+    of the page as scanned.
 
-    Only pages the rotation step reported on can be changed. That is also
-    what keeps the route to this job's own files: the page is looked up in
-    the document's record, never taken as a path.
+    Only pages the rotation step reported on can be changed, which is also what
+    keeps this route to the job's own files: the page is looked up in the
+    document's record, never taken as a path.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -892,15 +873,15 @@ def set_rotation(job_id: str, name: str):
 def set_duplicate(job_id: str, name: str):
     """Remove a suspected repeated page from the fixed PDF, or put it back.
 
-    The dedupe step only flags repeats -- it has been wrong too often to act
-    on its own -- so this is where a person decides, the same way the
-    rotation switch works. Body: ``{dupe_idx, remove}``. Only pages dedupe
-    flagged can be removed, looked up in the document's record.
+    The dedupe step only flags repeats -- it has been wrong too often to act on
+    its own -- so a person decides here, as with the rotation switch. Body
+    ``{dupe_idx, remove}``; only pages dedupe flagged can be removed, looked up
+    in the document's record.
 
-    Only the choice is recorded here, so switching back and forth is
-    instant. The fixed PDF is rebuilt once, when the user saves (see
-    _save_page_fixes) -- removing a page shifts every page after it, so the
-    rebuild is a full rewrite, too slow to run on every click.
+    Only the choice is recorded, so switching back and forth is instant. The
+    fixed PDF is rebuilt once, on save (see _save_page_fixes): removing a page
+    shifts every page after it, so the rebuild is a full rewrite, too slow to
+    run on every click.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -934,9 +915,8 @@ def set_duplicate(job_id: str, name: str):
 def _removals_differ_from_file(doc) -> bool:
     """Whether the Keep/Remove choices differ from what the fixed PDF holds.
 
-    Pages the fixed PDF no longer holds are exactly the rotation records with
-    no ``fixed_idx`` plus flagged repeats removed at the last save, which is
-    what ``saved_removed`` remembers.
+    ``saved_removed`` is what was removed at the last save, so a difference
+    from it is a choice not yet written.
     """
     return any(d["removed"] != d.get("saved_removed", False) for d in doc["duplicates"])
 
@@ -948,13 +928,12 @@ def _pending_removal_count(doc) -> int:
 def _save_page_fixes(job, doc) -> bool:
     """Rebuild one document's fixed PDF with its Keep/Remove choices.
 
-    Returns True if the file was rewritten. Rotations already in the file are
-    carried over, since the rebuild reapplies every current turn.
+    Returns True if the file was rewritten. Rotations already in the file carry
+    over, since the rebuild reapplies every current turn.
 
-    The choices are copied when the rebuild starts, and only that copy is
-    recorded as saved. Keep/Remove stays clickable during a save, so a click
-    that lands mid-rebuild must not be mistaken for part of it: it is left
-    pending, to go into the next save.
+    The choices are copied when the rebuild starts and only that copy is
+    recorded as saved: Keep/Remove stays clickable during a save, so a click
+    landing mid-rebuild is left pending for the next one.
     """
     fixed_pdf = job.workdir / runner.FIXED_DIRNAME / doc["filename"]
     original_pdf = job.workdir / runner.UPLOADS_DIRNAME / doc["filename"]
@@ -985,10 +964,10 @@ def _save_page_fixes(job, doc) -> bool:
 def unsaved_changes(store: jobstate.JobStore) -> list:
     """Every document, across this session's jobs, with changes not on disk.
 
-    Text counts when the in-memory edit differs from its .md file, and page
-    fixes when Keep/Remove choices differ from the fixed PDF. Used to ask
-    before the window closes, since all of it lives in memory and closing
-    loses it. Returns ``[{"job_id", "name", "text", "page_fixes"}, ...]``.
+    Text counts when the in-memory edit differs from its .md file, page fixes
+    when Keep/Remove choices differ from the fixed PDF. Asked before the window
+    closes, since all of it lives in memory. Returns
+    ``[{"job_id", "name", "text", "page_fixes"}, ...]``.
     """
     found = []
     for job in store.all():
@@ -1017,9 +996,9 @@ def unsaved():
 def edit(job_id: str, name: str):
     """Hold an edited document in memory. Nothing is written to disk here.
 
-    The review screen posts here as the user types (debounced). Keeping edits
-    in memory until an explicit Save/Export is what the spec asked for, and it
-    means a stray keystroke can never damage the pipeline's own output.
+    The review screen posts here as the user types, debounced. Holding edits
+    until an explicit Save means a stray keystroke can never damage the
+    pipeline's own output.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -1042,14 +1021,14 @@ def edit(job_id: str, name: str):
 def apply_spans(job_id: str, name: str):
     """Apply one diff span -- or every span still on the OCR side -- in place.
 
-    This is what saves the user from scrolling the editor to find the words a
-    diff is talking about. Like /edit, it only changes the in-memory copy;
-    nothing reaches disk until Save or Export.
+    Saves the user from scrolling the editor to find the words a diff is
+    talking about. Like /edit, only the in-memory copy changes; nothing reaches
+    disk until Save.
 
-    The request body takes either a single ``{page, index, direction}`` or
-    ``{direction, all: true}`` to sweep every span that is not already on the
-    requested side. A single span may also carry ``at_offset``: the copy the
-    user picked when its text appears more than once.
+    Body is either a single ``{page, index, direction}`` or
+    ``{direction, all: true}`` to sweep every span not already on the requested
+    side. A single span may also carry ``at_offset``: the copy the user picked
+    when its text appears more than once.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -1073,7 +1052,7 @@ def apply_spans(job_id: str, name: str):
     if text is None:
         text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
 
-    # Build the list of spans to act on.
+    # The spans to act on.
     if payload.get("all"):
         targets = [
             (page["page"], index, span)
@@ -1093,7 +1072,7 @@ def apply_spans(job_id: str, name: str):
 
     offsets = job.span_offsets.setdefault(name, {})
 
-    # Only meaningful for one span: it is a position in the text as it stands.
+    # Only meaningful for one span: a position in the text as it stands.
     at_offset = None if payload.get("all") else payload.get("at_offset")
     if at_offset is not None and (isinstance(at_offset, bool) or not isinstance(at_offset, int)):
         return jsonify({"error": "at_offset must be a whole number."}), 400
@@ -1105,9 +1084,9 @@ def apply_spans(job_id: str, name: str):
         key = _span_key(page_no, index)
         hint = offsets.get(key)
 
-        # Skip spans already showing the requested side, so a bulk apply does
-        # not report them as failures. A picked copy is exempt: picking a
-        # different copy of an applied span moves the change, it is not a no-op.
+        # Skip spans already on the requested side, so a bulk apply does not
+        # report them as failures. A picked copy is exempt: picking a different
+        # copy of an applied span moves the change, it is not a no-op.
         if at_offset is None and runner.span_state(text, span["ocr"], span["vlm"], hint) == direction:
             counts["unchanged"] += 1
             continue
@@ -1125,10 +1104,9 @@ def apply_spans(job_id: str, name: str):
         counts[status] += 1
 
         if status == "applied":
-            # Remember where this span now sits. Positions of the other spans
-            # are deliberately left alone: each record carries the words
-            # either side of its span, so it can still be found after an edit
-            # elsewhere moves it, with no bookkeeping to get wrong.
+            # Remember where this span now sits. The other spans are left
+            # alone: each record carries the words either side of its own span,
+            # so it is still found after an edit elsewhere moves it.
             offsets[key] = new_hint
         else:
             skipped.append({"page": page_no, "index": index, "status": status,
@@ -1151,8 +1129,8 @@ def save(job_id: str):
     """Write everything pending to disk: text edits to the .md files, and
     Keep/Remove choices to the fixed PDFs.
 
-    This is the only route that overwrites the pipeline's output, and it only
-    ever runs when the user presses Save.
+    The only route that overwrites the pipeline's output, and it runs only when
+    the user presses Save.
     """
     store: jobstate.JobStore = current_app.config["JOB_STORE"]
     job = store.get(job_id)
@@ -1164,9 +1142,9 @@ def save(job_id: str):
 
     written = []
     page_fixes = {}
-    # What each document still has unsaved once this save is done -- the
-    # review screen sets its "unsaved" marks from this rather than assuming
-    # everything was saved, since edits and clicks can land mid-save.
+    # What each document still has unsaved once this save is done: edits and
+    # clicks can land mid-save, so the review screen sets its marks from this
+    # rather than assuming everything was written.
     saved_text = {}
     still_pending = {}
     for name in names:
@@ -1185,7 +1163,7 @@ def save(job_id: str):
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc), "written": written}), 404
         except (runner.FixedPdfBusy, OSError) as exc:
-            # The choices stay pending, so pressing Save again is all it takes.
+            # The choices stay pending, so pressing Save again is enough.
             return jsonify({"error": _busy_message(
                 job.workdir / runner.FIXED_DIRNAME / doc["filename"], exc),
                 "written": written}), 409

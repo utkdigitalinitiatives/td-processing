@@ -3,33 +3,10 @@ from pathlib import Path
 import shutil
 import fitz  # PyMuPDF
 
-# Finds pages whose table/figure was printed sideways and sets the page's
-# /Rotate so a viewer displays the page landscape with the content upright.
-#
-# This is a lossless change. /Rotate is one key in the page dictionary -- the
-# scanned image bytes are never re-rendered or re-compressed.
+# Sets /Rotate on pages whose table or figure was printed sideways, so a viewer
+# displays them upright. Lossless: /Rotate is one key in the page dictionary, and
+# the scanned image bytes are never re-rendered or re-compressed.
 
-# Report only (prints to console, changes nothing)
-# python fix_rotation.py "/path/to/pdfs" -r
-
-# Report and export review PDFs containing just the affected pages, rotated
-# python fix_rotation.py "/path/to/pdfs" -r -o "/path/to/review_folder"
-
-# Write corrected copies into an output folder, leaving the originals alone
-# python fix_rotation.py "/path/to/pdfs" -r --apply -o "/path/to/rotated"
-
-# Overwrite the originals (a .bak is written alongside each one first)
-# python fix_rotation.py "/path/to/pdfs" -r --in-place
-
-# Two things this deliberately does not do:
-#   * It does not repair the text layer. On scans whose OCR was rotation-blind
-#     the invisible text stays garbage, and after rotating it sits sideways
-#     relative to the image. Fixing that needs a re-OCR of those pages.
-#   * /Rotate is whole-page, so a page mixing upright body text with one
-#     sideways table cannot be fixed this way. Those normally classify as 0 and
-#     are left alone, which is the right outcome.
-#   * It does not flip upside-down pages on its own. A 180 that only the image
-#     classifier believes is always left for a human -- see decide_rotation().
 
 # PaddleOCR's document-orientation classifier. Already cached under
 # ~/.paddlex/official_models/ by the OCR script, so this costs no new download.
@@ -39,9 +16,8 @@ ORIENTATION_MODEL = "PP-LCNet_x1_0_doc_ori"
 # being read left-to-right; below it the line runs up or down the page.
 HORIZONTAL_DIR_CUTOFF = 0.7
 
-# Below this many text lines a page is "near-blank": the image classifier gets
-# unreliable there (it is what produced the only false positives seen in
-# testing), so such pages are sent to review rather than rotated.
+# Below this many text lines a page is "near-blank", where the image classifier
+# produced the only false positives seen in testing. Those pages go to review.
 MIN_LINES_FOR_CONFIDENCE = 5
 
 # Share of lines that must agree before the text layer alone is trusted.
@@ -55,8 +31,7 @@ NEIGHBOUR_VOTES = 2
 # How sure the model has to be before its disagreement overrules a rotation
 # that something else settled. Pages it simply cannot read -- a scatter of dots,
 # a dense block of figures -- come back disagreeing at around 0.6 to 0.7, while
-# a page genuinely left sideways comes back at 0.88 and up. Only the latter is
-# evidence; the former is the model declining to judge.
+# a page genuinely left sideways comes back at 0.88 and up.
 CONTRADICTION_SCORE = 0.80
 
 
@@ -64,8 +39,8 @@ def textlayer_rotation(page) -> tuple[int | None, int, int]:
     """Reads the /Rotate a page needs from its OCR text layer's line directions.
 
     Returns (rotation still needed, lines counted, rotation the raw text shows).
-    The last two differ once a page carries a /Rotate that already cancels the
-    raw direction, which is how an already-corrected page is recognised.
+    The first and last differ once a page carries a /Rotate cancelling the raw
+    direction, which is how an already-corrected page is recognised.
     """
     votes: dict[int, int] = {}
 
@@ -92,8 +67,8 @@ def textlayer_rotation(page) -> tuple[int | None, int, int]:
         return None, total, 0
 
     if winner == 0:
-        # The text layer is already upright, so the page is either already rotated or
-        # it is a mixed page that cannot be fixed. Either way, do not report it
+        # Upright raw text means the page is already rotated, or is mixed and
+        # beyond a whole-page turn. Either way, report nothing.
         return None, total, 0
 
     return (winner - page.rotation) % 360, total, winner
@@ -128,11 +103,10 @@ def classify_at(page, classifier, extra_rotation: int, dpi: int = 100) -> tuple[
 def image_rotation(page, classifier, dpi: int = 100) -> tuple[int, float, bool]:
     """Asks the orientation model what /Rotate a page needs, then checks its work.
 
-    Returns (rotation, score, verified). The model is good at spotting that a
-    page is sideways but can pick the wrong way round, landing 180 degrees out,
-    so its answer is only trusted once the page turned that far reads back as
-    upright. Where the re-read says it is exactly 180 out, that is a usable
-    answer in itself and the correction is tried and re-checked in turn.
+    Returns (rotation, score, verified). The model spots that a page is sideways
+    but can pick the wrong way round, so its answer is trusted only once the page
+    turned that far reads back as upright. A re-read saying it is exactly 180 out
+    is itself usable, so that correction is tried and re-checked in turn.
     """
     rotation, score = classify_at(page, classifier, 0, dpi=dpi)
     if rotation == 0:
@@ -162,11 +136,9 @@ def decide_rotation(
     min_score: float = 0.70,
 ) -> tuple[int, str, str]:
     """Weighs the two detectors against each other and returns (rotation, confidence, why)."""
-    # The two detectors are not equally strong, and the asymmetry matters:
-    # vertical text is measured geometry that nothing produces by accident,
-    # while horizontal text proves little, because OCR that was blind to
-    # rotation reads a sideways table as horizontal garbage. So a vertical text
-    # layer outranks the image classifier, and a horizontal one does not.
+    # Vertical text is measured geometry nothing produces by accident; horizontal
+    # text proves little, since rotation-blind OCR reads a sideways table as
+    # horizontal garbage. So a vertical text layer outranks the image classifier.
     if tl_rotation:
         if tl_rotation == img_rotation:
             # Corroboration beats either detector's own score
@@ -174,7 +146,6 @@ def decide_rotation(
         if tl_rotation == 180:
             return 180, "review", "only the text layer says 180"
         return tl_rotation, "high", "text layer majority"
-
 
     if tl_rotation == 0 and tl_raw:
         return 0, "clean", "already rotated, text layer agrees"
@@ -187,11 +158,10 @@ def decide_rotation(
     if line_count < MIN_LINES_FOR_CONFIDENCE:
         return img_rotation, "review", f"image only, near-blank page, score {score:.2f}"
 
-    # The page did not read as upright once turned this far, so the model has
-    # spotted that it is sideways without settling which way round
+    # Sideways, but the model never settled which way round.
     if not img_verified:
         return img_rotation, "review", f"image unsure which way round, score {score:.2f}"
- 
+
     if img_rotation == 180:
         return 180, "review", f"image only, 180 needs a human, score {score:.2f}"
 
@@ -204,11 +174,10 @@ def decide_rotation(
 def demote_by_neighbours(decisions: list[dict]):
     """Drops pages whose neighbours proved the text layer unreliable there.
 
-    Where OCR wrote bad direction vectors it did so across a stretch of pages,
-    not one, so a page kept only by the text layer while its neighbours were
-    caught reading sideways is almost certainly the same corruption -- just
-    with too little on it for the model to say so outright. Those pages are the
-    ones no single signal can settle, so the run settles them.
+    Bad OCR direction vectors come in stretches, not single pages. A page kept
+    only by the text layer while its neighbours were caught reading sideways is
+    almost certainly the same corruption, with too little on it for the model to
+    say so outright -- so the run settles what no single signal can.
     """
     caught = {d["page"] for d in decisions if d.get("contradicted")}
     if not caught:
@@ -217,9 +186,8 @@ def demote_by_neighbours(decisions: list[dict]):
     for d in decisions:
         if d["confidence"] not in ("high", "medium") or not d["rotation"]:
             continue
-        # A page the image independently backed is standing on its own evidence,
-        # not on the text layer, so a bad patch of direction vectors says
-        # nothing about it.
+        # A page the image independently backed stands on its own evidence, so a
+        # bad patch of direction vectors says nothing about it.
         if d.get("img_agreed"):
             continue
         near = sum(
@@ -237,15 +205,12 @@ def promote_by_neighbours(decisions: list[dict]):
     """Settles uncertain pages that sit inside a run of confident ones, in place.
 
     Sideways material arrives in runs -- an appendix of computer output, a block
-    of wide tables -- and the model reads those pages worst, because a sparse
-    monospace listing lacks the dense line texture it was trained on. Scores
-    dip below the bar on scattered pages in the middle of a run its neighbours
-    were confident about. A page surrounded by confident pages all turning the
-    same way is that same run, so the neighbours settle it.
+    of wide tables -- and the model reads those worst, because a sparse monospace
+    listing lacks the dense line texture it was trained on. A page surrounded by
+    confident pages all turning the same way belongs to that run.
 
-    Only pages already believed sideways are eligible, and only in the
-    direction the neighbours agree on, so this widens what gets applied without
-    inventing a rotation for a page nothing else suspected.
+    Only pages already believed sideways are eligible, and only in the direction
+    the neighbours agree on, so nothing is invented for a page nothing suspected.
     """
     confident = {
         d["page"]: d["rotation"]
@@ -256,9 +221,8 @@ def promote_by_neighbours(decisions: list[dict]):
     for d in decisions:
         if d["confidence"] != "review" or not d["rotation"]:
             continue
-        # Neighbours settle a page nothing could read. They do not overrule the
-        # page itself having been read and found still sideways -- that is
-        # direct evidence about this page, and it wins.
+        # Neighbours settle a page nothing could read, but never overrule the page
+        # itself having been read and found still sideways.
         if d.get("contradicted"):
             continue
         votes = sum(
@@ -364,15 +328,15 @@ def find_and_fix_rotations(
             backup = pdf_path.with_suffix(pdf_path.suffix + ".bak")
             if not backup.exists():
                 shutil.copy2(pdf_path, backup)
-            # incremental=True appends the changed page dictionaries rather than
+            # incremental=True appends the changed page dictionaries instead of
             # rewriting the file, so the scan bytes are physically untouched.
             doc.save(pdf_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
             print(f"  -> Rotated in place ({backup.name} kept as backup)")
         else:
             output_dir.mkdir(parents=True, exist_ok=True)
             out_file = output_dir / pdf_path.name
-            # No garbage/deflate: only the page dictionary should differ from
-            # the original, which is the whole point of doing it this way.
+            # No garbage/deflate: only the page dictionary should differ from the
+            # original, which is the whole point of doing it this way.
             doc.save(out_file)
             print(f"  -> Wrote corrected copy to: {out_file.name}")
 
@@ -406,7 +370,6 @@ def scan_directory(
         print("--apply needs an output directory (-o). Refusing to guess one.")
         return
 
-    # Check for conflicting output directory
     if apply and out_path is not None:
         clashing = [p for p in pdf_files if p.parent.resolve() == out_path.resolve()]
         if clashing:
@@ -426,7 +389,7 @@ def scan_directory(
     print(f"Scanning {len(pdf_files)} PDF(s) for sideways pages...\n")
 
     for pdf in pdf_files:
-        # Avoid re-scanning our own review output if it lands in the same folder
+        # Avoid re-scanning our own review output if it lands in the same folder.
         if pdf.name.startswith("ROTATED_"):
             continue
 

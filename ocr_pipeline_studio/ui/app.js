@@ -5,7 +5,7 @@
  * paying for itself.
  *
  * The one external dependency is markdown-it, vendored into ui/vendor/. It is
- * never loaded from a CDN, because the whole app has to work with no internet
+ * never loaded from a CDN, because the whole app works with no internet
  * connection.
  */
 

@@ -1,6 +1,6 @@
-"""Marks pipeline/ as a package so ``from pipeline.runner import ...`` works.
+"""Marks pipeline/ as a package.
 
-Deliberately empty of logic: the two original scripts live in this package and
-importing them has side effects (PaddleOCR init, dotenv loading), so this file
-must never import them at package-import time.
+Deliberately empty: the original scripts live here and importing them has side
+effects (PaddleOCR init, dotenv loading), so this file must never pull them in
+at package-import time.
 """
