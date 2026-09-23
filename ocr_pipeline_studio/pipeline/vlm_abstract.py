@@ -38,11 +38,19 @@ from dotenv import load_dotenv
 
 VALID_ABSTRACT_HEADINGS = ["ABSTRACT", "INTRODUCTION", "INTRO", "PURPOSE", "PREFACE", "SUMMARY"]  # Add more allowed headings here
 
-# Force CPU-only behavior before any Paddle/PaddleOCR imports.
-# This prevents CUDA probing on machines with GPU-linked Paddle builds.
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["FLAGS_selected_gpus"] = ""
-os.environ["PADDLE_DEVICE"] = "cpu"
+# CPU or GPU, decided before any Paddle/PaddleOCR import, since hiding the
+# GPU has to happen before Paddle probes for one.
+#
+# CPU is the default and the tested path: it needs no CUDA build, and it
+# cannot collide with the Ollama model that the VLM phase loads onto the GPU
+# (the collision the deferred VLM phase exists to avoid). Set OCR_USE_GPU=1
+# to run the OCR models on the GPU instead -- only useful with a CUDA build
+# of paddlepaddle installed.
+USE_GPU = os.environ.get("OCR_USE_GPU", "").strip().lower() in ("1", "true", "yes")
+if not USE_GPU:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["FLAGS_selected_gpus"] = ""
+    os.environ["PADDLE_DEVICE"] = "cpu"
 # Prefer legacy/non-PIR execution paths to avoid ConvertPirAttr issues
 # seen with mismatched Paddle/PaddleOCR builds.
 os.environ.setdefault("FLAGS_enable_pir_api", "0")
@@ -86,7 +94,7 @@ def init_paddle_ocr() -> PaddleOCR:
     """Initialize PaddleOCR in CPU-only compatibility mode."""
     global paddle_ocr
 
-    print("Initializing PaddleOCR (CPU mode) ...")
+    print("Initializing PaddleOCR (%s mode) ..." % ("GPU" if USE_GPU else "CPU"))
     
     desired_kwargs = {
         'lang': 'en',
@@ -115,13 +123,21 @@ def init_paddle_ocr() -> PaddleOCR:
 
     filtered_kwargs, unsupported = filter_supported_paddle_kwargs(desired_kwargs)
 
-    # Explicitly set backend device to CPU before creating OCR instance.
+    # Pick the backend device before creating the OCR instance. A GPU that
+    # cannot actually be used falls back to the CPU rather than failing the
+    # run -- a slow batch beats no batch.
     try:
         import paddle
-        paddle.set_device('cpu')
-        print("  Paddle device forced to CPU")
+        if USE_GPU and paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count():
+            paddle.set_device('gpu')
+            print("  Paddle device set to GPU")
+        else:
+            if USE_GPU:
+                print("  OCR_USE_GPU set, but this Paddle build has no usable GPU - using CPU")
+            paddle.set_device('cpu')
+            print("  Paddle device forced to CPU")
     except Exception as e:
-        print(f"  Could not force CPU device explicitly: {e}")
+        print(f"  Could not set the Paddle device explicitly: {e}")
 
     # Initialize PaddleOCR with compatible arguments only
     try:
