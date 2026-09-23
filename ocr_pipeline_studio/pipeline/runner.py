@@ -1,9 +1,9 @@
-"""Thin adapters around the original scripts in ``source_scripts/``.
+"""Thin adapters around the original OCR scripts.
 
-Nothing here reimplements them. The copies beside this module
-(``pipeline/dedupe.py``, ``pipeline/fix_rotation.py``, ``pipeline/vlm_abstract.py``)
-are byte-for-byte the originals; this module only calls them and reshapes
-their output for a background thread and a JSON API.
+Nothing here reimplements them. The scripts beside this module (``dedupe.py``,
+``fix_rotation.py``, ``vlm_abstract.py``) are the originals with their logic
+untouched; this module only calls them and reshapes their output for a
+background thread and a JSON API.
 
 dedupe.py and fix_rotation.py are called in-process: their core functions
 already return plain Python lists.

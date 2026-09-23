@@ -49,15 +49,14 @@ app.py                Entry point — Flask on a background thread, pywebview on
 server/               The local API: create_app(), job tracking, routes
 pipeline/             Vendored copies of the original scripts: dedupe, fix_rotation, vlm_abstract
 pipeline/runner.py    Adapter layer — calls those scripts, reshapes their output
-source_scripts/       The same originals, as handed over
 ui/                   The single page the whole app lives in
 workdir/              One folder per run (gitignored — see below)
 ```
 
-`pipeline/vlm_abstract.py`, `source_scripts/abstract_ocr_paddle_cuda.py` and
+`pipeline/vlm_abstract.py` and
 [`../auto_abstract/abstract_ocr_paddle_cuda.py`](../auto_abstract/abstract_ocr_paddle_cuda.py)
 are the same file, byte for byte — the app vendors the script it drives rather
-than importing it across the repository. Change one, change all three.
+than importing it across the repository. Change one, change the other.
 
 ## About the data
 
