@@ -20,7 +20,17 @@ root) and run:
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 ```
+
+The second command installs the OCR runtime, which `requirements.txt` cannot:
+PyPI carries no `paddlepaddle-gpu` newer than 2.6.2, so it comes from
+Paddle's own index. Despite the name, **the app still runs OCR on the CPU** --
+it hides the GPU unless you set `OCR_USE_GPU=1`. This build is used because
+it is several times faster at the same work: on a 50-thesis batch, the whole
+run went from 1h16m to 43m, and OCR alone from 12m51s to 3m52s, with the same
+text out. It adds roughly 2.5 GB of bundled CUDA libraries; if disk matters
+more than time, `pip install paddlepaddle==3.0.0` works and is slower.
 
 (Already have `.venv`? Just run the activate line.) If PowerShell refuses to
 run `Activate.ps1` over execution policy, run this once and try again:
@@ -233,7 +243,13 @@ heading in the first 15 pages. It looks for `ABSTRACT`, `INTRODUCTION`,
 pipeline log on the Run screen to see what it found.
 
 **Installing takes forever / fails on `paddlepaddle`** — confirm you are in
-the 3.11 venv: `python --version` should say 3.11.x.
+the 3.11 venv: `python --version` should say 3.11.x. The runtime download is
+about 2.5 GB, so the second install command is slow the first time.
+
+**No NVIDIA card in the machine** — that is fine: the app hides the GPU and
+runs OCR on the CPU regardless. If the CUDA build will not install or import
+there, use `pip install paddlepaddle==3.0.0` instead; everything works, just
+several times slower.
 
 **Every page reports "0 text segments found" and no document appears** —
 something upgraded the OCR packages past the pinned versions. Newer
@@ -244,7 +260,9 @@ Reinstall the pinned set:
 
 ```powershell
 pip install -r requirements.txt --force-reinstall
+pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/ --force-reinstall
 ```
 
-The three `paddle*` pins in `requirements.txt` are exact for this reason. Do
-not loosen them without running a real document through end to end afterwards.
+The `paddle*` versions are exact for this reason -- the two in
+`requirements.txt` and the runtime version in the command above. Do not
+loosen them without running a real document through end to end afterwards.
