@@ -53,10 +53,19 @@ ui/                   The single page the whole app lives in
 workdir/              One folder per run (gitignored — see below)
 ```
 
-`pipeline/vlm_abstract.py` and
+`pipeline/vlm_abstract.py` started as a byte-for-byte copy of
 [`../auto_abstract/abstract_ocr_paddle_cuda.py`](../auto_abstract/abstract_ocr_paddle_cuda.py)
-are the same file, byte for byte — the app vendors the script it drives rather
-than importing it across the repository. Change one, change the other.
+— the app vendors the script it drives rather than importing it across the
+repository — but **the two have deliberately diverged.** The app's copy
+carries the speed work: one long-lived OCR worker per batch instead of a
+process per page, a cap on the image the text detector sees, and page images
+cropped to their text before they go to the vision model. On a 50-thesis
+batch that is 43m against 1h16m. `auto_abstract/` is unchanged and slower.
+
+So do **not** re-sync them by copying either over the other; that would undo
+the speed work or drag it somewhere it has not been tested. A fix that
+belongs in both — anything about how the abstract itself is found or
+written — has to be applied to each.
 
 ## About the data
 
