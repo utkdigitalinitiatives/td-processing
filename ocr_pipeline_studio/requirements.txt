@@ -18,24 +18,8 @@ rapidfuzz>=3.0             # fuzzy text ratio used for duplicate-page detection
 # nothing -- see the troubleshooting section of INSTRUCTIONS.md.
 paddleocr==3.2.0           # the OCR engine itself
 paddlex==3.2.1             # paddleocr's pipeline backend; must match paddleocr
-# The inference runtime differs by platform, so only macOS's belongs here.
-#
-# macOS: this line. There is no CUDA build for macOS at any version, and
-# paddlepaddle publishes macOS wheels (Intel and Apple Silicon) for 3.11.
-paddlepaddle==3.0.0; sys_platform == "darwin"
-#
-# Windows and Linux: one more command, in INSTRUCTIONS.md --
-#
-#   pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-#
-# It cannot go here: PyPI carries no paddlepaddle-gpu past 2.6.2, so it comes
-# from Paddle's own index, and naming that index in this file would apply it
-# to every package listed. Despite the name the app still runs the models on
-# the CPU -- it hides the GPU unless OCR_USE_GPU=1 -- and is installed for its
-# speed alone: on a 50-thesis batch the whole run went from 1h16m to 43m and
-# OCR alone from 12m51s to 3m52s, with the GPU never touched. The plain
-# `paddlepaddle==3.0.0` works there too, needs ~2.5 GB less disk, and is
-# several times slower.
+paddlepaddle==3.0.0; sys_platform == "darwin"   # macOS: no CUDA build exists
+# Windows/Linux install the faster CUDA build separately -- see INSTRUCTIONS.md
 numpy>=1.24,<2.0           # paddle is built against the 1.x ABI; 2.x can break it
 Pillow>=10.0               # decodes the rendered page images before OCR
 tqdm>=4.66                 # imported at module scope by the OCR script

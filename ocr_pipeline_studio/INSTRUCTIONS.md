@@ -31,17 +31,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-That fourth command on Windows and Linux installs the OCR runtime, which
-`requirements.txt` cannot: PyPI carries no `paddlepaddle-gpu` newer than
-2.6.2, so it comes from Paddle's own index. Despite the name, **the app still
-runs OCR on the CPU** -- it hides the GPU unless you set `OCR_USE_GPU=1`. It
-is installed for its speed alone: on a 50-thesis batch the whole run went from
-1h16m to 43m, and OCR alone from 12m51s to 3m52s, with the same text out. It
-adds roughly 2.5 GB of bundled CUDA libraries; if disk matters more than time,
-`pip install paddlepaddle==3.0.0` works there too and is several times slower.
-
-macOS has no CUDA build at any version, so Macs get the plain
-`paddlepaddle==3.0.0` wheel, which `requirements.txt` installs for them.
+The fourth command is the OCR runtime, which PyPI does not carry past 2.6.2,
+so it comes from Paddle's own index. Despite the name it still runs on the
+CPU — the app hides the GPU unless `OCR_USE_GPU=1` — and is used because it is
+several times faster at the same work: a 50-thesis batch ran in 43m instead of
+1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.0.0` also works and is
+slower. macOS has no CUDA build, so `requirements.txt` installs that plain
+wheel there.
 
 (Already have `.venv`? Just run the activate line.) If PowerShell refuses to
 run `Activate.ps1` over execution policy, run this once and try again:
@@ -254,13 +250,12 @@ heading in the first 15 pages. It looks for `ABSTRACT`, `INTRODUCTION`,
 pipeline log on the Run screen to see what it found.
 
 **Installing takes forever / fails on `paddlepaddle`** — confirm you are in
-the 3.11 venv: `python --version` should say 3.11.x. The runtime download is
-about 2.5 GB, so the second install command is slow the first time.
+the 3.11 venv: `python --version` should say 3.11.x. The runtime is ~2.5 GB,
+so that command is slow the first time.
 
-**No NVIDIA card in the machine** — that is fine: the app hides the GPU and
-runs OCR on the CPU regardless. If the CUDA build will not install or import
-there, use `pip install paddlepaddle==3.0.0` instead; everything works, just
-several times slower. On macOS that is what `requirements.txt` already does.
+**No NVIDIA card in the machine** — fine: the app hides the GPU and runs on
+the CPU regardless. If the CUDA build will not install there, use
+`pip install paddlepaddle==3.0.0`; slower, but everything works.
 
 **Every page reports "0 text segments found" and no document appears** —
 something upgraded the OCR packages past the pinned versions. Newer
@@ -274,6 +269,6 @@ pip install -r requirements.txt --force-reinstall
 pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/ --force-reinstall
 ```
 
-The `paddle*` versions are exact for this reason -- the two in
-`requirements.txt` and the runtime version in the command above. Do not
-loosen them without running a real document through end to end afterwards.
+The `paddle*` versions are exact for this reason — the two in
+`requirements.txt` and the runtime above. Do not loosen them without running
+a real document through end to end afterwards.

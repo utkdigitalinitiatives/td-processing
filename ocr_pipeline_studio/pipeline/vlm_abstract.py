@@ -38,14 +38,9 @@ from dotenv import load_dotenv
 
 VALID_ABSTRACT_HEADINGS = ["ABSTRACT", "INTRODUCTION", "INTRO", "PURPOSE", "PREFACE", "SUMMARY"]  # Add more allowed headings here
 
-# CPU or GPU, decided before any Paddle/PaddleOCR import, since hiding the
-# GPU has to happen before Paddle probes for one.
-#
-# CPU is the default and the tested path: it needs no CUDA build, and it
-# cannot collide with the Ollama model that the VLM phase loads onto the GPU
-# (the collision the deferred VLM phase exists to avoid). Set OCR_USE_GPU=1
-# to run the OCR models on the GPU instead -- only useful with a CUDA build
-# of paddlepaddle installed.
+# Decided before any Paddle import: hiding the GPU has to happen before Paddle
+# probes for one. CPU by default -- it cannot collide with the Ollama model the
+# VLM phase loads onto the GPU.
 USE_GPU = os.environ.get("OCR_USE_GPU", "").strip().lower() in ("1", "true", "yes")
 if not USE_GPU:
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -109,23 +104,16 @@ def init_paddle_ocr() -> PaddleOCR:
         'text_det_thresh': 0.3,
         'text_det_box_thresh': 0.5,
         'text_det_unclip_ratio': 1.5,
-        # Cap the image the text *detector* works on. Pages are rendered at
-        # 350 dpi (~3900 x 2800 px) and the server detection model otherwise
-        # takes that at full size, which needs gigabytes of RAM: on a machine
-        # short of memory PaddleOCR then crashes or silently returns nothing,
-        # and every page comes out blank. Detection only has to find the text
-        # lines -- each line is still *read* from the full-resolution page --
-        # so capping it lost nothing measurable on test pages (98.5% word match
-        # against an uncapped run) and cut the read from a crash to ~6 s.
+        # Cap for the detector only; lines are still read from the full-
+        # resolution page. A 350 dpi page at full size needs gigabytes of RAM,
+        # and short of memory PaddleOCR crashes or returns every page blank.
         'text_det_limit_type': 'max',
         'text_det_limit_side_len': 2048,
     }
 
     filtered_kwargs, unsupported = filter_supported_paddle_kwargs(desired_kwargs)
 
-    # Pick the backend device before creating the OCR instance. A GPU that
-    # cannot actually be used falls back to the CPU rather than failing the
-    # run -- a slow batch beats no batch.
+    # A GPU that cannot be used falls back to the CPU rather than failing.
     try:
         import paddle
         if USE_GPU and paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count():
@@ -517,17 +505,15 @@ def run_ocr_page_worker(pdf_path: Path, page_index: int, dpi: int, confidence_th
     payload = [{"text": w.text, "conf": w.conf, "bbox": list(w.bbox)} for w in words]
     out_json.write_text(json.dumps(payload), encoding="utf-8")
 
-# A worker answers each request with this line once the page's JSON is
-# written, so the parent can tell "done" from PaddleOCR's own chatter.
+# Marks a request finished, so the parent can tell "done" from PaddleOCR's
+# own chatter on the same pipe.
 _OCR_WORKER_DONE = "@@OCR-WORKER-DONE@@"
 
 def run_ocr_worker_loop():
     """Child-process entry point: OCR pages on request until stdin closes.
 
-    One of these serves every page of a PDF. Starting a fresh process per
-    page cost ~15 s each time -- ~10 s importing PaddleOCR and ~5 s loading
-    its models -- before any reading happened. Crash isolation is unchanged:
-    a page that kills this process kills only this process, and the parent
+    One of these serves the whole batch, so PaddleOCR is imported and loaded
+    once rather than per page. A page that kills it kills only it: the parent
     starts a new one and retries that page (see ocr_page_isolated).
     """
     for line in sys.stdin:
@@ -539,8 +525,7 @@ def run_ocr_worker_loop():
             run_ocr_page_worker(Path(request["pdf"]), int(request["page"]), int(request["dpi"]),
                                 float(request["conf"]), Path(request["out_json"]))
         except Exception:
-            # No JSON written: the parent treats the page as failed and
-            # retries it in a fresh worker, as it would after a crash.
+            # No JSON written: the parent retries the page in a fresh worker.
             pass
         print(_OCR_WORKER_DONE, request["id"], flush=True)
 
@@ -572,9 +557,8 @@ def _ocr_worker_ask(pdf_path: Path, page_index: int, dpi: int, confidence_thresh
     global _ocr_worker, _ocr_worker_requests
     if _ocr_worker is None or _ocr_worker.poll() is not None:
         env = dict(os.environ)
-        # The worker prints PaddleOCR's own status lines (with symbols such as
-        # a check mark); on Windows a piped stdout would otherwise be cp1252
-        # and the first of those prints would kill the worker.
+        # PaddleOCR's status lines carry symbols a piped cp1252 stdout would
+        # choke on, killing the worker on its first print.
         env["PYTHONIOENCODING"] = "utf-8"
         _ocr_worker = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--ocr-worker"],
@@ -703,19 +687,17 @@ def _page_is_suspicious(segment_count: int, prior_counts: List[int], threshold: 
     return False
 
 # Ollama shrinks any page image for this model to about this many pixels
-# (~4,300 image tokens): a 300 dpi and a 200 dpi render both came to ~4,270.
-# So a full letter-size page is effectively seen at ~190 dpi, and anything
-# rendered above that is discarded before the model looks at it.
+# (~4,300 image tokens), so a letter page is seen at ~190 dpi however it is
+# rendered. Anything finer is discarded before the model looks at it.
 _VLM_MAX_PIXELS = 3_350_000
 
 def _vlm_text_block(page) -> Optional["fitz.Rect"]:
     """The part of a page that holds its text, padded, or None to use it all.
 
-    Found from a quick low-resolution render: rows and columns with a
-    meaningful amount of ink. A thin band at the very edge is ignored, since
-    scanned pages often carry a dark scanner edge there. Rotated pages and
-    anything unclear use the whole page -- a crop that cut off text would be
-    far worse than the time it saves.
+    Read off a low-resolution render: rows and columns carrying ink, ignoring
+    a thin band at the edge where scanners leave a dark border. Rotated pages
+    and anything unclear use the whole page, since a crop that cut off text
+    would cost more than it saves.
     """
     if page.rotation:
         return None
@@ -726,14 +708,12 @@ def _vlm_text_block(page) -> Optional["fitz.Rect"]:
     edge_y, edge_x = max(1, int(pix.height * 0.02)), max(1, int(pix.width * 0.02))
     ink[:edge_y, :] = ink[-edge_y:, :] = False
     ink[:, :edge_x] = ink[:, -edge_x:] = False
-    # Rows or columns that are almost solid dark are scanner bands or page
-    # edges, not text; they would stretch the crop to the whole page.
+    # Almost-solid rows and columns are scanner bands, not text.
     ink[ink.sum(axis=1) > pix.width * 0.9, :] = False
     ink[:, ink.sum(axis=0) > pix.height * 0.9] = False
     row_ink, col_ink = ink.sum(axis=1), ink.sum(axis=0)
-    # A speckled scan puts ink in every row, so text cannot be told from
-    # background reliably -- and a short last line mistaken for noise would
-    # be cut off. Those pages are sent whole, as before.
+    # A speckled scan has ink in every row, so a short last line could be
+    # mistaken for noise and cropped off. Send those whole.
     if np.median(row_ink) > pix.width * 0.02:
         return None
     rows = np.where(row_ink > max(2, pix.width * 0.002))[0]
@@ -744,8 +724,7 @@ def _vlm_text_block(page) -> Optional["fitz.Rect"]:
     pad_x, pad_y = page.rect.width * 0.03, page.rect.height * 0.03
     clip = fitz.Rect(cols[0] * scale - pad_x, rows[0] * scale - pad_y,
                      (cols[-1] + 1) * scale + pad_x, (rows[-1] + 1) * scale + pad_y) & page.rect
-    # Too small to be a text block (a stray mark), or so large that cropping
-    # gains nothing: send the whole page.
+    # A stray mark, or a crop too large to be worth it.
     if clip.width * clip.height < 0.15 * page.rect.width * page.rect.height:
         return None
     if clip.width * clip.height > 0.95 * page.rect.width * page.rect.height:
@@ -754,12 +733,11 @@ def _vlm_text_block(page) -> Optional["fitz.Rect"]:
 
 def _vlm_page_image(doc, page_index: int, dpi: int):
     """The page image sent to the VLM: its text block, at the resolution the
-    model would effectively have seen it at on the whole page.
+    model would have seen the whole page at.
 
-    Blank margins are a large share of a page, and every pixel costs the
-    model time to read (reading the image is most of a VLM call). Cropping
-    them at the same effective resolution keeps the text exactly as detailed
-    as before, with fewer image tokens. ``dpi`` stays the ceiling.
+    Reading the image is most of a VLM call, so dropping the blank margins
+    buys time while leaving the text as detailed as before. ``dpi`` is the
+    ceiling.
     """
     page = doc.load_page(page_index)
     clip = _vlm_text_block(page)
@@ -944,9 +922,8 @@ def _visible_len(text: str) -> int:
 # Greek-letter detector for the classify rule below -- reuses GREEK_MAP
 # rather than a second hardcoded list. Matches any valid representation:
 # glyph, HTML entity, bare name, or ASCII convention.
-# The micro sign (U+00B5) is the Greek letter mu as units are written ("µg",
-# "µM"); it lives in the math map, not GREEK_MAP, but must count as Greek
-# here or a VLM reading of "2.0µg/mg" for OCR's "2.Oug/mg" is never merged.
+# The micro sign (U+00B5) is mu as units write it ("µg"); it lives in the math
+# map, not GREEK_MAP, and must count here or "2.0µg/mg" is never merged.
 _GREEK_LETTER_CHARS = set(GREEK_MAP.keys()) | {"µ"}
 _GREEK_LETTER_NAMES = {name.strip("&;").lower() for name in GREEK_MAP.values() if name.startswith("&")}
 _GREEK_ASCII_VAR_RE = re.compile(r"^(" + "|".join(_GREEK_LETTER_NAMES) + r")_\w+$", re.IGNORECASE)
@@ -2179,8 +2156,7 @@ def load_overrides(path: Optional[Path]) -> dict:
 def main():
     import argparse
 
-    # Internal/hidden: a long-lived OCR worker serving one PDF's pages (see
-    # run_ocr_worker_loop).
+    # Internal/hidden: a long-lived OCR worker (see run_ocr_worker_loop).
     if "--ocr-worker" in sys.argv:
         run_ocr_worker_loop()
         return
@@ -2211,8 +2187,7 @@ def main():
     parser.add_argument("--single-pdf", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--isolate-pdfs", action="store_true",
                          help="Process each PDF in its own child process, as older versions did. "
-                              "Slower (every PDF re-imports PaddleOCR and starts its own OCR "
-                              "worker); only useful if a non-OCR crash is suspected.")
+                              "Slower; only useful if a non-OCR crash is suspected.")
     parser.add_argument("--vlm-review", action="store_true",
                          help="Opt-in: use a local Ollama vision model as a second-pass review for pages "
                               "that look suspicious (or all pages, with --vlm-review-mode always). Gracefully "
@@ -2280,13 +2255,10 @@ def main():
     print(f"Force single paragraph: {'yes' if args.force_single_paragraph else 'no'}")
     print(f"="*70)
 
-    # Process each PDF, retrying once if it fails. By default this happens in
-    # this process, so one OCR worker (see run_ocr_worker_loop) serves every
-    # page of every PDF: a child process per PDF used to cost ~25 s each --
-    # ~10 s re-importing PaddleOCR, ~15 s starting that PDF's own worker --
-    # before any reading. The crash-prone part, PaddleOCR's native code, is
-    # isolated in the worker either way; a Python error in one PDF is caught
-    # below and the batch carries on, as it did with a child per PDF.
+    # Each PDF is read in this process by default, so one OCR worker serves
+    # the whole batch instead of each PDF paying for its own. PaddleOCR's
+    # native code is isolated in that worker either way, and a Python error
+    # in one PDF is caught below so the batch carries on.
     failures = []
     for idx, pdf in enumerate(pdfs, 1):
         print(f"\n[{idx}/{len(pdfs)}] ", end="", flush=True)
