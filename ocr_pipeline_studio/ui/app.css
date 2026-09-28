@@ -161,9 +161,17 @@ select:disabled { background: #f1f3f6; color: var(--muted); }
 .sidebar {
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
   padding: 12px; position: sticky; top: 62px;
+  /* No taller than the window, so Save stays reachable however many documents
+     a batch holds -- the list below scrolls instead of the page. 78px is the
+     sticky offset plus .screen's padding. */
+  display: flex; flex-direction: column; max-height: calc(100vh - 78px);
 }
-.sidebar-head { display: flex; justify-content: space-between; align-items: baseline; }
-.doc-list { list-style: none; margin: 10px 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.sidebar-head { display: flex; justify-content: space-between; align-items: baseline; flex-shrink: 0; }
+.doc-list {
+  list-style: none; margin: 10px 0; padding: 0; display: flex; flex-direction: column; gap: 4px;
+  /* min-height: 0 is what lets this shrink far enough to scroll at all. */
+  overflow-y: auto; flex: 1 1 auto; min-height: 0; scrollbar-gutter: stable;
+}
 .doc-list button {
   width: 100%; text-align: left; font: inherit; cursor: pointer;
   background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
@@ -172,7 +180,8 @@ select:disabled { background: #f1f3f6; color: var(--muted); }
 .doc-list button.is-active { border-color: var(--accent); background: #f2f6fe; }
 .doc-list .doc-name { display: block; font-size: 13px; word-break: break-word; }
 .doc-list .doc-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
-.sidebar-actions { display: flex; gap: 6px; }
+.sidebar-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.sidebar #save-status { flex-shrink: 0; }
 .sidebar-actions button { flex: 1; }
 
 /* Flag chips -- one colour per real, script-produced reason. */
