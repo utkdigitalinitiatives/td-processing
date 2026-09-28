@@ -39,8 +39,15 @@ Requires **Python 3.11** — `paddlepaddle` publishes no 3.12/3.13 wheels — an
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 python app.py
 ```
+
+That fourth command is the OCR runtime, which PyPI does not carry past 2.6.2,
+so it comes from Paddle's own index; without it OCR has nothing to run on.
+Despite the name it still runs on the CPU, and it is several times faster than
+the plain `paddlepaddle==3.0.0` wheel. On **macOS** skip that line —
+`requirements.txt` installs the plain wheel there, since no CUDA build exists.
 
 ## Project structure
 

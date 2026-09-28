@@ -31,13 +31,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The fourth command is the OCR runtime, which PyPI does not carry past 2.6.2,
-so it comes from Paddle's own index. Despite the name it still runs on the
-CPU — the app hides the GPU unless `OCR_USE_GPU=1` — and is used because it is
-several times faster at the same work: a 50-thesis batch ran in 43m instead of
-1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.0.0` also works and is
-slower. macOS has no CUDA build, so `requirements.txt` installs that plain
-wheel there.
+The fourth command is the OCR runtime, and on Windows and Linux it is not
+optional: `requirements.txt` deliberately leaves paddle out there, so without
+it OCR has nothing to run on. PyPI does not carry it past 2.6.2, which is why
+it comes from Paddle's own index. Despite the name it still runs on the CPU —
+the app hides the GPU unless `OCR_USE_GPU=1` — and this build is the one used
+because it is several times faster at the same work: a 50-thesis batch ran in
+43m instead of 1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.0.0` is a
+working but slower substitute. macOS has no CUDA build, so `requirements.txt`
+installs that plain wheel there and there is no fourth command.
 
 (Already have `.venv`? Just run the activate line.) If PowerShell refuses to
 run `Activate.ps1` over execution policy, run this once and try again:
