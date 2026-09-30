@@ -1,0 +1,7 @@
+# launch.command keeps LF: a CRLF shebang makes macOS refuse to run the file
+# ("bad interpreter"), which is what a Windows clone copied to a Mac would get.
+*.command text eol=lf
+
+# Batch files keep CRLF, which cmd.exe parses reliably; bare LF misbehaves in
+# some constructs.
+*.cmd text eol=crlf

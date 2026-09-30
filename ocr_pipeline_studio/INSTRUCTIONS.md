@@ -1,20 +1,46 @@
 # Usage
-
 ## Setup
 
-Requires **Python 3.11** — `paddlepaddle` / `paddleocr` publish no 3.12/3.13
-wheels. Check with `py --list`; you want a line saying `-V:3.11`.
+Double-click **`create-shortcut.cmd`** in this folder. It puts an
+**OCR Pipeline Studio** icon on your Desktop, and that icon is the only thing
+you need from then on.
 
-Also requires [Ollama](https://ollama.com), running, with a vision model
-pulled. The app will not download models for you — a first pull can be several
-gigabytes, which is not something to start mid-job.
+Open it. The first time, it installs everything the app needs — Python 3.11 if
+you do not already have it, then the packages, then the OCR engine — in a
+window showing what it is doing. That downloads about 3 GB and takes 10 to 20
+minutes. Every launch after that opens the app straight away.
+
+If setup stops part way, nothing is broken and nothing already downloaded is
+lost: open the shortcut again and it carries on from where it stopped.
+
+On **macOS** there is no `.lnk`. Drag `launcher/launch.command` into the Dock,
+or right-click it and choose Make Alias to put one on the Desktop; the first run
+sets itself up the same way.
+
+`create-shortcut.cmd` is the only file here meant to be double-clicked. What it
+points at lives in **`launcher/`** and needs no attention: `launch.cmd` starts
+the app with the venv's own interpreter, handing off to `setup.cmd` when there
+is nothing installed yet.
+
+### The vision model
+
+The OCR/VLM comparison needs [Ollama](https://ollama.com) installed and
+running. Setup offers to pull the model for you if Ollama is there, and points
+you at the download if it is not — the app itself runs either way, and shows a
+banner telling you which.
 
 ```
 ollama pull qwen2.5vl:3b
 ```
 
-Open PowerShell in this folder (`ocr_pipeline_studio/`, not the repository
-root) and run:
+That pull is about 3 GB, so it is not something to start mid-job.
+
+## Doing it by hand
+
+Setup does the following; there is no need to do it yourself, but here it is
+for reference, or if you want to see where something failed. Open PowerShell in
+this folder (`ocr_pipeline_studio/`, **not** the repository root — that is the
+one mistake that produces a half-installed environment) and run:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -31,6 +57,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+**Python 3.11 exactly** — `paddlepaddle` / `paddleocr` publish no 3.12/3.13
+wheels. Check with `py --list`; you want a line saying `-V:3.11`.
+
 The fourth command is the OCR runtime, and on Windows and Linux it is not
 optional: `requirements.txt` deliberately leaves paddle out there, so without
 it OCR has nothing to run on. PyPI does not carry it past 2.6.2, which is why
@@ -38,11 +67,18 @@ it comes from Paddle's own index. Despite the name it still runs on the CPU —
 the app hides the GPU unless `OCR_USE_GPU=1` — and this build is the one used
 because it is several times faster at the same work: a 50-thesis batch ran in
 43m instead of 1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.0.0` is a
-working but slower substitute. macOS has no CUDA build, so `requirements.txt`
-installs that plain wheel there and there is no fourth command.
+working but slower substitute, and the one setup falls back to if that index
+cannot be reached. macOS has no CUDA build, so `requirements.txt` installs that
+plain wheel there and there is no fourth command.
 
-(Already have `.venv`? Just run the activate line.) If PowerShell refuses to
-run `Activate.ps1` over execution policy, run this once and try again:
+Doing it by hand leaves out one thing the shortcut relies on: the
+`.venv\.setup-complete` stamp file that `launcher/setup.cmd` writes when it
+finishes. Without it the shortcut treats the environment as unfinished and runs
+setup again, which is harmless — it finds everything installed, writes the stamp
+and carries on.
+
+If PowerShell refuses to run `Activate.ps1` over execution policy, run this
+once and try again:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
@@ -50,13 +86,18 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 ## Running it
 
-With the venv activated — `(.venv)` showing in your prompt:
+Double-click the Desktop shortcut, or from a terminal with the venv
+activated — `(.venv)` showing in your prompt:
 
 ```powershell
 python app.py
 ```
 
 A native window opens; close it to quit, and the server shuts down with it.
+
+Started from the shortcut there is no console window, so anything the app
+prints goes to **`workdir\launch.log`** instead. That is the first place to
+look if the icon seems to do nothing.
 
 **The first run is slower.** The first time OCR happens, PaddleOCR downloads
 its detection and recognition models into `C:\Users\<you>\.paddlex\` (a few

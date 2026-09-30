@@ -30,29 +30,30 @@ drives lives beside it in [`auto_abstract/`](../auto_abstract/).
 
 ## Quick start
 
-See **[INSTRUCTIONS.md](INSTRUCTIONS.md)** for setup and full usage.
+Double-click **`create-shortcut.cmd`**, then open the **OCR Pipeline Studio**
+icon it puts on your Desktop. The first run installs everything — Python 3.11
+if it is missing, the packages, and the OCR engine — in a window you can watch;
+about 3 GB and 10-20 minutes, once. After that the icon just opens the app.
 
-Requires **Python 3.11** — `paddlepaddle` publishes no 3.12/3.13 wheels — and
-[Ollama](https://ollama.com) running with `ollama pull qwen2.5vl:3b`.
+macOS: drag `launcher/launch.command` into the Dock and open it; the first run
+sets itself up the same way.
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-python app.py
-```
+The OCR/VLM comparison also wants [Ollama](https://ollama.com) with
+`ollama pull qwen2.5vl:3b`; setup offers to pull it, and the app runs without
+it either way.
 
-That fourth command is the OCR runtime, which PyPI does not carry past 2.6.2,
-so it comes from Paddle's own index; without it OCR has nothing to run on.
-Despite the name it still runs on the CPU, and it is several times faster than
-the plain `paddlepaddle==3.0.0` wheel. On **macOS** skip that line —
-`requirements.txt` installs the plain wheel there, since no CUDA build exists.
+To set up by hand instead, or to see exactly what setup does, see
+**[INSTRUCTIONS.md](INSTRUCTIONS.md)**.
 
 ## Project structure
 
 ```
 app.py                Entry point — Flask on a background thread, pywebview on the main one
+create-shortcut.cmd   Run once to put an OCR Pipeline Studio icon on the Desktop
+launcher/             What that icon runs; nothing in here needs opening by hand
+launcher/launch.cmd     Starts the app with the venv's own pythonw, no console
+launcher/setup.cmd      First-run install, called by launch.cmd when the venv is missing
+launcher/launch.command The macOS equivalent of both
 server/               The local API: create_app(), job tracking, routes
 pipeline/             Vendored copies of the original scripts: dedupe, fix_rotation, vlm_abstract
 pipeline/runner.py    Adapter layer — calls those scripts, reshapes their output
