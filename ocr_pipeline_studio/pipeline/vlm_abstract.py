@@ -52,6 +52,56 @@ os.environ.setdefault("FLAGS_enable_pir_api", "0")
 os.environ.setdefault("FLAGS_enable_pir_in_executor", "0")
 os.environ.setdefault("FLAGS_enable_new_ir_in_executor", "0")
 
+
+def _keep_child_consoles_hidden() -> None:
+    """Stop child processes flashing a black console window on screen.
+
+    Started from the desktop shortcut this script has no console of its own,
+    and Windows then hands a brand new console to every console program started
+    from here -- each one a black box appearing over whatever the user is doing.
+    Paddle runs `where ccache` on every import (find_ccache_home), so a batch
+    flashes at least one per page, and the console host is sometimes left
+    behind afterwards.
+
+    The offending calls are inside Paddle, so there is no argument to pass
+    them; the default for this process is changed instead. Also called before
+    the Paddle import below, since that import is itself one of the culprits.
+    """
+    if os.name != "nt":
+        return
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if not no_window:
+        return
+    # Having a console of our own means children share it and no new window
+    # appears, so running from a terminal is left exactly as it was.
+    import ctypes
+    try:
+        if ctypes.windll.kernel32.GetConsoleWindow() != 0:
+            return
+    except Exception:
+        return
+
+    # Flags that mean "give this child a console of its own"; OR-ing
+    # CREATE_NO_WINDOW alongside one of those is a contradiction Windows
+    # rejects, so such a call is left alone.
+    own_console = (getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                   | getattr(subprocess, "DETACHED_PROCESS", 0))
+    original_init = subprocess.Popen.__init__
+
+    def init_with_no_window(self, *args, **kwargs):
+        # creationflags is Popen's 14th argument; past that it was passed
+        # positionally and is not ours to touch.
+        if len(args) < 14:
+            flags = kwargs.get("creationflags", 0)
+            if not flags & own_console:
+                kwargs["creationflags"] = flags | no_window
+        original_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = init_with_no_window
+
+
+_keep_child_consoles_hidden()
+
 # Silence MuPDF's own warning/error output so tagged PDFs don't spam stderr
 try:
     fitz.TOOLS.mupdf_display_errors(False)

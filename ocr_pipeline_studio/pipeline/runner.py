@@ -128,6 +128,11 @@ def list_local_models(ollama_url: str = DEFAULT_OLLAMA_URL) -> dict:
             ["ollama", "list"],
             capture_output=True, text=True, timeout=15,
             encoding="utf-8", errors="replace",
+            # A console program run from a windowless parent gets a console of
+            # its own, piped streams or not, so from the desktop shortcut this
+            # flashes a black box on the screen. Guarded because the flag is
+            # Windows-only.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if proc.returncode == 0:
             models = []
