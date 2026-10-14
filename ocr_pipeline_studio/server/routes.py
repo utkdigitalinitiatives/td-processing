@@ -60,6 +60,9 @@ def models():
         "models": listing["models"],
         "source": listing["source"],
         "error": listing["error"],
+        # Served rather than written into the page, so the two cannot drift and
+        # the page refuse a batch the server would have taken, or vice versa.
+        "max_upload_bytes": current_app.config["MAX_CONTENT_LENGTH"],
         "default_model": runner.DEFAULT_VLM_MODEL,
         "modes": [
             {"id": key, "label": value["label"], "help": value["help"]}

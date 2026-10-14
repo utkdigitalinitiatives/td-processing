@@ -36,8 +36,20 @@ def create_app(project_root: Optional[Path] = None) -> Flask:
     app.config["WORKDIR"] = root / "workdir"
     app.config["OLLAMA_URL"] = OLLAMA_URL
 
-    # A scanned thesis can be large; Flask's default limit would reject one.
-    app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # 512 MB
+    # The UI posts a whole batch in one request, so this is the limit on a run,
+    # not on one thesis: at the 13-15 MB these scans run to, 2 GB is about 150
+    # of them.
+    #
+    # It is a disk limit rather than a memory one. Werkzeug hands each file
+    # part to a SpooledTemporaryFile that spills to %TEMP% past 500 KB, so a
+    # batch this size costs kilobytes of memory, not gigabytes -- but it is
+    # written to disk about three times over before a run settles (the temp
+    # spool, then uploads/, then the corrected copy in fixed/). Raise it from
+    # free disk space, not from how much memory seems safe.
+    #
+    # Flask's own MAX_FORM_PARTS, left at its default, separately caps a batch
+    # at a little under 1000 files however small they are.
+    app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024  # 2 GB
 
     app.config["WORKDIR"].mkdir(parents=True, exist_ok=True)
 
@@ -57,6 +69,15 @@ def create_app(project_root: Optional[Path] = None) -> Flask:
         from werkzeug.exceptions import HTTPException
 
         if isinstance(exc, HTTPException):
+            if exc.code == 413:
+                # Werkzeug's own wording for this is about request entities and
+                # says nothing about what to do. The page checks the batch size
+                # before uploading, so reaching here means something bypassed
+                # it -- a stale page, or a call made directly.
+                return jsonify({"error":
+                                "That batch is too large for one run (the limit is "
+                                "%d GB). Run it in two halves."
+                                % (app.config["MAX_CONTENT_LENGTH"] // (1024 ** 3))}), 413
             return jsonify({"error": exc.description}), exc.code
         app.logger.exception(exc)
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500

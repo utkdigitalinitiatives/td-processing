@@ -21,6 +21,7 @@
 
   var state = {
     pending: [],        // {file, pages} staged in the drop zone
+    maxUploadBytes: 0,  // the server's limit on one batch, from /models
     jobId: null,
     fixesOnly: false,   // whether the job on screen was a page-fixes-only run
     openedFolder: null, // set when the run on screen was opened from a folder
@@ -103,6 +104,9 @@
         modeSelect.appendChild(option);
       });
       updateModeHelp();
+      // The server owns this number; startRun() checks a batch against it
+      // before uploading.
+      state.maxUploadBytes = data.max_upload_bytes || 0;
       return data;
     });
   }
@@ -258,6 +262,14 @@
     return "Check the abstract pages for " + names.join(", ") + " - use a form like 5-8 or 5.";
   }
 
+  // Sizes here are always hundreds of megabytes or more, so GB reads better
+  // than switching units. The limit is passed 0 decimals because it is a round
+  // number: without that, a batch barely over it reads "2.0 GB, over the
+  // 2.0 GB limit".
+  function gigabytes(bytes, decimals) {
+    return (bytes / (1024 * 1024 * 1024)).toFixed(decimals === undefined ? 1 : decimals) + " GB";
+  }
+
   function startRun() {
     var fixesOnly = isFixesOnly();
     var overrides = {};
@@ -270,6 +282,22 @@
     if (bad.length) {
       showRunError(badPagesMessage(bad));
       return;
+    }
+
+    // Checked here rather than left to the server: the whole batch goes up in
+    // one request, so finding out afterwards means waiting for gigabytes to
+    // upload only to be turned away.
+    if (state.maxUploadBytes) {
+      var total = state.pending.reduce(function (sum, entry) {
+        return sum + entry.file.size;
+      }, 0);
+      if (total > state.maxUploadBytes) {
+        showRunError(
+          "This batch is " + gigabytes(total) + ", over the " +
+          gigabytes(state.maxUploadBytes, 0) + " limit for one run. Run it in two " +
+          "halves - the second can be added once the first is saved.");
+        return;
+      }
     }
 
     var form = new FormData();
