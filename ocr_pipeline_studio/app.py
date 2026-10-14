@@ -8,6 +8,7 @@ of leaving a server running with no window attached.
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import threading
@@ -79,8 +80,16 @@ IS_ONLY_INSTANCE = claim_single_instance()
 # nothing. Opened "w" -- the last launch is what anyone needs, and the file
 # cannot grow without bound -- which is only safe because a second copy has
 # already bowed out above without reaching this line.
+#
+# Kept on this PC beside the venv (see launcher/launch.cmd), not in workdir/:
+# the project folder may be a share several PCs run from, and each launch
+# would wipe the log of whichever PC started before it.
 if IS_ONLY_INSTANCE and (sys.stdout is None or sys.stderr is None):
-    _log_path = PROJECT_ROOT / "workdir" / "launch.log"
+    _local = os.environ.get("LOCALAPPDATA")
+    if _local:
+        _log_path = Path(_local) / "OCR Pipeline Studio" / "launch.log"
+    else:
+        _log_path = PROJECT_ROOT / "workdir" / "launch.log"
     _log_path.parent.mkdir(parents=True, exist_ok=True)
     sys.stdout = sys.stderr = open(_log_path, "w", encoding="utf-8",
                                    errors="replace", buffering=1)

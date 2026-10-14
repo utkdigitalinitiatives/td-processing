@@ -6,14 +6,24 @@ rem
 rem There is no "activate" step: activating a venv only puts its Scripts folder
 rem on PATH, so calling the venv's own pythonw.exe is the same thing. pythonw
 rem rather than python because it has no console window attached -- output goes
-rem to workdir\launch.log instead, see app.py.
+rem to launch.log in LOCAL instead, see app.py.
+rem
+rem The venv lives in LOCAL, on this PC, not in the project folder: the folder
+rem may be a network share opened by several PCs, and a venv only runs on the
+rem PC that built it -- anywhere else pythonw fails without a word. Code and
+rem workdir\ stay shared; each PC sets up its own environment once.
 rem
 rem Nothing installed yet? setup.cmd is run instead, so the desktop shortcut is
 rem the only thing anyone has to touch.
 
 set "ROOT=%~dp0.."
-set "PY=%ROOT%\.venv\Scripts\pythonw.exe"
-set "STAMP=%ROOT%\.venv\.setup-complete"
+set "LOCAL=%LOCALAPPDATA%\OCR Pipeline Studio"
+set "PY=%LOCAL%\.venv\Scripts\pythonw.exe"
+set "STAMP=%LOCAL%\.venv\.setup-complete"
+
+rem Bytecode caches go to this PC too, rather than every PC writing its own
+rem __pycache__ into the shared folder.
+set "PYTHONPYCACHEPREFIX=%LOCAL%\pycache"
 
 if not exist "%PY%" goto :setup
 

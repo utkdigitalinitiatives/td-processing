@@ -11,9 +11,15 @@ rem blank echoes, and this file has to work on someone else's machine first try.
 setlocal
 rem This file lives in launcher\; everything it acts on is one level up.
 set "ROOT=%~dp0.."
-cd /d "%ROOT%"
+rem pushd rather than cd: the project may be on a network share, and cd
+rem refuses a \\server\share path where pushd maps it to a drive letter.
+pushd "%ROOT%"
 
-set "VENV=%ROOT%\.venv"
+rem The venv is per PC, not in the project folder -- see launch.cmd.
+set "LOCAL=%LOCALAPPDATA%\OCR Pipeline Studio"
+if not exist "%LOCAL%" mkdir "%LOCAL%"
+set "PYTHONPYCACHEPREFIX=%LOCAL%\pycache"
+set "VENV=%LOCAL%\.venv"
 set "VPY=%VENV%\Scripts\python.exe"
 set "STAMP=%VENV%\.setup-complete"
 set "PADDLE_INDEX=https://www.paddlepaddle.org.cn/packages/stable/cu126/"
@@ -32,10 +38,12 @@ echo You only have to do this once. Afterwards the Desktop shortcut
 echo opens the app straight away.
 echo.
 
-if not exist "%ROOT%\..\.venv\Scripts\python.exe" goto :nostray
-echo Note: there is also a .venv outside this project folder - a leftover
-echo from setup having been run in the wrong place. It is several gigabytes
-echo and you can delete it. This setup does not use it.
+if not exist "%ROOT%\.venv\Scripts\python.exe" goto :nostray
+echo Note: there is an old .venv inside the project folder, from before
+echo setup moved to this PC's own storage. It is several gigabytes, no
+echo longer used, and can be deleted once no one is still running the app
+echo from it:
+echo     %ROOT%\.venv
 echo.
 :nostray
 
@@ -157,6 +165,8 @@ start "" "%VENV%\Scripts\pythonw.exe" "%ROOT%\app.py"
 rem A breather so this window is not gone before the app's own window shows.
 rem ping rather than timeout: timeout fails outright when stdin is redirected.
 ping -n 4 127.0.0.1 >nul
+rem Releases the drive letter pushd may have mapped for a network share.
+popd
 exit /b 0
 
 rem ===============================================================
@@ -220,4 +230,5 @@ echo  shortcut again retries from where it stopped.
 echo ------------------------------------------------------------
 echo.
 pause
+popd
 exit /b 1

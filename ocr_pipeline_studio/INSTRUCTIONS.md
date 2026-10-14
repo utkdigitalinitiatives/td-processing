@@ -71,11 +71,12 @@ working but slower substitute, and the one setup falls back to if that index
 cannot be reached. macOS has no CUDA build, so `requirements.txt` installs that
 plain wheel there and there is no fourth command.
 
-Doing it by hand leaves out one thing the shortcut relies on: the
-`.venv\.setup-complete` stamp file that `launcher/setup.cmd` writes when it
-finishes. Without it the shortcut treats the environment as unfinished and runs
-setup again, which is harmless — it finds everything installed, writes the stamp
-and carries on.
+A venv made by hand is for running from a terminal only: the shortcut does not
+use it. The shortcut keeps its own environment on each PC, in
+`%LOCALAPPDATA%\OCR Pipeline Studio\.venv`, so that the project folder can sit
+on a network share — see "Running from a shared folder" below. It treats that
+environment as finished only once `launcher/setup.cmd` has written the
+`.setup-complete` stamp into it.
 
 If PowerShell refuses to run `Activate.ps1` over execution policy, run this
 once and try again:
@@ -96,8 +97,28 @@ python app.py
 A native window opens; close it to quit, and the server shuts down with it.
 
 Started from the shortcut there is no console window, so anything the app
-prints goes to **`workdir\launch.log`** instead. That is the first place to
+prints goes to **`%LOCALAPPDATA%\OCR Pipeline Studio\launch.log`** instead —
+paste that into Explorer's address bar to open it. That is the first place to
 look if the icon seems to do nothing.
+
+### Running from a shared folder
+
+The project folder can live on a network share that several PCs open. Code
+and `workdir/` are shared, so every PC sees the same runs; the Python
+environment is not, because a venv only works on the PC that built it. On each
+PC:
+
+1. Open the shared folder and double-click `create-shortcut.cmd`.
+2. Double-click the new Desktop shortcut. The first time on each PC this runs
+   setup (10-20 minutes); after that it opens the app straight away.
+
+On a Mac, open `launcher/launch.command` from the share instead; its
+environment goes in `~/Library/Application Support/OCR Pipeline Studio/`. If
+macOS refuses to open it from the network, right-click it and choose Open, or
+run `chmod +x` on it once.
+
+Two people can run at once — each run gets its own folder — but if two people
+open and save the *same* run, the last save wins.
 
 **The first run is slower.** The first time OCR happens, PaddleOCR downloads
 its detection and recognition models into `C:\Users\<you>\.paddlex\` (a few

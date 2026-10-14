@@ -12,7 +12,7 @@ rem double-clicking is the whole point of this file.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
  "$link = (New-Object -ComObject WScript.Shell).CreateShortcut(([Environment]::GetFolderPath('Desktop')) + '\OCR Pipeline Studio.lnk');" ^
  "$link.TargetPath = '%~dp0launcher\launch.cmd';" ^
- "$link.WorkingDirectory = (Resolve-Path '%~dp0').Path;" ^
+ "$link.WorkingDirectory = (Resolve-Path '%~dp0').ProviderPath;" ^
  "$link.Description = 'OCR Pipeline Studio';" ^
  "$link.WindowStyle = 7;" ^
  "$link.Save()"

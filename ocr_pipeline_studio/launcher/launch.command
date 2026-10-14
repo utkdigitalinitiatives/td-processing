@@ -7,11 +7,20 @@
 # "activate" step -- calling the venv's own python is what activating does.
 #
 # Lives in launcher/, so it works one level up.
+#
+# The venv lives on this Mac, not in the project folder: the folder may be a
+# network share opened by several machines, and a venv only runs on the one
+# that built it. Code and workdir/ stay shared; each Mac sets up once.
 set -e
 cd "$(dirname "$0")/.."
 
-VENV=".venv"
+LOCAL="$HOME/Library/Application Support/OCR Pipeline Studio"
+VENV="$LOCAL/.venv"
 STAMP="$VENV/.setup-complete"
+mkdir -p "$LOCAL"
+
+# Bytecode caches stay on this Mac too, rather than in the shared folder.
+export PYTHONPYCACHEPREFIX="$LOCAL/pycache"
 
 # The stamp is written last, so a venv without one is a setup that died part
 # way -- indistinguishable from a finished one until the app fails on a

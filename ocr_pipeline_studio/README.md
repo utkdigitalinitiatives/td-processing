@@ -35,6 +35,12 @@ icon it puts on your Desktop. The first run installs everything — Python 3.11
 if it is missing, the packages, and the OCR engine — in a window you can watch;
 about 3 GB and 10-20 minutes, once. After that the icon just opens the app.
 
+The folder can sit on a network share used by several PCs: the install goes
+into each machine's own storage (`%LOCALAPPDATA%` on Windows,
+`~/Library/Application Support` on a Mac), so each one sets up once,
+and all of them share `workdir/`. See
+[INSTRUCTIONS.md](INSTRUCTIONS.md#running-from-a-shared-folder).
+
 macOS: drag `launcher/launch.command` into the Dock and open it; the first run
 sets itself up the same way.
 
@@ -52,7 +58,7 @@ app.py                Entry point — Flask on a background thread, pywebview on
 create-shortcut.cmd   Run once to put an OCR Pipeline Studio icon on the Desktop
 launcher/             What that icon runs; nothing in here needs opening by hand
 launcher/launch.cmd     Starts the app with the venv's own pythonw, no console
-launcher/setup.cmd      First-run install, called by launch.cmd when the venv is missing
+launcher/setup.cmd      First-run install into %LOCALAPPDATA%, called by launch.cmd when the venv is missing
 launcher/launch.command The macOS equivalent of both
 server/               The local API: create_app(), job tracking, routes
 pipeline/             Vendored copies of the original scripts: dedupe, fix_rotation, vlm_abstract
