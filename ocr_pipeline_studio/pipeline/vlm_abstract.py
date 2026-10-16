@@ -122,6 +122,12 @@ except ImportError:
 # Global PaddleOCR instance - lazy initialized
 paddle_ocr = None
 
+# Why the last paddle_ocr_page() call returned no words, or None if it found
+# some. A global rather than a second return value so its other callers are
+# unchanged; the OCR worker passes it back to the parent (see
+# run_ocr_worker_loop).
+last_ocr_page_problem = None
+
 
 def filter_supported_paddle_kwargs(desired_kwargs: dict):
     """Return kwargs limited to PaddleOCR's supported signature."""
@@ -464,24 +470,27 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
         pix: Pixmap to process
         confidence_threshold: Filter out detections below this confidence (0.0-1.0)
     """
-    global paddle_ocr
+    global paddle_ocr, last_ocr_page_problem
     if paddle_ocr is None:
         raise RuntimeError("PaddleOCR not initialized. Call init_paddle_ocr() first.")
-    
+    last_ocr_page_problem = None
+
     # Convert Pixmap to numpy array
     img_bytes = pix.tobytes("png")
     img_array = np.array(Image.open(BytesIO(img_bytes)))
-    
+
     # Run PaddleOCR with modern predict API
     try:
         result = paddle_ocr.predict(img_array)
     except Exception as e:
         print(f"PaddleOCR failed: {e}")
+        last_ocr_page_problem = "PaddleOCR failed: %s: %s" % (type(e).__name__, e)
         return []
-    
+
     words = []
     # Guard against blank/unreadable pages
     if not result or not isinstance(result, list) or len(result) == 0:
+        last_ocr_page_problem = "PaddleOCR returned no result for the page"
         return words
     
     # New PaddleOCR API returns: [{'rec_texts': [...], 'rec_scores': [...], 'rec_polys': [...]}]
@@ -532,7 +541,20 @@ def paddle_ocr_page(pix, confidence_threshold: float = 0.60) -> List[OCRWord]:
         except Exception as e:
             # Skip malformed entries but continue processing
             continue
-    
+
+    # An empty page is worth explaining, because the two causes need opposite
+    # fixes: nothing detected at all (a blank page, or PaddleOCR short of
+    # memory -- see text_det_limit_side_len) against lines read but all
+    # filtered out (a faint scan, or a threshold set too high).
+    if not words:
+        if rec_texts:
+            last_ocr_page_problem = (
+                "PaddleOCR read %d line(s) but none passed the %.0f%% confidence "
+                "and noise filters" % (len(rec_texts), confidence_threshold * 100))
+        else:
+            last_ocr_page_problem = (
+                "PaddleOCR detected no text on the page (%dx%d px image)" % (img_w, img_h))
+
     return words
 
 # ---- Per-page OCR process isolation ----
@@ -559,6 +581,16 @@ def run_ocr_page_worker(pdf_path: Path, page_index: int, dpi: int, confidence_th
 # own chatter on the same pipe.
 _OCR_WORKER_DONE = "@@OCR-WORKER-DONE@@"
 
+# Marks a line explaining why a page came back empty, for the parent to print
+# into the run log. Everything else the worker prints is PaddleOCR's chatter,
+# which the parent reads past -- so without this a page that failed looked
+# exactly like a blank one.
+_OCR_WORKER_NOTE = "@@OCR-WORKER-NOTE@@"
+
+def _worker_note(message: str) -> None:
+    # One line, or the parent would read the rest as chatter.
+    print(_OCR_WORKER_NOTE, " ".join(str(message).split()), flush=True)
+
 def run_ocr_worker_loop():
     """Child-process entry point: OCR pages on request until stdin closes.
 
@@ -574,13 +606,20 @@ def run_ocr_worker_loop():
         try:
             run_ocr_page_worker(Path(request["pdf"]), int(request["page"]), int(request["dpi"]),
                                 float(request["conf"]), Path(request["out_json"]))
-        except Exception:
+            if last_ocr_page_problem:
+                _worker_note(last_ocr_page_problem)
+        except Exception as e:
             # No JSON written: the parent retries the page in a fresh worker.
-            pass
+            _worker_note("%s: %s" % (type(e).__name__, e))
         print(_OCR_WORKER_DONE, request["id"], flush=True)
 
 _ocr_worker = None
 _ocr_worker_requests = 0
+
+# The worker's notes on the page ocr_page_isolated() last read, for its caller
+# to print after the page's own progress line. Cleared per page, kept across
+# that page's retry.
+ocr_page_notes: List[str] = []
 
 def _stop_ocr_worker():
     """End the current OCR worker, politely if it is still alive."""
@@ -622,7 +661,11 @@ def _ocr_worker_ask(pdf_path: Path, page_index: int, dpi: int, confidence_thresh
         _ocr_worker.stdin.write(json.dumps(request) + "\n")
         _ocr_worker.stdin.flush()
         for line in _ocr_worker.stdout:
-            if line.startswith(_OCR_WORKER_DONE):
+            if line.startswith(_OCR_WORKER_NOTE):
+                note = line[len(_OCR_WORKER_NOTE):].strip()
+                if note and note not in ocr_page_notes:
+                    ocr_page_notes.append(note)
+            elif line.startswith(_OCR_WORKER_DONE):
                 return line.split()[1:2] == [request_id]
     except (OSError, ValueError):
         pass
@@ -636,6 +679,7 @@ def ocr_page_isolated(pdf_path: Path, page_index: int, dpi: int, confidence_thre
     PaddleOCR is loaded once per PDF rather than once per page. A page that
     crashes it gets a fresh worker for its retry.
     """
+    ocr_page_notes.clear()
     for attempt in range(1, max_attempts + 1):
         with tempfile.TemporaryDirectory() as tmp:
             out_json = Path(tmp) / "words.json"
@@ -1474,6 +1518,9 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
         print(f"    Processing page {p+1} with PaddleOCR...", end='', flush=True)
         page_words = ocr_page_isolated(src_path, p, dpi=350, confidence_threshold=confidence_threshold)
         print(f" done ({len(page_words)} text segments found)")
+        if not page_words:
+            for note in ocr_page_notes:
+                print(f"      ⚠ page {p+1}: {note}")
 
         if vlm_review_mode:
             suspicious = vlm_review_mode == "always" or _page_is_suspicious(len(page_words), prior_segment_counts, vlm_trigger_threshold)
