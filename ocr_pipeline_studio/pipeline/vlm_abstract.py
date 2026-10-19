@@ -225,6 +225,18 @@ STOP_HEADINGS_RE = re.compile(
     re.IGNORECASE
 )
 
+CHAPTER_LABEL_RE = re.compile(r"^\s*chapter(\s+\d+)?\s*\.?\s*$", re.IGNORECASE)
+
+# Skipped when finding the abstract: a contents page lists every fallback heading.
+CONTENTS_PAGE_RE = re.compile(
+    r"^\s*(table of contents|contents|list of (tables|figures|illustrations|plates))\s*\.?\s*$",
+    re.IGNORECASE
+)
+CONTENTS_HEADING_LINES = 6  # how far down a page its heading can be
+
+# Fewer segments than this before a stop heading is a page number or header.
+MIN_WORDS_BEFORE_STOP = 8
+
 # Named entities for common Greek & math 
 GREEK_MAP = {
     "α": "&alpha;", "β": "&beta;", "γ": "&gamma;", "δ": "&delta;", "ε": "&epsilon;",
@@ -1405,7 +1417,11 @@ def find_abstract_page(doc, max_first_pages=15) -> Optional[int]:
        if not text.strip():
            page_lines.append([])
            continue  # Skip blank pages
-       page_lines.append([ln.strip() for ln in text.splitlines() if ln.strip()])
+       lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+       if any(CONTENTS_PAGE_RE.match(ln) for ln in lines[:CONTENTS_HEADING_LINES]):
+           page_lines.append([])
+           continue
+       page_lines.append(lines)
 
    # Honor heading priority order (first match wins).
    for heading in VALID_ABSTRACT_HEADINGS:
@@ -1568,17 +1584,29 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
 
         lines = group_words_into_lines(page_words)
 
-        # If we hit a stop heading, terminate
+        # A stop heading ends the region only once text has been kept. Before
+        # that the range started early: drop a "Chapter 1" label, skip the page
+        # for any other heading.
         stop = False
+        skip_page = False
         filtered_words = []
         pre_stop_lines = []
         for ln in lines:
             text = " ".join(w.text for w in ln).strip()
             if STOP_HEADINGS_RE.match(text):
-                stop = True
-                break
+                if len(collected) + len(filtered_words) >= MIN_WORDS_BEFORE_STOP:
+                    stop = True
+                elif not CHAPTER_LABEL_RE.match(text):
+                    print(f"    Page {p+1} starts with \"{text}\" - skipped, looking on the next page")
+                    skip_page = True
+                if stop or skip_page:
+                    break
+                continue
             filtered_words.extend(ln)
             pre_stop_lines.append(ln)
+        if skip_page:
+            vlm_flagged_pages.pop(p, None)
+            continue
         collected.extend(filtered_words)
 
         # Only the part of this page that's actually abstract content --
