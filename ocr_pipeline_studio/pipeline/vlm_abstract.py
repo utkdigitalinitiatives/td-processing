@@ -1605,7 +1605,11 @@ def extract_abstract_region(doc, start_page: int, max_pages=4, confidence_thresh
             filtered_words.extend(ln)
             pre_stop_lines.append(ln)
         if skip_page:
-            vlm_flagged_pages.pop(p, None)
+            # What came before is a copyright line or header, not the abstract.
+            collected.clear()
+            vlm_flagged_pages.clear()
+            vlm_diff_pages.clear()
+            page_ocr_texts.clear()
             continue
         collected.extend(filtered_words)
 
