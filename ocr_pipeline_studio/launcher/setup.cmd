@@ -22,7 +22,13 @@ set "PYTHONPYCACHEPREFIX=%LOCAL%\pycache"
 set "VENV=%LOCAL%\.venv"
 set "VPY=%VENV%\Scripts\python.exe"
 set "STAMP=%VENV%\.setup-complete"
-set "PADDLE_INDEX=https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+rem 3.2.2 with CUDA 12.9: 3.0.0/cu126 read no text at all on an RTX 5060 with a
+rem new Intel CPU. 3.3.x reads no text anywhere -- do not go past 3.2.x.
+rem ENGINE goes into the stamp; launch.cmd re-runs setup when it differs, so
+rem change it in both files together.
+set "PADDLE_VERSION=3.2.2"
+set "PADDLE_INDEX=https://www.paddlepaddle.org.cn/packages/stable/cu129/"
+set "ENGINE=engine=paddle-3.2.2-cu129"
 set "PYTHON_URL=https://www.python.org/downloads/release/python-3119/"
 
 title OCR Pipeline Studio - setup
@@ -37,6 +43,12 @@ echo.
 echo You only have to do this once. Afterwards the Desktop shortcut
 echo opens the app straight away.
 echo.
+
+if not exist "%STAMP%" goto :notupdate
+echo This PC was set up before, with an older OCR engine. Only the
+echo engine is replaced; that is a few minutes, not the full setup.
+echo.
+:notupdate
 
 if not exist "%ROOT%\.venv\Scripts\python.exe" goto :nostray
 echo Note: there is an old .venv inside the project folder, from before
@@ -110,21 +122,28 @@ rem requirements.txt installs paddle on macOS only, because Windows wants the
 rem CUDA build and PyPI does not carry it past 2.6.2. It comes from Paddle's
 rem own index instead -- a CDN that is not always reachable, hence the
 rem fallback to the slower PyPI wheel rather than failing the whole setup.
-"%VPY%" -m pip install --disable-pip-version-check paddlepaddle-gpu==3.0.0 -i %PADDLE_INDEX%
+"%VPY%" -m pip install --disable-pip-version-check paddlepaddle-gpu==%PADDLE_VERSION% -i %PADDLE_INDEX%
 if not errorlevel 1 goto :paddledone
 
 echo.
 echo      That index could not be reached. Falling back to the standard
 echo      wheel, which works but runs OCR several times slower.
 echo.
-"%VPY%" -m pip install --disable-pip-version-check paddlepaddle==3.0.0
+rem Both packages install as "paddle"; an older GPU build left behind by a
+rem previous setup would shadow the new one.
+"%VPY%" -m pip uninstall --disable-pip-version-check -y paddlepaddle-gpu >nul 2>&1
+"%VPY%" -m pip install --disable-pip-version-check paddlepaddle==%PADDLE_VERSION%
 if errorlevel 1 goto :paddlefailed
 
 :paddledone
 echo.
 
-rem Written last and only here: launch.cmd treats its absence as "unfinished".
-echo Setup completed. Delete this file to make setup run again.> "%STAMP%"
+rem Written last and only here: launch.cmd treats its absence as "unfinished",
+rem and a stamp without the current ENGINE line as "needs the new engine".
+> "%STAMP%" (
+  echo Setup completed. Delete this file to make setup run again.
+  echo %ENGINE%
+)
 
 echo ============================================================
 echo  Setup finished.

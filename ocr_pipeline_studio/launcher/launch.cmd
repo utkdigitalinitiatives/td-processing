@@ -20,6 +20,9 @@ set "ROOT=%~dp0.."
 set "LOCAL=%LOCALAPPDATA%\OCR Pipeline Studio"
 set "PY=%LOCAL%\.venv\Scripts\pythonw.exe"
 set "STAMP=%LOCAL%\.venv\.setup-complete"
+rem Must match ENGINE in setup.cmd. A PC set up with an older engine re-runs
+rem setup, which reuses the venv and only replaces paddle.
+set "ENGINE=engine=paddle-3.2.2-cu129"
 
 rem Bytecode caches go to this PC too, rather than every PC writing its own
 rem __pycache__ into the shared folder.
@@ -31,6 +34,8 @@ rem The stamp is written by setup.cmd as its last act, so a venv without one is
 rem a setup that died part way -- which looks identical to a finished one until
 rem the app fails on a missing package.
 if not exist "%STAMP%" goto :setup
+findstr /x /c:"%ENGINE%" "%STAMP%" >nul 2>&1
+if errorlevel 1 goto :setup
 
 rem start returns straight away, so this window closes and leaves the app.
 start "" "%PY%" "%ROOT%\app.py"

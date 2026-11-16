@@ -46,7 +46,7 @@ one mistake that produces a half-installed environment) and run:
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+pip install paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
 ```
 
 On **macOS** the first three are the equivalent three, and there is no fourth:
@@ -66,10 +66,17 @@ it OCR has nothing to run on. PyPI does not carry it past 2.6.2, which is why
 it comes from Paddle's own index. Despite the name it still runs on the CPU —
 the app hides the GPU unless `OCR_USE_GPU=1` — and this build is the one used
 because it is several times faster at the same work: a 50-thesis batch ran in
-43m instead of 1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.0.0` is a
+43m instead of 1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.2.2` is a
 working but slower substitute, and the one setup falls back to if that index
-cannot be reached. macOS has no CUDA build, so `requirements.txt` installs that
-plain wheel there and there is no fourth command.
+cannot be reached. macOS has no CUDA build, so `requirements.txt` installs the
+plain 3.0.0 wheel there and there is no fourth command.
+
+Windows used 3.0.0 with CUDA 12.6 until November 2026. On a PC with an RTX
+5060 and a recent Intel CPU it read no text on any page, on CPU or GPU;
+3.2.2 with CUDA 12.9 reads the same pages correctly and gives identical
+output on PCs where 3.0.0 worked. Setup writes the engine version into the
+`.setup-complete` stamp, and the shortcut re-runs setup on any PC whose stamp
+names an older engine, so PCs upgrade themselves on their next launch.
 
 A venv made by hand is for running from a terminal only: the shortcut does not
 use it. The shortcut keeps its own environment on each PC, in
@@ -319,7 +326,7 @@ so that command is slow the first time.
 
 **No NVIDIA card in the machine** — fine: the app hides the GPU and runs on
 the CPU regardless. If the CUDA build will not install there, use
-`pip install paddlepaddle==3.0.0`; slower, but everything works.
+`pip install paddlepaddle==3.2.2`; slower, but everything works.
 
 **Every page reports "0 text segments found" and no document appears** —
 something upgraded the OCR packages past the pinned versions. Newer
@@ -330,8 +337,12 @@ Reinstall the pinned set:
 
 ```powershell
 pip install -r requirements.txt --force-reinstall
-pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/ --force-reinstall
+pip install paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/ --force-reinstall
 ```
+
+The same symptom with 3.0.0 installed, on a newer PC (RTX 50-series GPU,
+recent Intel CPU), is that version not supporting the hardware: run the
+second command above, without `--force-reinstall`.
 
 The `paddle*` versions are exact for this reason — the two in
 `requirements.txt` and the runtime above. Do not loosen them without running
