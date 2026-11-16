@@ -19,7 +19,7 @@ it's missing. Then, in the folder holding `fix_rotation.py`:
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install PyMuPDF numpy paddleocr==3.2.0 paddlex==3.2.1 paddlepaddle==3.0.0
+pip install PyMuPDF numpy paddleocr==3.2.0 paddlex==3.2.1 paddlepaddle==3.2.2
 ```
 
 Those version numbers are exact on purpose. A newer paddlepaddle reports every

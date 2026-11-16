@@ -18,7 +18,7 @@ rapidfuzz>=3.0             # fuzzy text ratio used for duplicate-page detection
 # nothing -- see the troubleshooting section of INSTRUCTIONS.md.
 paddleocr==3.2.0           # the OCR engine itself
 paddlex==3.2.1             # paddleocr's pipeline backend; must match paddleocr
-paddlepaddle==3.0.0; sys_platform == "darwin"   # macOS: no CUDA build exists
+paddlepaddle==3.2.2; sys_platform == "darwin"   # macOS: no CUDA build; 3.0.0 segfaults on an M4 Max
 # Windows/Linux install the faster CUDA build separately -- see INSTRUCTIONS.md
 numpy>=1.24,<2.0           # paddle is built against the 1.x ABI; 2.x can break it
 Pillow>=10.0               # decodes the rendered page images before OCR

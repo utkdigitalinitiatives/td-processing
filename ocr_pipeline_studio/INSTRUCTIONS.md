@@ -69,7 +69,9 @@ because it is several times faster at the same work: a 50-thesis batch ran in
 43m instead of 1h16m. It adds ~2.5 GB; `pip install paddlepaddle==3.2.2` is a
 working but slower substitute, and the one setup falls back to if that index
 cannot be reached. macOS has no CUDA build, so `requirements.txt` installs the
-plain 3.0.0 wheel there and there is no fourth command.
+plain 3.2.2 wheel there and there is no fourth command. On an M4 Max Mac
+Studio, 3.0.0 crashed (segfault in its CPU convolution) on every page; 3.2.2
+reads them. The Mac launcher stamps and checks the engine the same way.
 
 Windows used 3.0.0 with CUDA 12.6 until November 2026. On a PC with an RTX
 5060 and a recent Intel CPU it read no text on any page, on CPU or GPU;

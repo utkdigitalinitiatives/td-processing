@@ -17,6 +17,9 @@ cd "$(dirname "$0")/.."
 LOCAL="$HOME/Library/Application Support/OCR Pipeline Studio"
 VENV="$LOCAL/.venv"
 STAMP="$VENV/.setup-complete"
+# Goes into the stamp; a Mac whose stamp lacks it re-runs setup, which reuses
+# the venv and only replaces paddle. Change it with the pin in requirements.txt.
+ENGINE="engine=paddle-3.2.2-cpu"
 mkdir -p "$LOCAL"
 
 # Bytecode caches stay on this Mac too, rather than in the shared folder.
@@ -25,7 +28,7 @@ export PYTHONPYCACHEPREFIX="$LOCAL/pycache"
 # The stamp is written last, so a venv without one is a setup that died part
 # way -- indistinguishable from a finished one until the app fails on a
 # missing package.
-if [ ! -x "$VENV/bin/python" ] || [ ! -f "$STAMP" ]; then
+if [ ! -x "$VENV/bin/python" ] || [ ! -f "$STAMP" ] || ! grep -qx "$ENGINE" "$STAMP"; then
     echo "============================================================"
     echo " OCR Pipeline Studio - first-time setup"
     echo "============================================================"
@@ -33,6 +36,11 @@ if [ ! -x "$VENV/bin/python" ] || [ ! -f "$STAMP" ]; then
     echo "This downloads a few hundred megabytes and takes a few minutes."
     echo "You only have to do this once."
     echo
+    if [ -f "$STAMP" ]; then
+        echo "This Mac was set up before, with an older OCR engine. Only the"
+        echo "engine is replaced."
+        echo
+    fi
 
     # 3.11 specifically: paddleocr publishes no wheels for 3.12 or newer.
     if ! command -v python3.11 >/dev/null 2>&1; then
@@ -51,7 +59,7 @@ if [ ! -x "$VENV/bin/python" ] || [ ! -f "$STAMP" ]; then
     # sys_platform == "darwin" marker, so there is no second install step.
     "$VENV/bin/python" -m pip install --disable-pip-version-check -r requirements.txt
 
-    echo "Setup completed. Delete this file to make setup run again." > "$STAMP"
+    printf 'Setup completed. Delete this file to make setup run again.\n%s\n' "$ENGINE" > "$STAMP"
     echo
     echo "Setup finished."
 
